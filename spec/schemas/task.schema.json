@@ -1,992 +1,169 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://rowhammer-openenv.invalid/schemas/task.schema.json",
-  "title": "RowHammer-OpenEnv Administrator Task Instance",
-  "$defs": {
-    "AnyFlip": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "kind"
-      ],
-      "properties": {
-        "kind": {
-          "const": "any_flip"
-        },
-        "scope": {
-          "type": [
-            "object",
-            "null"
-          ]
-        },
-        "causes": {
-          "type": "array",
-          "items": {
-            "enum": [
-              "rowhammer",
-              "rowpress",
-              "retention",
-              "combined"
-            ]
-          },
-          "uniqueItems": true
-        }
-      }
-    },
-    "FlipCount": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "kind",
-        "count"
-      ],
-      "properties": {
-        "kind": {
-          "const": "flip_count_at_least"
-        },
-        "count": {
-          "type": "integer",
-          "minimum": 1
-        },
-        "scope": {
-          "type": [
-            "object",
-            "null"
-          ]
-        }
-      }
-    },
-    "FlipInRow": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "kind",
-        "row"
-      ],
-      "properties": {
-        "kind": {
-          "const": "flip_in_row"
-        },
-        "row": {
-          "oneOf": [
-            {
-              "title": "SimulatedAddress",
-              "description": "A synthetic simulator address. Never a host physical or virtual address.",
-              "oneOf": [
-                {
-                  "type": "object",
-                  "additionalProperties": false,
-                  "required": [
-                    "space",
-                    "value"
-                  ],
-                  "properties": {
-                    "space": {
-                      "const": "logical"
-                    },
-                    "value": {
-                      "type": "integer",
-                      "minimum": 0,
-                      "maximum": 18446744073709551615
-                    }
-                  }
-                },
-                {
-                  "type": "object",
-                  "additionalProperties": false,
-                  "required": [
-                    "space",
-                    "channel",
-                    "rank",
-                    "bank",
-                    "row"
-                  ],
-                  "properties": {
-                    "space": {
-                      "const": "dram"
-                    },
-                    "channel": {
-                      "type": "integer",
-                      "minimum": 0
-                    },
-                    "pseudochannel": {
-                      "type": "integer",
-                      "minimum": 0
-                    },
-                    "rank": {
-                      "type": "integer",
-                      "minimum": 0
-                    },
-                    "bank_group": {
-                      "type": "integer",
-                      "minimum": 0
-                    },
-                    "bank": {
-                      "type": "integer",
-                      "minimum": 0
-                    },
-                    "subarray": {
-                      "type": "integer",
-                      "minimum": 0
-                    },
-                    "row": {
-                      "type": "integer",
-                      "minimum": 0
-                    },
-                    "column": {
-                      "type": "integer",
-                      "minimum": 0
-                    },
-                    "device": {
-                      "type": "integer",
-                      "minimum": 0
-                    },
-                    "lane": {
-                      "type": "integer",
-                      "minimum": 0
-                    },
-                    "bit": {
-                      "type": "integer",
-                      "minimum": 0
-                    },
-                    "burst_offset": {
-                      "type": "integer",
-                      "minimum": 0
-                    }
-                  }
-                },
-                {
-                  "type": "object",
-                  "additionalProperties": false,
-                  "required": [
-                    "space",
-                    "value"
-                  ],
-                  "properties": {
-                    "space": {
-                      "const": "row_handle"
-                    },
-                    "value": {
-                      "type": "string",
-                      "minLength": 1,
-                      "maxLength": 256,
-                      "pattern": "^[A-Za-z0-9._:-]+$"
-                    }
-                  }
-                }
-              ]
-            },
-            {
-              "type": "string",
-              "maxLength": 256
-            }
-          ]
-        }
-      }
-    },
-    "SpecificCell": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "kind",
-        "coordinate_ref"
-      ],
-      "properties": {
-        "kind": {
-          "const": "specific_cell"
-        },
-        "coordinate_ref": {
-          "type": [
-            "string",
-            "object"
-          ],
-          "maxLength": 512
-        }
-      }
-    },
-    "SpecificTransition": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "kind",
-        "from",
-        "to"
-      ],
-      "properties": {
-        "kind": {
-          "const": "specific_transition"
-        },
-        "from": {
-          "enum": [
-            0,
-            1
-          ]
-        },
-        "to": {
-          "enum": [
-            0,
-            1
-          ]
-        }
-      }
-    },
-    "SpecificFinalValue": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "kind",
-        "value"
-      ],
-      "properties": {
-        "kind": {
-          "const": "specific_final_value"
-        },
-        "value": {
-          "enum": [
-            0,
-            1
-          ]
-        }
-      }
-    },
-    "ExactFlipSet": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "kind",
-        "cells"
-      ],
-      "properties": {
-        "kind": {
-          "const": "exact_flip_set"
-        },
-        "cells": {
-          "type": "array",
-          "minItems": 1,
-          "maxItems": 65536,
-          "items": {
-            "title": "SimulatedAddress",
-            "description": "A synthetic simulator address. Never a host physical or virtual address.",
-            "oneOf": [
-              {
-                "type": "object",
-                "additionalProperties": false,
-                "required": [
-                  "space",
-                  "value"
-                ],
-                "properties": {
-                  "space": {
-                    "const": "logical"
-                  },
-                  "value": {
-                    "type": "integer",
-                    "minimum": 0,
-                    "maximum": 18446744073709551615
-                  }
-                }
-              },
-              {
-                "type": "object",
-                "additionalProperties": false,
-                "required": [
-                  "space",
-                  "channel",
-                  "rank",
-                  "bank",
-                  "row"
-                ],
-                "properties": {
-                  "space": {
-                    "const": "dram"
-                  },
-                  "channel": {
-                    "type": "integer",
-                    "minimum": 0
-                  },
-                  "pseudochannel": {
-                    "type": "integer",
-                    "minimum": 0
-                  },
-                  "rank": {
-                    "type": "integer",
-                    "minimum": 0
-                  },
-                  "bank_group": {
-                    "type": "integer",
-                    "minimum": 0
-                  },
-                  "bank": {
-                    "type": "integer",
-                    "minimum": 0
-                  },
-                  "subarray": {
-                    "type": "integer",
-                    "minimum": 0
-                  },
-                  "row": {
-                    "type": "integer",
-                    "minimum": 0
-                  },
-                  "column": {
-                    "type": "integer",
-                    "minimum": 0
-                  },
-                  "device": {
-                    "type": "integer",
-                    "minimum": 0
-                  },
-                  "lane": {
-                    "type": "integer",
-                    "minimum": 0
-                  },
-                  "bit": {
-                    "type": "integer",
-                    "minimum": 0
-                  },
-                  "burst_offset": {
-                    "type": "integer",
-                    "minimum": 0
-                  }
-                }
-              },
-              {
-                "type": "object",
-                "additionalProperties": false,
-                "required": [
-                  "space",
-                  "value"
-                ],
-                "properties": {
-                  "space": {
-                    "const": "row_handle"
-                  },
-                  "value": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 256,
-                    "pattern": "^[A-Za-z0-9._:-]+$"
-                  }
-                }
-              }
-            ]
-          }
-        },
-        "extra_flips_allowed": {
-          "type": "boolean"
-        }
-      }
-    },
-    "Syndrome": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "kind",
-        "mask",
-        "value"
-      ],
-      "properties": {
-        "kind": {
-          "const": "syndrome"
-        },
-        "mask": {
-          "type": "string",
-          "maxLength": 65536
-        },
-        "value": {
-          "type": "string",
-          "maxLength": 65536
-        },
-        "ecc_model": {
-          "type": "string",
-          "maxLength": 256
-        }
-      }
-    },
-    "Persistent": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "kind",
-        "cycles",
-        "child"
-      ],
-      "properties": {
-        "kind": {
-          "const": "persistent_condition"
-        },
-        "cycles": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "verification_reads": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "child": {
-          "$ref": "#/$defs/Predicate"
-        }
-      }
-    },
-    "All": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "kind",
-        "children"
-      ],
-      "properties": {
-        "kind": {
-          "const": "all"
-        },
-        "children": {
-          "type": "array",
-          "minItems": 1,
-          "maxItems": 128,
-          "items": {
-            "$ref": "#/$defs/Predicate"
-          }
-        }
-      }
-    },
-    "Any": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "kind",
-        "children"
-      ],
-      "properties": {
-        "kind": {
-          "const": "any"
-        },
-        "children": {
-          "type": "array",
-          "minItems": 1,
-          "maxItems": 128,
-          "items": {
-            "$ref": "#/$defs/Predicate"
-          }
-        }
-      }
-    },
-    "Not": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "kind",
-        "child"
-      ],
-      "properties": {
-        "kind": {
-          "const": "not"
-        },
-        "child": {
-          "$ref": "#/$defs/Predicate"
-        }
-      }
-    },
-    "Predicate": {
-      "oneOf": [
-        {
-          "$ref": "#/$defs/AnyFlip"
-        },
-        {
-          "$ref": "#/$defs/FlipCount"
-        },
-        {
-          "$ref": "#/$defs/FlipInRow"
-        },
-        {
-          "$ref": "#/$defs/SpecificCell"
-        },
-        {
-          "$ref": "#/$defs/SpecificTransition"
-        },
-        {
-          "$ref": "#/$defs/SpecificFinalValue"
-        },
-        {
-          "$ref": "#/$defs/ExactFlipSet"
-        },
-        {
-          "$ref": "#/$defs/Syndrome"
-        },
-        {
-          "$ref": "#/$defs/Persistent"
-        },
-        {
-          "$ref": "#/$defs/All"
-        },
-        {
-          "$ref": "#/$defs/Any"
-        },
-        {
-          "$ref": "#/$defs/Not"
-        }
-      ]
-    }
-  },
+  "$id": "https://example.org/rowhammer-openenv/task.schema.json",
+  "title": "RowHammerEnv task config",
   "type": "object",
-  "additionalProperties": false,
   "required": [
-    "schema_version",
-    "task_id",
-    "task_instance_id",
-    "split",
+    "id",
     "profile",
-    "ramulator",
+    "standard",
     "mitigation",
-    "target",
-    "control",
-    "initial_memory",
-    "observability",
+    "disclosure",
+    "objective",
     "budgets",
-    "reward",
-    "verification"
+    "reward"
   ],
+  "additionalProperties": false,
   "properties": {
-    "schema_version": {
-      "const": "rh-task/v1"
-    },
-    "task_id": {
+    "id": {
       "type": "string",
-      "minLength": 1,
-      "maxLength": 128
-    },
-    "task_instance_id": {
-      "type": "string",
-      "format": "uuid"
-    },
-    "split": {
-      "enum": [
-        "train",
-        "validation",
-        "test",
-        "private_test"
-      ]
+      "pattern": "^[a-zA-Z0-9_.:-]+$"
     },
     "profile": {
-      "type": "object",
-      "required": [
-        "id",
-        "version"
-      ],
-      "properties": {
-        "id": {
-          "type": "string"
-        },
-        "version": {
-          "type": "string"
-        },
-        "selection": {
-          "type": "object"
-        }
-      },
-      "additionalProperties": false
+      "type": "string"
     },
-    "ramulator": {
-      "type": "object",
-      "required": [
-        "standard",
-        "organization",
-        "timing",
-        "controller",
-        "scheduler",
-        "row_policy",
-        "refresh_manager",
-        "address_mapper"
-      ],
-      "properties": {
-        "standard": {
-          "type": "string"
-        },
-        "organization": {
-          "type": "string"
-        },
-        "timing": {
-          "type": "string"
-        },
-        "ranks": {
-          "type": "integer",
-          "minimum": 1
-        },
-        "controller": {
-          "type": "string"
-        },
-        "scheduler": {
-          "type": "string"
-        },
-        "row_policy": {
-          "type": "string"
-        },
-        "refresh_manager": {
-          "type": "string"
-        },
-        "address_mapper": {
-          "type": "string"
-        },
-        "clock_ratio": {
-          "type": "integer",
-          "minimum": 1
-        }
-      },
-      "additionalProperties": false
+    "standard": {
+      "type": "string",
+      "enum": [
+        "DDR3",
+        "DDR4",
+        "DDR5",
+        "HBM2",
+        "HBM3",
+        "custom"
+      ]
     },
     "mitigation": {
       "type": "object",
       "required": [
-        "id",
-        "disclosure"
+        "name",
+        "params"
       ],
+      "additionalProperties": false,
       "properties": {
-        "id": {
-          "type": "string"
-        },
-        "version": {
-          "type": "string"
-        },
-        "parameters": {
-          "type": "object"
-        },
-        "disclosure": {
-          "enum": [
-            "exact",
-            "family",
-            "hidden"
-          ]
-        }
-      },
-      "additionalProperties": false
-    },
-    "target": {
-      "type": "object",
-      "required": [
-        "predicate",
-        "disclosure"
-      ],
-      "properties": {
-        "predicate": {
-          "$ref": "#/$defs/Predicate"
-        },
-        "disclosure": {
-          "type": "object"
-        }
-      },
-      "additionalProperties": false
-    },
-    "control": {
-      "type": "object",
-      "required": [
-        "modes",
-        "script_access"
-      ],
-      "properties": {
-        "modes": {
-          "type": "array",
-          "minItems": 1,
-          "uniqueItems": true,
-          "items": {
-            "enum": [
-              "transactions",
-              "commands"
-            ]
-          }
-        },
-        "script_access": {
+        "name": {
+          "type": "string",
           "enum": [
             "none",
-            "scripts_only",
-            "direct_only",
-            "both"
+            "oracle",
+            "para",
+            "twice",
+            "graphene",
+            "blockhammer",
+            "hydra",
+            "rrs",
+            "aqua",
+            "prac",
+            "custom"
           ]
         },
-        "command_timing_modes": {
-          "type": "array",
-          "uniqueItems": true,
-          "items": {
-            "enum": [
-              "strict",
-              "earliest_legal"
-            ]
-          }
+        "params": {
+          "type": "object"
         }
-      },
-      "additionalProperties": false
+      }
     },
-    "initial_memory": {
+    "disclosure": {
       "type": "object",
       "required": [
-        "policy"
+        "mapping",
+        "adjacency",
+        "victim",
+        "profile",
+        "feedback"
       ],
+      "additionalProperties": false,
       "properties": {
-        "policy": {
+        "mapping": {
           "enum": [
-            "fixed",
-            "policy_selectable",
+            "physical",
+            "logical_only",
+            "opaque_handles"
+          ]
+        },
+        "adjacency": {
+          "enum": [
+            "exact",
+            "candidate_set",
             "hidden"
           ]
         },
-        "pattern": {
-          "oneOf": [
-            {
-              "type": "object",
-              "additionalProperties": false,
-              "required": [
-                "kind",
-                "value"
-              ],
-              "properties": {
-                "kind": {
-                  "const": "constant_byte"
-                },
-                "value": {
-                  "type": "integer",
-                  "minimum": 0,
-                  "maximum": 255
-                }
-              }
-            },
-            {
-              "type": "object",
-              "additionalProperties": false,
-              "required": [
-                "kind",
-                "value",
-                "width_bits",
-                "endianness"
-              ],
-              "properties": {
-                "kind": {
-                  "const": "constant_word"
-                },
-                "value": {
-                  "type": "integer",
-                  "minimum": 0
-                },
-                "width_bits": {
-                  "enum": [
-                    8,
-                    16,
-                    32,
-                    64
-                  ]
-                },
-                "endianness": {
-                  "enum": [
-                    "little",
-                    "big"
-                  ]
-                }
-              }
-            },
-            {
-              "type": "object",
-              "additionalProperties": false,
-              "required": [
-                "kind"
-              ],
-              "properties": {
-                "kind": {
-                  "enum": [
-                    "checkerboard",
-                    "inverse_checkerboard"
-                  ]
-                },
-                "phase": {
-                  "type": "integer",
-                  "minimum": 0,
-                  "maximum": 1
-                }
-              }
-            },
-            {
-              "type": "object",
-              "additionalProperties": false,
-              "required": [
-                "kind",
-                "period",
-                "values"
-              ],
-              "properties": {
-                "kind": {
-                  "enum": [
-                    "row_stripe",
-                    "column_stripe"
-                  ]
-                },
-                "period": {
-                  "type": "integer",
-                  "minimum": 1
-                },
-                "values": {
-                  "type": "array",
-                  "minItems": 1,
-                  "maxItems": 256,
-                  "items": {
-                    "type": "integer",
-                    "minimum": 0,
-                    "maximum": 255
-                  }
-                }
-              }
-            },
-            {
-              "type": "object",
-              "additionalProperties": false,
-              "required": [
-                "kind",
-                "seed"
-              ],
-              "properties": {
-                "kind": {
-                  "const": "prng"
-                },
-                "seed": {
-                  "type": "integer",
-                  "minimum": 0,
-                  "maximum": 18446744073709551615
-                },
-                "algorithm": {
-                  "enum": [
-                    "philox4x32-10",
-                    "threefry2x64-20"
-                  ]
-                }
-              }
-            },
-            {
-              "type": "object",
-              "additionalProperties": false,
-              "required": [
-                "kind",
-                "encoding",
-                "data"
-              ],
-              "properties": {
-                "kind": {
-                  "const": "explicit_bytes"
-                },
-                "encoding": {
-                  "enum": [
-                    "base64url",
-                    "hex"
-                  ]
-                },
-                "data": {
-                  "type": "string",
-                  "maxLength": 1398104
-                }
-              }
-            }
+        "victim": {
+          "enum": [
+            "exact",
+            "row_handle",
+            "cell_handle",
+            "hidden_until_finish"
           ]
         },
-        "setup_mode": {
+        "profile": {
           "enum": [
-            "simulated_writes",
-            "instant_setup"
+            "public_profile_id",
+            "family_only",
+            "hidden"
+          ]
+        },
+        "feedback": {
+          "enum": [
+            "full_trace",
+            "summarized_counts",
+            "reward_only"
           ]
         }
-      },
-      "additionalProperties": false
+      }
     },
-    "observability": {
+    "objective": {
       "type": "object",
-      "additionalProperties": {
-        "type": [
-          "boolean",
-          "string",
-          "array",
-          "object",
-          "null"
-        ]
+      "required": [
+        "type"
+      ],
+      "additionalProperties": true,
+      "properties": {
+        "type": {
+          "enum": [
+            "any_flip",
+            "target_row_flip",
+            "target_cell_flip",
+            "pattern_target",
+            "mitigation_aware"
+          ]
+        }
       }
     },
     "budgets": {
       "type": "object",
-      "minProperties": 1,
-      "maxProperties": 64,
+      "required": [
+        "tool_calls",
+        "acts",
+        "cycles"
+      ],
       "additionalProperties": {
         "type": "integer",
         "minimum": 0
+      },
+      "properties": {
+        "tool_calls": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "acts": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "cycles": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "script_ms": {
+          "type": "integer",
+          "minimum": 0
+        }
       }
     },
     "reward": {
-      "type": "object",
-      "required": [
-        "success",
-        "valid_nonterminal",
-        "invalid_action",
-        "invalid_penalty_floor"
-      ],
-      "properties": {
-        "success": {
-          "type": "number"
-        },
-        "valid_nonterminal": {
-          "type": "number"
-        },
-        "invalid_action": {
-          "type": "number"
-        },
-        "invalid_penalty_floor": {
-          "type": "number"
-        },
-        "efficiency_bonus_max": {
-          "type": "number",
-          "minimum": 0,
-          "maximum": 0.1
-        }
-      },
-      "additionalProperties": false
-    },
-    "verification": {
-      "type": "object",
-      "required": [
-        "drain"
-      ],
-      "properties": {
-        "drain": {
-          "enum": [
-            "none",
-            "program",
-            "all"
-          ]
-        },
-        "settlement_cycles": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "privileged_reads": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "extra_flips_allowed": {
-          "type": "boolean"
-        }
-      },
-      "additionalProperties": false
-    },
-    "preflight": {
-      "type": "object",
-      "properties": {
-        "required": {
-          "type": "boolean"
-        },
-        "policy": {
-          "type": "string"
-        },
-        "minimum_success_probability": {
-          "type": "number",
-          "minimum": 0,
-          "maximum": 1
-        },
-        "validation_budget_multiplier": {
-          "type": "number",
-          "minimum": 1
-        }
-      },
-      "additionalProperties": false
+      "enum": [
+        "sparse_success",
+        "training_cost_shaped"
+      ]
     }
   }
 }

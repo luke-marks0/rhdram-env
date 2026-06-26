@@ -1,26 +1,16 @@
-# RowHammer-OpenEnv specification bundle
+# RowHammer-OpenEnv concise specification bundle
 
-This bundle contains the normative engineering specification and supporting machine-readable artifacts for a simulation-only reinforcement-learning environment built with OpenEnv and Ramulator 2.1.
+This is a compact v2 replacement for the earlier verbose bundle. It keeps the engineering decisions and safety constraints, but removes oversized prose and giant schemas.
 
-## Contents
+Files:
 
-- `SPECIFICATION.md` — complete architecture, policy API, disturbance model, task system, implementation plan, and test suite.
-- `schemas/action.schema.json` — logical `CallToolAction` and tool argument schemas.
-- `schemas/program.schema.json` — transaction and direct-command AST schemas.
-- `schemas/observation.schema.json` — public observation schema.
-- `schemas/task.schema.json` — administrator task-instance schema.
-- `schemas/profile.schema.json` — signed empirical-profile manifest schema.
-- `schemas/errors.schema.json` — stable public error schema.
-- `SOURCE_MANIFEST.template.yaml` — immutable source/data provenance template.
-- `repository-tree.txt` — condensed proposed repository layout.
-- `test-matrix.csv` — CI/admission/release test summary.
-- `examples/` — validated task, action, and observation examples.
-- `VALIDATION_REPORT.md` — local schema and cross-artifact validation results.
+- `SPEC.md` — concise normative specification.
+- `IMPLEMENTATION_PLAN.md` — phase order, serial gates, parallel workstreams, and acceptance criteria.
+- `TEST_PLAN.md` — release-oriented test suite.
+- `REPOSITORY_TREE.md` — proposed repository skeleton.
+- `SOURCE_MANIFEST.template.yaml` — source/provenance manifest template.
+- `schemas/*.schema.json` — compact structural schemas for the policy action, observation, and task config contracts.
+- `examples/*.json` — small examples validated against the schemas.
+- `VALIDATION_REPORT.md` — local validation summary.
 
-## Required pins
-
-- Ramulator 2.1: `278f1effc3838099a6ffe0ad5f9f572fea80c948`
-- OpenEnv v0.3.1: `7449c5dfe375c4c6e6f0827826925a46efd9249f`
-- Primary DDR4 data: ReadDisturbanceVTS25 `5d734309457cc8a4ea3b1ec36b93932925548bac`
-
-The specification requires real Ramulator execution, empirically calibrated profiles, genuine mitigations, and a fail-closed hardened sandbox. It prohibits mocks and simplified fallbacks in production, training, evaluation, integration testing, and release qualification.
+The schemas intentionally validate only the wire shape. DRAM legality, timing, disturbance statistics, sandbox policy, hidden-state non-leakage, and reward correctness are enforced by the simulator, sandbox, and tests rather than encoded in thousands of schema lines.

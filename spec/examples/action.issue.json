@@ -1,0 +1,36 @@
+{
+  "tool": "dram.issue",
+  "args": {
+    "commands": [
+      {
+        "op": "ACT",
+        "addr": {
+          "kind": "physical",
+          "channel": 0,
+          "rank": 0,
+          "bankgroup": 0,
+          "bank": 1,
+          "row": 1234
+        },
+        "tag": "a0"
+      },
+      {
+        "op": "WAIT",
+        "cycles": 32
+      },
+      {
+        "op": "PRE",
+        "addr": {
+          "kind": "physical",
+          "channel": 0,
+          "rank": 0,
+          "bankgroup": 0,
+          "bank": 1,
+          "row": 1234
+        },
+        "tag": "p0"
+      }
+    ],
+    "stop_on_error": true
+  }
+}

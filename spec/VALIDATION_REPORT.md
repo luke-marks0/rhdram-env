@@ -1,20 +1,24 @@
-# Local validation report
+# Validation report
 
-Generated: 2026-06-26T06:05:18.102083+00:00
+- `action` schema is valid Draft 2020-12.
+- `observation` schema is valid Draft 2020-12.
+- `task` schema is valid Draft 2020-12.
+- `examples/action.issue.json` validates against `schemas/action.schema.json`.
+- `examples/observation.reset.json` validates against `schemas/observation.schema.json`.
+- `examples/task.known_target.json` validates against `schemas/task.schema.json`.
+- Markdown code fences are balanced in the main documents.
 
-- PASS: `schemas/action.schema.json` parses and is a valid Draft 2020-12 schema.
-- PASS: `schemas/errors.schema.json` parses and is a valid Draft 2020-12 schema.
-- PASS: `schemas/observation.schema.json` parses and is a valid Draft 2020-12 schema.
-- PASS: `schemas/profile.schema.json` parses and is a valid Draft 2020-12 schema.
-- PASS: `schemas/program.schema.json` parses and is a valid Draft 2020-12 schema.
-- PASS: `schemas/task.schema.json` parses and is a valid Draft 2020-12 schema.
-- PASS: `examples/command_action.json` validates against `action.schema.json`.
-- PASS: `examples/initial_observation.json` validates against `observation.schema.json`.
-- PASS: `examples/task.yaml` validates against `task.schema.json`.
-- PASS: `SOURCE_MANIFEST.template.yaml` parses and contains immutable-source policy plus seven source entries.
-- PASS: `test-matrix.csv` parses with 43 test rows.
-- PASS: `SPECIFICATION.md` has balanced code fences, required no-mock block, implementation plan, and test-suite section (3109 lines).
-- PASS: embedded normative task and initial-observation examples validate against their schemas.
-- PASS: required Ramulator, OpenEnv, and VTS25 pins are present.
+## Line counts
 
-This report covers local syntax, schema, and cross-artifact consistency. Runtime simulator, calibration, mitigation, and sandbox conformance tests are specified but require the future repository implementation.
+- `IMPLEMENTATION_PLAN.md`: 64 lines
+- `README.md`: 16 lines
+- `REPOSITORY_TREE.md`: 64 lines
+- `SOURCE_MANIFEST.template.yaml`: 40 lines
+- `SPEC.md`: 281 lines
+- `TEST_PLAN.md`: 88 lines
+- `examples/action.issue.json`: 36 lines
+- `examples/observation.reset.json`: 54 lines
+- `examples/task.known_target.json`: 30 lines
+- `schemas/action.schema.json`: 157 lines
+- `schemas/observation.schema.json`: 105 lines
+- `schemas/task.schema.json`: 169 lines

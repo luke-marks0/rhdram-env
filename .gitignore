@@ -1,0 +1,15 @@
+.pytest_cache/
+__pycache__/
+*.py[cod]
+.mypy_cache/
+.ruff_cache/
+
+# Controlled caches: scripts may populate these locally, but raw research
+# artifacts and generated profiles are not committed.
+data/raw/*
+!data/raw/.gitignore
+data/canonical/*
+!data/canonical/.gitignore
+data/profiles/*
+!data/profiles/.gitignore
+

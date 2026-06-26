@@ -1,110 +1,40 @@
-schema_version: rh-source-manifest/v1
-manifest_status: template
-policy:
-  runtime_network_downloads: forbidden
-  require_immutable_revision_or_doi: true
-  require_per_file_checksums_before_profile_build: true
-  require_license_clearance_before_redistribution: true
-  fail_on_inventory_drift: true
+# Copy to SOURCE_MANIFEST.yaml and fill all pins before executable work is admitted.
+manifest_version: 1
+created_utc: "YYYY-MM-DDTHH:MM:SSZ"
 
 sources:
-  - id: vts25-ddr4-read-disturbance
-    role: primary_ddr4_calibration
-    paper_url: https://arxiv.org/abs/2503.16749
-    repository_url: https://github.com/CMU-SAFARI/ReadDisturbanceVTS25
-    revision: 5d734309457cc8a4ea3b1ec36b93932925548bac
-    data_url: https://github.com/CMU-SAFARI/ReadDisturbanceVTS25/tree/5d734309457cc8a4ea3b1ec36b93932925548bac/data
-    expected_file_families:
-      - '*_retention.csv'
-      - '*_rd_ber.csv'
-      - '*_rd_hcf.csv'
-      - '*_rd_rp.csv'
-      - '*_ds_ber_sweep.csv'
-    checksums: TO_BE_COMPUTED_AND_COMMITTED_BY_FETCH_JOB
-    license_status: review_required
-    redistribution: forbidden_until_cleared
-    split_unit: physical_module_or_chip
-    allowed_uses:
-      - offline_ingestion
-      - calibration_after_license_review
-      - held_out_validation_after_license_review
+  - id: ramulator2
+    role: simulator
+    url: https://github.com/CMU-SAFARI/ramulator2/tree/v2.1
+    commit: "<exact commit>"
+    license: "<license>"
+    sha256: "<archive sha256>"
 
-  - id: rowpress-artifact
-    role: protocol_semantics_and_mitigation_reference
-    paper_url: https://arxiv.org/abs/2306.17061
-    repository_url: https://github.com/CMU-SAFARI/RowPress
-    revision: 5b6f1502594e9ea7a1557b98b5544c096a30eec5
-    data_url: null
-    checksums: TO_BE_COMPUTED_AND_COMMITTED_BY_FETCH_JOB
-    license_status: mit_for_code_verify_data_separately
-    redistribution: subject_to_file_level_audit
-    allowed_uses:
-      - protocol_review
-      - mitigation_reference
-      - artifact_reproduction
+  - id: openenv
+    role: rl_environment_protocol
+    url: https://github.com/huggingface/OpenEnv/releases/tag/v0.3.1
+    commit: "<exact commit>"
+    license: "<license>"
+    sha256: "<archive sha256>"
 
-  - id: dsn24-hbm2-read-disturbance
-    role: hbm2_calibration_and_validation
-    paper_url: https://arxiv.org/abs/2310.14665
-    repository_url: https://github.com/CMU-SAFARI/HBM-Read-Disturbance
-    revision: bc9d600e03efbe38c740ba015398510ca9bd1a60
-    data_url: https://zenodo.org/records/10257930
-    doi: 10.5281/zenodo.10257930
-    files:
-      - name: DSN_24_HBM_AE.zip
-        size_bytes: TO_BE_CONFIRMED_BY_FETCH_JOB
-        md5: 0601628cb43d6e1e7c9d6dd6ad2dfd26
-        sha256: TO_BE_COMPUTED_AND_COMMITTED_BY_FETCH_JOB
-    license_status: cc-by-4.0
-    attribution_required: true
-    split_unit: physical_hbm2_chip
-    allowed_uses:
-      - offline_ingestion
-      - separate_hbm2_profile
-      - held_out_validation
+  - id: ddr4_vts25
+    role: empirical_ddr4_read_disturbance_profile_source
+    url: https://github.com/CMU-SAFARI/ReadDisturbanceVTS25
+    commit: "<exact commit>"
+    paper: https://arxiv.org/abs/2503.16749
+    license: "<license or data-use terms>"
+    sha256: "<archive sha256>"
 
-  - id: original-rowhammer-artifact
-    role: historical_ddr3_validation_only
-    paper_url: https://users.ece.cmu.edu/~yoonguk/papers/kim-isca14.pdf
-    repository_url: https://github.com/CMU-SAFARI/rowhammer
-    revision: TO_BE_PINNED_BEFORE_INGESTION
-    data_url: https://github.com/CMU-SAFARI/rowhammer/tree/master/data
-    checksums: TO_BE_COMPUTED_AFTER_PINNING
-    license_status: file_level_review_required
-    allowed_uses:
-      - historical_regression
-      - separate_ddr3_profile_after_review
-    forbidden_uses:
-      - pooling_into_ddr4_profile_without_approved_study
+  - id: hbm2_read_disturbance
+    role: optional_empirical_hbm2_profile_source
+    url: https://github.com/CMU-SAFARI/HBM-Read-Disturbance
+    commit: "<exact commit>"
+    paper: https://arxiv.org/abs/2310.14665
+    license: "<license or data-use terms>"
+    sha256: "<archive sha256>"
 
-  - id: dram-voltage-study-retention
-    role: ddr3l_retention_cross_validation
-    repository_url: https://github.com/CMU-SAFARI/DRAM-Voltage-Study
-    revision: TO_BE_PINNED_BEFORE_INGESTION
-    data_url: https://github.com/CMU-SAFARI/DRAM-Voltage-Study/blob/master/characterization_results/retention_time_profile.csv
-    checksums: TO_BE_COMPUTED_AFTER_PINNING
-    license_status: review_required
-    allowed_uses:
-      - separate_ddr3l_retention_profile_after_review
-      - aggregate_cross_validation
-    forbidden_uses:
-      - transferring_parameters_to_ddr4_or_hbm2
-
-  - id: revisiting-rowhammer-2020
-    role: aggregate_validation_only
-    paper_url: https://arxiv.org/abs/2005.13121
-    revision: arxiv-version-to-be-recorded
-    data_url: null
-    license_status: paper_citation_only
-    allowed_uses:
-      - aggregate_sanity_checks
-
-  - id: variable-read-disturbance-2025
-    role: aggregate_temporal_variability_validation_only
-    paper_url: https://arxiv.org/abs/2502.13075
-    revision: arxiv-version-to-be-recorded
-    data_url: null
-    license_status: paper_citation_only
-    allowed_uses:
-      - aggregate_sanity_checks
-      - model_limitation_review
+policy:
+  no_mocks: true
+  no_mock_fallbacks: true
+  fail_closed_for_unavailable_capabilities: true
+  simulation_only: true

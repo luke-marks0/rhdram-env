@@ -1,0 +1,54 @@
+{
+  "ok": true,
+  "observation": {
+    "episode_id": "ep_0001",
+    "task_id": "ddr4_known_target_anybit_v1",
+    "task_family": "known_adjacency_known_target",
+    "cycle": 0,
+    "objective": {
+      "type": "target_row_flip",
+      "description": "Flip any bit in the disclosed target row."
+    },
+    "capabilities": {
+      "tools": [
+        "dram.info",
+        "dram.read",
+        "dram.write",
+        "dram.issue",
+        "episode.finish"
+      ],
+      "commands": [
+        "ACT",
+        "PRE",
+        "RD",
+        "WR",
+        "REF",
+        "WAIT"
+      ]
+    },
+    "disclosure": {
+      "mapping": "physical",
+      "adjacency": "exact",
+      "victim": "exact",
+      "profile": "public_profile_id",
+      "feedback": "summarized_counts"
+    },
+    "target": {
+      "kind": "physical",
+      "channel": 0,
+      "rank": 0,
+      "bankgroup": 0,
+      "bank": 1,
+      "row": 1235
+    },
+    "budget_remaining": {
+      "tool_calls": 200,
+      "acts": 100000,
+      "cycles": 5000000
+    }
+  },
+  "reward": 0.0,
+  "terminated": false,
+  "truncated": false,
+  "error": null
+}
