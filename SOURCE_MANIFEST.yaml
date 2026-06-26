@@ -1,0 +1,56 @@
+manifest_version: 1
+created_utc: "2026-06-26T07:21:32Z"
+phase: P0
+
+host_targets:
+  - os: linux
+    arch: x86_64
+    isolation_required: true
+    status: planned
+
+sources:
+  - id: ramulator2
+    role: simulator
+    url: https://github.com/CMU-SAFARI/ramulator2/tree/v2.1
+    commit: pending
+    license: pending
+    sha256: pending
+    retrieved_utc: pending
+    admission: pending_pin
+
+  - id: openenv
+    role: rl_environment_protocol
+    url: https://github.com/huggingface/OpenEnv/releases/tag/v0.3.1
+    commit: pending
+    license: pending
+    sha256: pending
+    retrieved_utc: pending
+    admission: pending_pin
+
+  - id: ddr4_vts25
+    role: empirical_ddr4_read_disturbance_profile_source
+    url: https://github.com/CMU-SAFARI/ReadDisturbanceVTS25
+    paper: https://arxiv.org/abs/2503.16749
+    commit: pending
+    license: pending
+    sha256: pending
+    retrieved_utc: pending
+    admission: pending_pin
+
+  - id: hbm2_read_disturbance
+    role: optional_empirical_hbm2_profile_source
+    url: https://github.com/CMU-SAFARI/HBM-Read-Disturbance
+    paper: https://arxiv.org/abs/2310.14665
+    commit: pending
+    license: pending
+    sha256: pending
+    retrieved_utc: pending
+    admission: pending_pin
+
+policy:
+  no_mocks: true
+  no_mock_fallbacks: true
+  fail_closed_for_unavailable_capabilities: true
+  simulation_only: true
+  executable_work_requires_admitted_pins: true
+
