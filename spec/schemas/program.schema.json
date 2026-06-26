@@ -1,0 +1,546 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://rowhammer-openenv.invalid/schemas/program.schema.json",
+  "title": "RowHammer-OpenEnv Program AST",
+  "type": "object",
+  "$defs": {
+    "Address": {
+      "title": "SimulatedAddress",
+      "description": "A synthetic simulator address. Never a host physical or virtual address.",
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "space",
+            "value"
+          ],
+          "properties": {
+            "space": {
+              "const": "logical"
+            },
+            "value": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 18446744073709551615
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "space",
+            "channel"
+          ],
+          "properties": {
+            "space": {
+              "const": "dram"
+            },
+            "channel": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "pseudochannel": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "rank": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "bank_group": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "bank": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "subarray": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "row": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "column": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "device": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "lane": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "bit": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "burst_offset": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "space",
+            "value"
+          ],
+          "properties": {
+            "space": {
+              "const": "row_handle"
+            },
+            "value": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256,
+              "pattern": "^[A-Za-z0-9._:-]+$"
+            }
+          }
+        }
+      ]
+    },
+    "Payload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "encoding",
+        "data"
+      ],
+      "properties": {
+        "encoding": {
+          "enum": [
+            "base64url",
+            "hex"
+          ]
+        },
+        "data": {
+          "type": "string",
+          "maxLength": 1398104
+        },
+        "mask": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 1398104
+        }
+      }
+    },
+    "Wait": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "op",
+        "cycles"
+      ],
+      "properties": {
+        "op": {
+          "const": "wait"
+        },
+        "cycles": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "Barrier": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "op",
+        "scope"
+      ],
+      "properties": {
+        "op": {
+          "const": "barrier"
+        },
+        "scope": {
+          "enum": [
+            "program",
+            "source",
+            "controller",
+            "all"
+          ]
+        },
+        "source_id": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "Transaction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "op",
+        "kind",
+        "address",
+        "size"
+      ],
+      "properties": {
+        "op": {
+          "const": "transaction"
+        },
+        "kind": {
+          "enum": [
+            "READ",
+            "WRITE"
+          ]
+        },
+        "address": {
+          "$ref": "#/$defs/Address"
+        },
+        "size": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1048576
+        },
+        "source_id": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "payload": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/Payload"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "tag": {
+          "type": "string",
+          "maxLength": 128
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "WRITE"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "required": [
+              "payload"
+            ]
+          }
+        }
+      ]
+    },
+    "TransactionSequence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "op",
+        "body"
+      ],
+      "properties": {
+        "op": {
+          "const": "sequence"
+        },
+        "body": {
+          "type": "array",
+          "maxItems": 100000,
+          "items": {
+            "$ref": "#/$defs/TransactionNode"
+          }
+        }
+      }
+    },
+    "TransactionRepeat": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "op",
+        "count",
+        "body"
+      ],
+      "properties": {
+        "op": {
+          "const": "repeat"
+        },
+        "count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000000
+        },
+        "body": {
+          "type": "array",
+          "maxItems": 100000,
+          "items": {
+            "$ref": "#/$defs/TransactionNode"
+          }
+        }
+      }
+    },
+    "TransactionNode": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/Transaction"
+        },
+        {
+          "$ref": "#/$defs/Wait"
+        },
+        {
+          "$ref": "#/$defs/Barrier"
+        },
+        {
+          "$ref": "#/$defs/TransactionSequence"
+        },
+        {
+          "$ref": "#/$defs/TransactionRepeat"
+        }
+      ]
+    },
+    "TransactionProgram": {
+      "type": "array",
+      "maxItems": 100000,
+      "items": {
+        "$ref": "#/$defs/TransactionNode"
+      }
+    },
+    "Command": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "op",
+        "command",
+        "address"
+      ],
+      "properties": {
+        "op": {
+          "const": "command"
+        },
+        "command": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^[A-Za-z0-9_+-]+$"
+        },
+        "address": {
+          "$ref": "#/$defs/Address"
+        },
+        "requested_relative_cycle": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "payload": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/Payload"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "tag": {
+          "type": "string",
+          "maxLength": 128
+        }
+      }
+    },
+    "CommandSequence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "op",
+        "body"
+      ],
+      "properties": {
+        "op": {
+          "const": "sequence"
+        },
+        "body": {
+          "type": "array",
+          "maxItems": 100000,
+          "items": {
+            "$ref": "#/$defs/CommandNode"
+          }
+        }
+      }
+    },
+    "CommandRepeat": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "op",
+        "count",
+        "body"
+      ],
+      "properties": {
+        "op": {
+          "const": "repeat"
+        },
+        "count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000000
+        },
+        "body": {
+          "type": "array",
+          "maxItems": 100000,
+          "items": {
+            "$ref": "#/$defs/CommandNode"
+          }
+        }
+      }
+    },
+    "CommandNode": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/Command"
+        },
+        {
+          "$ref": "#/$defs/Wait"
+        },
+        {
+          "$ref": "#/$defs/Barrier"
+        },
+        {
+          "$ref": "#/$defs/CommandSequence"
+        },
+        {
+          "$ref": "#/$defs/CommandRepeat"
+        }
+      ]
+    },
+    "CommandProgram": {
+      "type": "array",
+      "maxItems": 100000,
+      "items": {
+        "$ref": "#/$defs/CommandNode"
+      }
+    },
+    "TransactionExecution": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "queue_policy": {
+          "enum": [
+            "reject_on_full",
+            "retry_until_deadline",
+            "retry_n_cycles"
+          ]
+        },
+        "retry_cycles": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "max_cycles": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "max_issued_commands": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "on_error": {
+          "enum": [
+            "abort",
+            "continue"
+          ]
+        },
+        "completion": {
+          "enum": [
+            "return_after_submit",
+            "drain_program",
+            "drain_all"
+          ]
+        }
+      }
+    },
+    "CommandExecution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "timing_mode"
+      ],
+      "properties": {
+        "timing_mode": {
+          "enum": [
+            "strict",
+            "earliest_legal"
+          ]
+        },
+        "max_cycles": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "max_issued_commands": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "on_error": {
+          "enum": [
+            "abort",
+            "continue"
+          ]
+        },
+        "completion": {
+          "enum": [
+            "return_after_submit",
+            "drain_program",
+            "drain_all"
+          ]
+        }
+      }
+    }
+  },
+  "oneOf": [
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "program"
+      ],
+      "properties": {
+        "kind": {
+          "const": "transactions"
+        },
+        "program": {
+          "$ref": "#/$defs/TransactionProgram"
+        },
+        "execution": {
+          "$ref": "#/$defs/TransactionExecution"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "program"
+      ],
+      "properties": {
+        "kind": {
+          "const": "commands"
+        },
+        "program": {
+          "$ref": "#/$defs/CommandProgram"
+        },
+        "execution": {
+          "$ref": "#/$defs/CommandExecution"
+        }
+      }
+    }
+  ]
+}

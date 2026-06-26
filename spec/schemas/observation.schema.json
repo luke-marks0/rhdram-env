@@ -1,0 +1,233 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://rowhammer-openenv.invalid/schemas/observation.schema.json",
+  "title": "RowHammer-OpenEnv Observation",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "api_version",
+    "episode_id",
+    "phase",
+    "task",
+    "tool_catalog",
+    "result",
+    "budget",
+    "public_metrics",
+    "messages",
+    "termination",
+    "build"
+  ],
+  "properties": {
+    "api_version": {
+      "const": "rh-openenv/v1"
+    },
+    "episode_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "phase": {
+      "enum": [
+        "ready",
+        "running",
+        "succeeded",
+        "failed",
+        "truncated"
+      ]
+    },
+    "task": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "additionalProperties": true
+    },
+    "tool_catalog": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "name",
+              "input_schema"
+            ],
+            "properties": {
+              "name": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128
+              },
+              "description": {
+                "type": "string",
+                "maxLength": 4096
+              },
+              "input_schema": {
+                "type": "object"
+              },
+              "schema_digest": {
+                "type": "string",
+                "maxLength": 128
+              }
+            }
+          }
+        }
+      ]
+    },
+    "result": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "additionalProperties": true
+    },
+    "budget": {
+      "type": "object",
+      "maxProperties": 64,
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "used",
+          "limit"
+        ],
+        "properties": {
+          "used": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "remaining": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      }
+    },
+    "public_metrics": {
+      "type": "object",
+      "maxProperties": 128,
+      "additionalProperties": {
+        "type": [
+          "integer",
+          "number",
+          "string",
+          "boolean",
+          "null"
+        ]
+      }
+    },
+    "messages": {
+      "type": "array",
+      "maxItems": 128,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "level",
+          "code",
+          "text"
+        ],
+        "properties": {
+          "level": {
+            "enum": [
+              "debug",
+              "info",
+              "warning",
+              "error"
+            ]
+          },
+          "code": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "text": {
+            "type": "string",
+            "maxLength": 4096
+          }
+        }
+      }
+    },
+    "termination": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "reason"
+          ],
+          "properties": {
+            "kind": {
+              "enum": [
+                "success",
+                "failure",
+                "truncation"
+              ]
+            },
+            "reason": {
+              "type": "string",
+              "maxLength": 256
+            },
+            "infrastructure": {
+              "type": "boolean"
+            },
+            "verified_cycle": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            }
+          }
+        }
+      ]
+    },
+    "build": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "environment",
+        "ramulator_commit",
+        "openenv_commit",
+        "profile"
+      ],
+      "properties": {
+        "environment": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "ramulator_commit": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$"
+        },
+        "openenv_commit": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$"
+        },
+        "profile": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "sandbox": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 256
+        }
+      }
+    }
+  }
+}

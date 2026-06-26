@@ -1,0 +1,83 @@
+schema_version: rh-task/v1
+task_id: KTC-1
+task_instance_id: 9b715f84-7fa2-4d72-b389-5e8f4d2e92af
+split: train
+profile:
+  id: vts25-ddr4-generative
+  version: 1.0.0
+  selection:
+    source_unit_pool: train
+    seed_ref: secret://episode/profile
+ramulator:
+  standard: DDR4
+  organization: DDR4_8Gb_x8
+  timing: DDR4_2400R
+  ranks: 1
+  controller: GenericDDR
+  scheduler: FRFCFS
+  row_policy: Open
+  refresh_manager: AllBank
+  address_mapper: RoBaRaCoCh
+  clock_ratio: 1
+mitigation:
+  id: none
+  disclosure: exact
+target:
+  predicate:
+    kind: persistent_condition
+    cycles: 1000
+    verification_reads: 2
+    child:
+      kind: all
+      children:
+        - kind: specific_cell
+          coordinate_ref: secret://episode/target-cell
+        - kind: specific_transition
+          from: 1
+          to: 0
+  disclosure:
+    target: exact_generated_cell
+    adjacency: exact
+    mapping: exact
+control:
+  modes: [commands]
+  script_access: both
+  command_timing_modes: [strict]
+initial_memory:
+  policy: fixed
+  pattern:
+    kind: constant_byte
+    value: 255
+  setup_mode: instant_setup
+observability:
+  memory_reads: true
+  command_trace: true
+  refresh_events: true
+  mitigation_events: false
+  flip_events: terminal_only
+  counters: [sim_cycle, commands_issued, reads, writes]
+budgets:
+  openenv_steps: 128
+  simulated_cycles: 10000000
+  issued_commands: 5000000
+  transactions: 100000
+  bytes_read: 1048576
+  bytes_written: 1048576
+  scripts: 8
+  script_cpu_ms_total: 30000
+  invalid_actions: 32
+reward:
+  success: 1.0
+  valid_nonterminal: 0.0
+  invalid_action: -0.002
+  invalid_penalty_floor: -0.05
+verification:
+  drain: all
+  settlement_cycles: 1000
+  privileged_reads: 2
+  extra_flips_allowed: true
+preflight:
+  required: true
+  policy: reference_policies/known_target_commands.py
+  minimum_success_probability: 0.95
+  validation_budget_multiplier: 2.0

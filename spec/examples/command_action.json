@@ -1,0 +1,41 @@
+{
+  "tool_name": "submit_command_program",
+  "arguments": {
+    "api_version": "rh-openenv/v1",
+    "request_id": "bb6af7ae-cd3e-45d9-9bce-4690b8b29a13",
+    "program": [
+      {
+        "op": "command",
+        "command": "ACT",
+        "address": {
+          "space": "dram",
+          "channel": 0,
+          "rank": 0,
+          "bank": 0,
+          "row": 12
+        }
+      },
+      {
+        "op": "wait",
+        "cycles": 24
+      },
+      {
+        "op": "command",
+        "command": "PRE",
+        "address": {
+          "space": "dram",
+          "channel": 0,
+          "rank": 0,
+          "bank": 0
+        }
+      }
+    ],
+    "execution": {
+      "timing_mode": "strict",
+      "max_cycles": 1000,
+      "max_issued_commands": 100,
+      "on_error": "abort",
+      "completion": "drain_program"
+    }
+  }
+}

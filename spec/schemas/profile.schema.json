@@ -1,0 +1,253 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://rowhammer-openenv.invalid/schemas/profile.schema.json",
+  "title": "RowHammer-OpenEnv Signed Profile Manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "profile_id",
+    "version",
+    "mode",
+    "standard",
+    "compatible_ramulator",
+    "sources",
+    "domain",
+    "split_manifest_digest",
+    "model",
+    "validation",
+    "content_digest",
+    "signature"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "rh-profile/v1"
+    },
+    "profile_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "version": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64
+    },
+    "mode": {
+      "enum": [
+        "measured_replay",
+        "empirical_generative",
+        "research_hypothesis_extension"
+      ]
+    },
+    "standard": {
+      "enum": [
+        "DDR3",
+        "DDR3L",
+        "DDR4",
+        "DDR5",
+        "LPDDR5",
+        "HBM2",
+        "HBM3",
+        "HBM4",
+        "GDDR6"
+      ]
+    },
+    "compatible_ramulator": {
+      "type": "object",
+      "required": [
+        "commit",
+        "organizations",
+        "timings"
+      ],
+      "properties": {
+        "commit": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$"
+        },
+        "organizations": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string"
+          }
+        },
+        "timings": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "sources": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "url",
+          "revision_or_doi",
+          "manifest_digest",
+          "license_status"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "url": {
+            "type": "string",
+            "format": "uri"
+          },
+          "revision_or_doi": {
+            "type": "string"
+          },
+          "manifest_digest": {
+            "type": "string"
+          },
+          "license_status": {
+            "enum": [
+              "cleared",
+              "restricted",
+              "review_required"
+            ]
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "domain": {
+      "type": "object",
+      "required": [
+        "temperature_c",
+        "refresh",
+        "access_patterns"
+      ],
+      "properties": {
+        "temperature_c": {
+          "type": "object",
+          "required": [
+            "min",
+            "max"
+          ],
+          "properties": {
+            "min": {
+              "type": "number"
+            },
+            "max": {
+              "type": "number"
+            }
+          },
+          "additionalProperties": false
+        },
+        "refresh": {
+          "type": "object"
+        },
+        "access_patterns": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string"
+          }
+        },
+        "max_neighbor_distance": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "unsupported_behavior": {
+          "const": "fail_closed"
+        }
+      },
+      "additionalProperties": true
+    },
+    "split_manifest_digest": {
+      "type": "string",
+      "minLength": 16
+    },
+    "model": {
+      "type": "object",
+      "required": [
+        "runtime_format",
+        "builder_commit",
+        "parser_versions",
+        "rng"
+      ],
+      "properties": {
+        "runtime_format": {
+          "type": "string"
+        },
+        "builder_commit": {
+          "type": "string"
+        },
+        "parser_versions": {
+          "type": "object"
+        },
+        "rng": {
+          "type": "object"
+        },
+        "cell_identity": {
+          "enum": [
+            "measured",
+            "generated",
+            "mixed"
+          ]
+        }
+      },
+      "additionalProperties": true
+    },
+    "validation": {
+      "type": "object",
+      "required": [
+        "held_out_units",
+        "metrics",
+        "passed"
+      ],
+      "properties": {
+        "held_out_units": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "metrics": {
+          "type": "object"
+        },
+        "passed": {
+          "const": true
+        },
+        "report_digest": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "model_card": {
+      "type": "string"
+    },
+    "content_digest": {
+      "type": "string",
+      "pattern": "^(sha256:)?[0-9a-f]{64}$"
+    },
+    "signature": {
+      "type": "object",
+      "required": [
+        "algorithm",
+        "key_id",
+        "value"
+      ],
+      "properties": {
+        "algorithm": {
+          "type": "string"
+        },
+        "key_id": {
+          "type": "string"
+        },
+        "value": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}
