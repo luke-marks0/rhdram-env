@@ -10,14 +10,24 @@ Current scope:
 - host-interface denylist;
 - no-mock and fail-closed policy;
 - local phase 0 verification.
+- phase 1 bootstrap from OpenEnv-style `reset()`/`step()` into a real
+  Ramulator 2.1 `External` frontend request path.
 
-No Ramulator, OpenEnv, disturbance, profile, sandbox, or task runtime code is
-admitted yet. Executable implementation starts only after the external source
-pins in `SOURCE_MANIFEST.yaml` are resolved and admitted.
+Ramulator and OpenEnv are admitted only for the Phase 1 bootstrap. Disturbance,
+profile, sandbox, task, reward, SDK, and mitigation implementation remain
+unavailable.
 
 Run the phase 0 gate:
 
 ```sh
 python3 -B scripts/verify_phase0.py
 python3 -B -m unittest discover -s tests
+```
+
+Phase 1 needs fetched upstream sources and a local Ramulator build:
+
+```sh
+python3 -B scripts/fetch_phase1_sources.py
+python3 -B scripts/build_phase1.py
+python3 -B scripts/verify_phase1.py
 ```
