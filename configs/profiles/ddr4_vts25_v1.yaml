@@ -1,0 +1,27 @@
+# Build recipe for the first DDR4 read-disturbance profile.
+# Domain facts (temperatures, aggressor classes, data patterns, RowPress support) are
+# derived from the measured data; this file fixes only the recipe-level choices.
+profile_id: ddr4_vts25_v1
+standard: DDR4
+source_id: ddr4_vts25
+labeling: sampled-not-exact-replay
+
+domain:
+  # Policy choices that are not derivable from the measurements:
+  temperature_extrapolation: false
+  timing: ddr4_nominal_dram_bender
+  timing_extrapolation: false
+
+fit:
+  # A family is treated as directionally biased (and its dominant bitflip direction
+  # is gated on held-out data) only when the two patterns' median HC-first differ by
+  # at least this factor. Near-symmetric families (e.g. axmicr) are not direction-gated.
+  direction_bias_min_strength: 1.15
+
+validation:
+  # Sanity gates for held-out checks (not tight scientific bounds). Within-module
+  # (unseen rows of training chips) is gated strictly; cross-module (unseen chips) is
+  # gated on central tendency and structure only, since shape shifts between modules.
+  row_ks_gate: 0.30
+  row_median_ratio_gate: 1.5
+  chip_median_ratio_gate: 2.5

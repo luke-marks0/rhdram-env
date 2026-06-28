@@ -1,0 +1,6 @@
+rhdram-openenv profile-builder development trust root v1
+# The first non-empty line above is the canonical seed phrase. The profile-builder
+# derives an Ed25519 signing key as sha256(seed_phrase). This is a development trust
+# anchor for reproducible, tamper-evident builds inside this repository only.
+# Production deployments MUST replace it with an externally managed (HSM/KMS) key,
+# re-sign every profile, and publish the new public key in profile_builder/trust/.

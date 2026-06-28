@@ -1,0 +1,789 @@
+{
+  "checks": [
+    {
+      "check": "median_ratio",
+      "family": "axmicr",
+      "gate": 1.5,
+      "n_holdout": 1089,
+      "passed": true,
+      "ratio": 1.0119750897918842,
+      "stratum": "single|all_ones",
+      "tier": "within_module"
+    },
+    {
+      "check": "ks",
+      "family": "axmicr",
+      "gate": 0.3,
+      "ks": 0.05727617587435485,
+      "n_holdout": 1089,
+      "passed": true,
+      "stratum": "single|all_ones",
+      "tier": "within_module"
+    },
+    {
+      "check": "median_ratio",
+      "family": "axmicr",
+      "gate": 1.5,
+      "n_holdout": 1089,
+      "passed": true,
+      "ratio": 1.0293927158036253,
+      "stratum": "single|all_zeros",
+      "tier": "within_module"
+    },
+    {
+      "check": "ks",
+      "family": "axmicr",
+      "gate": 0.3,
+      "ks": 0.07297843248852542,
+      "n_holdout": 1089,
+      "passed": true,
+      "stratum": "single|all_zeros",
+      "tier": "within_module"
+    },
+    {
+      "check": "median_ratio",
+      "family": "axmicr",
+      "gate": 1.5,
+      "n_holdout": 545,
+      "passed": true,
+      "ratio": 0.992206657851551,
+      "stratum": "double|all_ones",
+      "tier": "within_module"
+    },
+    {
+      "check": "ks",
+      "family": "axmicr",
+      "gate": 0.3,
+      "ks": 0.08350291488739842,
+      "n_holdout": 545,
+      "passed": true,
+      "stratum": "double|all_ones",
+      "tier": "within_module"
+    },
+    {
+      "check": "median_ratio",
+      "family": "axmicr",
+      "gate": 1.5,
+      "n_holdout": 545,
+      "passed": true,
+      "ratio": 0.9964205340510686,
+      "stratum": "double|all_zeros",
+      "tier": "within_module"
+    },
+    {
+      "check": "ks",
+      "family": "axmicr",
+      "gate": 0.3,
+      "ks": 0.045664251699080505,
+      "n_holdout": 545,
+      "passed": true,
+      "stratum": "double|all_zeros",
+      "tier": "within_module"
+    },
+    {
+      "check": "ordering",
+      "double_median": 49000.0,
+      "family": "axmicr",
+      "passed": true,
+      "single_median": 280000.0,
+      "stratum": "single_gt_double|all_ones",
+      "tier": "within_module"
+    },
+    {
+      "check": "ordering",
+      "double_median": 49000.0,
+      "family": "axmicr",
+      "passed": true,
+      "single_median": 280000.0,
+      "stratum": "single_gt_double|all_zeros",
+      "tier": "within_module"
+    },
+    {
+      "bias_strength": 1.0,
+      "check": "direction",
+      "diagnostic": true,
+      "family": "axmicr",
+      "fitted_dominant_pattern": "all_ones",
+      "gated": false,
+      "observed_dominant_pattern": "all_zeros",
+      "passed": true,
+      "stratum": "direction",
+      "tier": "within_module"
+    },
+    {
+      "check": "median_ratio",
+      "family": "hisasa",
+      "gate": 1.5,
+      "n_holdout": 3039,
+      "passed": true,
+      "ratio": 0.909754342494666,
+      "stratum": "single|all_ones",
+      "tier": "within_module"
+    },
+    {
+      "check": "ks",
+      "family": "hisasa",
+      "gate": 0.3,
+      "ks": 0.1264750665492257,
+      "n_holdout": 3039,
+      "passed": true,
+      "stratum": "single|all_ones",
+      "tier": "within_module"
+    },
+    {
+      "check": "median_ratio",
+      "family": "hisasa",
+      "gate": 2.5,
+      "n_holdout": 4092,
+      "passed": true,
+      "ratio": 0.7697921359570251,
+      "stratum": "single|all_ones",
+      "tier": "cross_module"
+    },
+    {
+      "check": "ks_diagnostic",
+      "diagnostic": true,
+      "family": "hisasa",
+      "ks": 0.3931801815283855,
+      "n_holdout": 4092,
+      "passed": true,
+      "stratum": "single|all_ones",
+      "tier": "cross_module"
+    },
+    {
+      "check": "median_ratio",
+      "family": "hisasa",
+      "gate": 1.5,
+      "n_holdout": 3039,
+      "passed": true,
+      "ratio": 0.893863376417963,
+      "stratum": "single|all_zeros",
+      "tier": "within_module"
+    },
+    {
+      "check": "ks",
+      "family": "hisasa",
+      "gate": 0.3,
+      "ks": 0.13956386157375056,
+      "n_holdout": 3039,
+      "passed": true,
+      "stratum": "single|all_zeros",
+      "tier": "within_module"
+    },
+    {
+      "check": "median_ratio",
+      "family": "hisasa",
+      "gate": 2.5,
+      "n_holdout": 4092,
+      "passed": true,
+      "ratio": 0.7821304543657176,
+      "stratum": "single|all_zeros",
+      "tier": "cross_module"
+    },
+    {
+      "check": "ks_diagnostic",
+      "diagnostic": true,
+      "family": "hisasa",
+      "ks": 0.4301739124302715,
+      "n_holdout": 4092,
+      "passed": true,
+      "stratum": "single|all_zeros",
+      "tier": "cross_module"
+    },
+    {
+      "check": "median_ratio",
+      "family": "hisasa",
+      "gate": 1.5,
+      "n_holdout": 1522,
+      "passed": true,
+      "ratio": 0.8380656059560264,
+      "stratum": "double|all_ones",
+      "tier": "within_module"
+    },
+    {
+      "check": "ks",
+      "family": "hisasa",
+      "gate": 0.3,
+      "ks": 0.16580248764182226,
+      "n_holdout": 1522,
+      "passed": true,
+      "stratum": "double|all_ones",
+      "tier": "within_module"
+    },
+    {
+      "check": "median_ratio",
+      "family": "hisasa",
+      "gate": 2.5,
+      "n_holdout": 2048,
+      "passed": true,
+      "ratio": 0.8799688862538277,
+      "stratum": "double|all_ones",
+      "tier": "cross_module"
+    },
+    {
+      "check": "ks_diagnostic",
+      "diagnostic": true,
+      "family": "hisasa",
+      "ks": 0.44441966030198876,
+      "n_holdout": 2048,
+      "passed": true,
+      "stratum": "double|all_ones",
+      "tier": "cross_module"
+    },
+    {
+      "check": "median_ratio",
+      "family": "hisasa",
+      "gate": 1.5,
+      "n_holdout": 1522,
+      "passed": true,
+      "ratio": 0.8894156666070374,
+      "stratum": "double|all_zeros",
+      "tier": "within_module"
+    },
+    {
+      "check": "ks",
+      "family": "hisasa",
+      "gate": 0.3,
+      "ks": 0.14426648724873825,
+      "n_holdout": 1522,
+      "passed": true,
+      "stratum": "double|all_zeros",
+      "tier": "within_module"
+    },
+    {
+      "check": "median_ratio",
+      "family": "hisasa",
+      "gate": 2.5,
+      "n_holdout": 2048,
+      "passed": true,
+      "ratio": 0.8894156666070374,
+      "stratum": "double|all_zeros",
+      "tier": "cross_module"
+    },
+    {
+      "check": "ks_diagnostic",
+      "diagnostic": true,
+      "family": "hisasa",
+      "ks": 0.433673840924543,
+      "n_holdout": 2048,
+      "passed": true,
+      "stratum": "double|all_zeros",
+      "tier": "cross_module"
+    },
+    {
+      "check": "ordering",
+      "double_median": 20000.0,
+      "family": "hisasa",
+      "passed": true,
+      "single_median": 130000.0,
+      "stratum": "single_gt_double|all_ones",
+      "tier": "within_module"
+    },
+    {
+      "check": "ordering",
+      "double_median": 17000.0,
+      "family": "hisasa",
+      "passed": true,
+      "single_median": 80000.0,
+      "stratum": "single_gt_double|all_zeros",
+      "tier": "within_module"
+    },
+    {
+      "bias_strength": 1.5555555555555556,
+      "check": "direction",
+      "diagnostic": false,
+      "family": "hisasa",
+      "fitted_dominant_pattern": "all_zeros",
+      "gated": true,
+      "observed_dominant_pattern": "all_zeros",
+      "passed": true,
+      "stratum": "direction",
+      "tier": "within_module"
+    },
+    {
+      "check": "ordering",
+      "double_median": 21000.0,
+      "family": "hisasa",
+      "passed": true,
+      "single_median": 110000.0,
+      "stratum": "single_gt_double|all_ones",
+      "tier": "cross_module"
+    },
+    {
+      "check": "ordering",
+      "double_median": 17000.0,
+      "family": "hisasa",
+      "passed": true,
+      "single_median": 70000.0,
+      "stratum": "single_gt_double|all_zeros",
+      "tier": "cross_module"
+    },
+    {
+      "bias_strength": 1.5555555555555556,
+      "check": "direction",
+      "diagnostic": false,
+      "family": "hisasa",
+      "fitted_dominant_pattern": "all_zeros",
+      "gated": true,
+      "observed_dominant_pattern": "all_zeros",
+      "passed": true,
+      "stratum": "direction",
+      "tier": "cross_module"
+    },
+    {
+      "check": "median_ratio",
+      "family": "hyhy",
+      "gate": 1.5,
+      "n_holdout": 3154,
+      "passed": true,
+      "ratio": 0.9684710913254428,
+      "stratum": "single|all_ones",
+      "tier": "within_module"
+    },
+    {
+      "check": "ks",
+      "family": "hyhy",
+      "gate": 0.3,
+      "ks": 0.06865359112668667,
+      "n_holdout": 3154,
+      "passed": true,
+      "stratum": "single|all_ones",
+      "tier": "within_module"
+    },
+    {
+      "check": "median_ratio",
+      "family": "hyhy",
+      "gate": 2.5,
+      "n_holdout": 4083,
+      "passed": true,
+      "ratio": 1.331647750572484,
+      "stratum": "single|all_ones",
+      "tier": "cross_module"
+    },
+    {
+      "check": "ks_diagnostic",
+      "diagnostic": true,
+      "family": "hyhy",
+      "ks": 0.5003408368574811,
+      "n_holdout": 4083,
+      "passed": true,
+      "stratum": "single|all_ones",
+      "tier": "cross_module"
+    },
+    {
+      "check": "median_ratio",
+      "family": "hyhy",
+      "gate": 1.5,
+      "n_holdout": 3157,
+      "passed": true,
+      "ratio": 0.9538548099500912,
+      "stratum": "single|all_zeros",
+      "tier": "within_module"
+    },
+    {
+      "check": "ks",
+      "family": "hyhy",
+      "gate": 0.3,
+      "ks": 0.0797188131551474,
+      "n_holdout": 3157,
+      "passed": true,
+      "stratum": "single|all_zeros",
+      "tier": "within_module"
+    },
+    {
+      "check": "median_ratio",
+      "family": "hyhy",
+      "gate": 2.5,
+      "n_holdout": 4090,
+      "passed": true,
+      "ratio": 1.2718064132667883,
+      "stratum": "single|all_zeros",
+      "tier": "cross_module"
+    },
+    {
+      "check": "ks_diagnostic",
+      "diagnostic": true,
+      "family": "hyhy",
+      "ks": 0.48479649955056575,
+      "n_holdout": 4090,
+      "passed": true,
+      "stratum": "single|all_zeros",
+      "tier": "cross_module"
+    },
+    {
+      "check": "median_ratio",
+      "family": "hyhy",
+      "gate": 1.5,
+      "n_holdout": 1579,
+      "passed": true,
+      "ratio": 1.0071313479550479,
+      "stratum": "double|all_ones",
+      "tier": "within_module"
+    },
+    {
+      "check": "ks",
+      "family": "hyhy",
+      "gate": 0.3,
+      "ks": 0.05723643853035543,
+      "n_holdout": 1579,
+      "passed": true,
+      "stratum": "double|all_ones",
+      "tier": "within_module"
+    },
+    {
+      "check": "median_ratio",
+      "family": "hyhy",
+      "gate": 2.5,
+      "n_holdout": 2042,
+      "passed": true,
+      "ratio": 1.3428417972733973,
+      "stratum": "double|all_ones",
+      "tier": "cross_module"
+    },
+    {
+      "check": "ks_diagnostic",
+      "diagnostic": true,
+      "family": "hyhy",
+      "ks": 0.6276208100914357,
+      "n_holdout": 2042,
+      "passed": true,
+      "stratum": "double|all_ones",
+      "tier": "cross_module"
+    },
+    {
+      "check": "median_ratio",
+      "family": "hyhy",
+      "gate": 1.5,
+      "n_holdout": 1580,
+      "passed": true,
+      "ratio": 1.0086345527310794,
+      "stratum": "double|all_zeros",
+      "tier": "within_module"
+    },
+    {
+      "check": "ks",
+      "family": "hyhy",
+      "gate": 0.3,
+      "ks": 0.06804574491127668,
+      "n_holdout": 1580,
+      "passed": true,
+      "stratum": "double|all_zeros",
+      "tier": "within_module"
+    },
+    {
+      "check": "median_ratio",
+      "family": "hyhy",
+      "gate": 2.5,
+      "n_holdout": 2044,
+      "passed": true,
+      "ratio": 1.375410753724199,
+      "stratum": "double|all_zeros",
+      "tier": "cross_module"
+    },
+    {
+      "check": "ks_diagnostic",
+      "diagnostic": true,
+      "family": "hyhy",
+      "ks": 0.6910518592420258,
+      "n_holdout": 2044,
+      "passed": true,
+      "stratum": "double|all_zeros",
+      "tier": "cross_module"
+    },
+    {
+      "check": "ordering",
+      "double_median": 33000.0,
+      "family": "hyhy",
+      "passed": true,
+      "single_median": 240000.0,
+      "stratum": "single_gt_double|all_ones",
+      "tier": "within_module"
+    },
+    {
+      "check": "ordering",
+      "double_median": 22000.0,
+      "family": "hyhy",
+      "passed": true,
+      "single_median": 120000.0,
+      "stratum": "single_gt_double|all_zeros",
+      "tier": "within_module"
+    },
+    {
+      "bias_strength": 2.0,
+      "check": "direction",
+      "diagnostic": false,
+      "family": "hyhy",
+      "fitted_dominant_pattern": "all_zeros",
+      "gated": true,
+      "observed_dominant_pattern": "all_zeros",
+      "passed": true,
+      "stratum": "direction",
+      "tier": "within_module"
+    },
+    {
+      "check": "ordering",
+      "double_median": 44000.0,
+      "family": "hyhy",
+      "passed": true,
+      "single_median": 330000.0,
+      "stratum": "single_gt_double|all_ones",
+      "tier": "cross_module"
+    },
+    {
+      "check": "ordering",
+      "double_median": 30000.0,
+      "family": "hyhy",
+      "passed": true,
+      "single_median": 160000.0,
+      "stratum": "single_gt_double|all_zeros",
+      "tier": "cross_module"
+    },
+    {
+      "bias_strength": 2.0,
+      "check": "direction",
+      "diagnostic": false,
+      "family": "hyhy",
+      "fitted_dominant_pattern": "all_zeros",
+      "gated": true,
+      "observed_dominant_pattern": "all_zeros",
+      "passed": true,
+      "stratum": "direction",
+      "tier": "cross_module"
+    },
+    {
+      "check": "median_ratio",
+      "family": "sasa",
+      "gate": 1.5,
+      "n_holdout": 1672,
+      "passed": true,
+      "ratio": 0.8226563192630766,
+      "stratum": "single|all_ones",
+      "tier": "within_module"
+    },
+    {
+      "check": "ks",
+      "family": "sasa",
+      "gate": 0.3,
+      "ks": 0.20018463197523584,
+      "n_holdout": 1672,
+      "passed": true,
+      "stratum": "single|all_ones",
+      "tier": "within_module"
+    },
+    {
+      "check": "median_ratio",
+      "family": "sasa",
+      "gate": 2.5,
+      "n_holdout": 4092,
+      "passed": true,
+      "ratio": 0.4798828529034614,
+      "stratum": "single|all_ones",
+      "tier": "cross_module"
+    },
+    {
+      "check": "ks_diagnostic",
+      "diagnostic": true,
+      "family": "sasa",
+      "ks": 0.6901366888240106,
+      "n_holdout": 4092,
+      "passed": true,
+      "stratum": "single|all_ones",
+      "tier": "cross_module"
+    },
+    {
+      "check": "median_ratio",
+      "family": "sasa",
+      "gate": 1.5,
+      "n_holdout": 1674,
+      "passed": true,
+      "ratio": 0.9654448944445043,
+      "stratum": "single|all_zeros",
+      "tier": "within_module"
+    },
+    {
+      "check": "ks",
+      "family": "sasa",
+      "gate": 0.3,
+      "ks": 0.1842756237433789,
+      "n_holdout": 1674,
+      "passed": true,
+      "stratum": "single|all_zeros",
+      "tier": "within_module"
+    },
+    {
+      "check": "median_ratio",
+      "family": "sasa",
+      "gate": 2.5,
+      "n_holdout": 4092,
+      "passed": true,
+      "ratio": 0.48272244722225216,
+      "stratum": "single|all_zeros",
+      "tier": "cross_module"
+    },
+    {
+      "check": "ks_diagnostic",
+      "diagnostic": true,
+      "family": "sasa",
+      "ks": 0.7848277942039347,
+      "n_holdout": 4092,
+      "passed": true,
+      "stratum": "single|all_zeros",
+      "tier": "cross_module"
+    },
+    {
+      "check": "median_ratio",
+      "family": "sasa",
+      "gate": 1.5,
+      "n_holdout": 677,
+      "passed": true,
+      "ratio": 0.8650249954308796,
+      "stratum": "double|all_ones",
+      "tier": "within_module"
+    },
+    {
+      "check": "ks",
+      "family": "sasa",
+      "gate": 0.3,
+      "ks": 0.21127095849968563,
+      "n_holdout": 677,
+      "passed": true,
+      "stratum": "double|all_ones",
+      "tier": "within_module"
+    },
+    {
+      "check": "median_ratio",
+      "family": "sasa",
+      "gate": 2.5,
+      "n_holdout": 2048,
+      "passed": true,
+      "ratio": 0.5918592074000756,
+      "stratum": "double|all_ones",
+      "tier": "cross_module"
+    },
+    {
+      "check": "ks_diagnostic",
+      "diagnostic": true,
+      "family": "sasa",
+      "ks": 0.7997961192238757,
+      "n_holdout": 2048,
+      "passed": true,
+      "stratum": "double|all_ones",
+      "tier": "cross_module"
+    },
+    {
+      "check": "median_ratio",
+      "family": "sasa",
+      "gate": 1.5,
+      "n_holdout": 866,
+      "passed": true,
+      "ratio": 0.7391921327636571,
+      "stratum": "double|all_zeros",
+      "tier": "within_module"
+    },
+    {
+      "check": "ks",
+      "family": "sasa",
+      "gate": 0.3,
+      "ks": 0.1906241954261898,
+      "n_holdout": 866,
+      "passed": true,
+      "stratum": "double|all_zeros",
+      "tier": "within_module"
+    },
+    {
+      "check": "median_ratio",
+      "family": "sasa",
+      "gate": 2.5,
+      "n_holdout": 2048,
+      "passed": true,
+      "ratio": 0.4517285255777905,
+      "stratum": "double|all_zeros",
+      "tier": "cross_module"
+    },
+    {
+      "check": "ks_diagnostic",
+      "diagnostic": true,
+      "family": "sasa",
+      "ks": 0.7868606444052797,
+      "n_holdout": 2048,
+      "passed": true,
+      "stratum": "double|all_zeros",
+      "tier": "cross_module"
+    },
+    {
+      "check": "ordering",
+      "double_median": 19000.0,
+      "family": "sasa",
+      "passed": true,
+      "single_median": 120000.0,
+      "stratum": "single_gt_double|all_ones",
+      "tier": "within_module"
+    },
+    {
+      "check": "ordering",
+      "double_median": 18000.0,
+      "family": "sasa",
+      "passed": true,
+      "single_median": 80000.0,
+      "stratum": "single_gt_double|all_zeros",
+      "tier": "within_module"
+    },
+    {
+      "bias_strength": 1.7142857142857142,
+      "check": "direction",
+      "diagnostic": false,
+      "family": "sasa",
+      "fitted_dominant_pattern": "all_zeros",
+      "gated": true,
+      "observed_dominant_pattern": "all_zeros",
+      "passed": true,
+      "stratum": "direction",
+      "tier": "within_module"
+    },
+    {
+      "check": "ordering",
+      "double_median": 13000.0,
+      "family": "sasa",
+      "passed": true,
+      "single_median": 70000.0,
+      "stratum": "single_gt_double|all_ones",
+      "tier": "cross_module"
+    },
+    {
+      "check": "ordering",
+      "double_median": 11000.0,
+      "family": "sasa",
+      "passed": true,
+      "single_median": 40000.0,
+      "stratum": "single_gt_double|all_zeros",
+      "tier": "cross_module"
+    },
+    {
+      "bias_strength": 1.7142857142857142,
+      "check": "direction",
+      "diagnostic": false,
+      "family": "sasa",
+      "fitted_dominant_pattern": "all_zeros",
+      "gated": true,
+      "observed_dominant_pattern": "all_zeros",
+      "passed": true,
+      "stratum": "direction",
+      "tier": "cross_module"
+    }
+  ],
+  "gates": {
+    "chip_median_ratio_gate": 2.5,
+    "row_ks_gate": 0.3,
+    "row_median_ratio_gate": 1.5
+  },
+  "holdout_chips": [
+    "hisasa03",
+    "hyhy1e",
+    "sasa29"
+  ],
+  "n_checks": 77,
+  "n_failed": 0,
+  "n_gated": 64,
+  "passed": true,
+  "train_chip_holdout_chip_disjoint": true
+}

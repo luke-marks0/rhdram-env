@@ -12,10 +12,14 @@ Current scope:
 - local phase 0 verification.
 - phase 1 bootstrap from OpenEnv-style `reset()`/`step()` into a real
   Ramulator 2.1 `External` frontend request path.
+- phase 3 empirical DDR4 read-disturbance profile fitted from the admitted
+  VTS25 real-chip data, held-out validated, and signed.
 
-Ramulator and OpenEnv are admitted only for the Phase 1 bootstrap. Disturbance,
-profile, sandbox, task, reward, SDK, and mitigation implementation remain
-unavailable.
+Ramulator and OpenEnv are admitted for the Phase 1 bootstrap; the `ddr4_vts25`
+source and the `ddr4_vts25_v1` profile are admitted for Phase 3. The disturbance
+engine, sandbox, tasks, reward, SDK, and mitigations remain unavailable until
+their own phase gates pass, so the profile is not yet wired into a running flip
+model.
 
 Run the phase 0 gate:
 
@@ -30,4 +34,13 @@ Phase 1 needs fetched upstream sources and a local Ramulator build:
 python3 -B scripts/fetch_phase1_sources.py
 python3 -B scripts/build_phase1.py
 python3 -B scripts/verify_phase1.py
+```
+
+Phase 3 fetches the pinned read-disturbance data, builds the signed profile, and
+runs the admission gate:
+
+```sh
+python3 -B scripts/fetch_phase3_sources.py
+python3 -B -m profile_builder.package.build
+python3 -B scripts/verify_phase3.py
 ```

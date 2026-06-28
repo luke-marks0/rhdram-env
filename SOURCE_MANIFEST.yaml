@@ -33,10 +33,13 @@ sources:
     url: https://github.com/CMU-SAFARI/ReadDisturbanceVTS25
     paper: https://arxiv.org/abs/2503.16749
     commit: 5d734309457cc8a4ea3b1ec36b93932925548bac
-    license: pending
-    sha256: pending
-    retrieved_utc: pending
-    admission: deferred_until_p3
+    license: "no SPDX license file upstream at pinned commit; CMU-SAFARI public research artifact; use conditioned on citing luo2025revisiting (see third_party/ReadDisturbanceVTS25/PROVENANCE.md)"
+    sha256: 4d25bffd34f17ede7d19431278e1f82f6eb5ad84aaca6555f58bd93ee164a8f7
+    sha256_meaning: sha256 of profile_builder/sources/ddr4_vts25.sha256sums, anchoring the 48 vendored read-disturbance CSVs
+    data_sha256sums: profile_builder/sources/ddr4_vts25.sha256sums
+    fetch: scripts/fetch_phase3_sources.py
+    retrieved_utc: "2026-06-28T06:18:22Z"
+    admission: admitted
 
   - id: hbm2_read_disturbance
     role: optional_empirical_hbm2_profile_source
