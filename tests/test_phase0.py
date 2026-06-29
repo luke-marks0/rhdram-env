@@ -20,10 +20,14 @@ class Phase0Tests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
 
     def test_old_hidden_project_files_are_absent(self) -> None:
-        for name in [".github", ".pytest_cache", ".gitignore"]:
+        for name in [".github", ".pytest_cache"]:
             self.assertFalse((ROOT / name).exists(), name)
+
+    def test_local_artifacts_are_ignored(self) -> None:
+        text = (ROOT / ".gitignore").read_text()
+        self.assertIn("build/", text)
+        self.assertIn("third_party/", text)
 
 
 if __name__ == "__main__":
     unittest.main()
-

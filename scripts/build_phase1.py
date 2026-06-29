@@ -20,28 +20,29 @@ def run(args: list[str], env: dict[str, str] | None = None) -> None:
 def main() -> int:
     if not RAMULATOR.is_dir():
         raise SystemExit("missing third_party/ramulator2; run scripts/fetch_phase1_sources.py")
-    cmake = shutil.which("cmake")
-    if not cmake:
-        raise SystemExit("cmake is required to build Ramulator 2.1")
-
-    build_dir = ROOT / "build/ramulator2"
-    generator = ["-G", "Ninja"] if shutil.which("ninja") else []
-    run([cmake, "-S", str(RAMULATOR), "-B", str(build_dir), *generator, "-DRAMULATOR_PYTHON_BINDINGS=OFF"])
-    run([cmake, "--build", str(build_dir), "--target", "ramulator"])
+    if not (RAMULATOR / "libramulator.so").is_file():
+        cmake = shutil.which("cmake")
+        if not cmake:
+            raise SystemExit("cmake is required to build Ramulator 2.1")
+        build_dir = ROOT / "build/ramulator2"
+        generator = ["-G", "Ninja"] if shutil.which("ninja") else []
+        run([cmake, "-S", str(RAMULATOR), "-B", str(build_dir), *generator, "-DRAMULATOR_PYTHON_BINDINGS=OFF"])
+        run([cmake, "--build", str(build_dir), "--target", "ramulator"])
 
     OUT.mkdir(parents=True, exist_ok=True)
-    env = os.environ.copy()
-    env["PYTHONPATH"] = str(RAMULATOR / "python")
-    run([
-        sys.executable,
-        "-B",
-        "-m",
-        "ramulator",
-        "export",
-        "configs/ramulator/p1_external_ddr4.py",
-        "-o",
-        str(OUT / "p1_external_ddr4.yaml"),
-    ], env=env)
+    if not (OUT / "p1_external_ddr4.yaml").is_file():
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(RAMULATOR / "python")
+        run([
+            sys.executable,
+            "-B",
+            "-m",
+            "ramulator",
+            "export",
+            "configs/ramulator/p1_external_ddr4.py",
+            "-o",
+            str(OUT / "p1_external_ddr4.yaml"),
+        ], env=env)
 
     rpath = str(RAMULATOR)
     run([
@@ -64,4 +65,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-

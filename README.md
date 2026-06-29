@@ -12,6 +12,8 @@ Current scope:
 - local phase 0 verification.
 - phase 1 bootstrap from OpenEnv-style `reset()`/`step()` into a real
   Ramulator 2.1 `External` frontend request path.
+- phase 2 worker protocol with fresh episode lifecycle, sparse memory overlay,
+  logical reads/writes, `RD`/`WR`/`WAIT` command issue, and public event traces.
 - phase 3 empirical DDR4 read-disturbance profile fitted from the admitted
   VTS25 real-chip data, held-out validated, and signed.
 
@@ -34,6 +36,13 @@ Phase 1 needs fetched upstream sources and a local Ramulator build:
 python3 -B scripts/fetch_phase1_sources.py
 python3 -B scripts/build_phase1.py
 python3 -B scripts/verify_phase1.py
+```
+
+Phase 2 builds the persistent simulator worker and runs the command/memory gate:
+
+```sh
+python3 -B scripts/build_phase2.py
+python3 -B scripts/verify_phase2.py
 ```
 
 Phase 3 fetches the pinned read-disturbance data, builds the signed profile, and
