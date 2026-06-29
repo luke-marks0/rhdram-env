@@ -16,12 +16,16 @@ Current scope:
   logical reads/writes, `RD`/`WR`/`WAIT` command issue, and public event traces.
 - phase 3 empirical DDR4 read-disturbance profile fitted from the admitted
   VTS25 real-chip data, held-out validated, and signed.
+- phase 4 disturbance engine consuming accepted worker events and the signed
+  DDR4 VTS25 profile to produce persistent simulated flips.
+- phase 5 known-target task wrapper with trusted reward and budgets.
+- phase 6 restricted `script.run` path for a small `rh_sdk` broker subset.
+- phase 7 oracle mitigation; other mitigations fail closed.
 
 Ramulator and OpenEnv are admitted for the Phase 1 bootstrap; the `ddr4_vts25`
 source and the `ddr4_vts25_v1` profile are admitted for Phase 3. The disturbance
-engine, sandbox, tasks, reward, SDK, and mitigations remain unavailable until
-their own phase gates pass, so the profile is not yet wired into a running flip
-model.
+engine is admitted for Phase 4. Sandbox, tasks, reward, SDK, and mitigations
+remain unavailable until their own phase gates pass.
 
 Run the phase 0 gate:
 
@@ -52,4 +56,18 @@ runs the admission gate:
 python3 -B scripts/fetch_phase3_sources.py
 python3 -B -m profile_builder.package.build
 python3 -B scripts/verify_phase3.py
+```
+
+Phase 4 runs a known-vulnerable DDR4 fixture and no-flip controls:
+
+```sh
+python3 -B scripts/verify_phase4.py
+```
+
+Phase 5-7 gates:
+
+```sh
+python3 -B scripts/verify_phase5.py
+python3 -B scripts/verify_phase6.py
+python3 -B scripts/verify_phase7.py
 ```
