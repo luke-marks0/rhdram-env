@@ -13,24 +13,33 @@ class RowHammerDisturbanceEnv(RowHammerEnv):
         *args: Any,
         disturbance: DisturbanceEngine | None = None,
         mitigation: dict[str, Any] | None = None,
+        profile_id: str = "ddr4_vts25_v1",
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
         self.disturbance = disturbance
         self.mitigation = mitigation or {"name": "none", "params": {}}
+        self.profile_id = profile_id
 
     def reset(self, seed: int | None = None, episode_id: str | None = None, **kwargs: Any) -> Phase2Observation:
         obs = super().reset(seed=seed, episode_id=episode_id, **kwargs)
         if obs.error:
             return obs
         try:
-            self.disturbance = DisturbanceEngine(seed=seed or 0, mitigation=self.mitigation["name"])
+            self.disturbance = DisturbanceEngine(
+                seed=seed or 0,
+                mitigation=self.mitigation["name"],
+                profile_id=self.profile_id,
+            )
         except ValueError as exc:
             if str(exc).startswith("UNAVAILABLE_CAPABILITY:"):
                 self.close()
                 return self._error("UNAVAILABLE_CAPABILITY", str(exc).split(":", 1)[1])
+            if str(exc).startswith("PROFILE_REJECTED:"):
+                self.close()
+                return self._error("PROFILE_REJECTED", str(exc).split(":", 1)[1])
             raise
-        obs.metadata["profile"] = "ddr4_vts25_v1"
+        obs.metadata["profile"] = self.disturbance.profile_id
         obs.metadata["mitigation"] = self.mitigation
         obs.metadata["disturbance"] = {
             "family": self.disturbance.family,

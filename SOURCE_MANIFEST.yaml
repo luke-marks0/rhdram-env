@@ -1,6 +1,6 @@
 manifest_version: 1
 created_utc: "2026-06-26T07:21:32Z"
-phase: P7
+phase: P10
 
 host_targets:
   - os: linux
@@ -49,7 +49,7 @@ sources:
     license: pending
     sha256: pending
     retrieved_utc: pending
-    admission: deferred_until_p9
+    admission: deferred_pending_license_and_hash
 
 policy:
   no_mocks: true

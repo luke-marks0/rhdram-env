@@ -1,7 +1,6 @@
 # RowHammer OpenEnv
 
-Phase 0 repository for the RowHammer-OpenEnv environment described in
-`spec/`.
+Repository for the RowHammer-OpenEnv environment described in `spec/`.
 
 Current scope:
 
@@ -21,11 +20,16 @@ Current scope:
 - phase 5 known-target task wrapper with trusted reward and budgets.
 - phase 6 restricted `script.run` path for a small `rh_sdk` broker subset.
 - phase 7 oracle mitigation; other mitigations fail closed.
+- phase 8 lean advanced task families: any-flip, hidden-target,
+  unknown-adjacency, target-cell, pattern-target, and mitigation-aware variants.
+- phase 9 profile registry: admitted DDR4 profile loads, non-admitted profiles
+  fail closed.
+- phase 10 release gate for admitted phase checks, provenance, unit tests, and
+  tracked-file hygiene.
 
 Ramulator and OpenEnv are admitted for the Phase 1 bootstrap; the `ddr4_vts25`
-source and the `ddr4_vts25_v1` profile are admitted for Phase 3. The disturbance
-engine is admitted for Phase 4. Sandbox, tasks, reward, SDK, and mitigations
-remain unavailable until their own phase gates pass.
+source and the `ddr4_vts25_v1` profile are admitted. HBM2 remains non-admitted
+until its license, hashes, and validation package are resolved.
 
 Run the phase 0 gate:
 
@@ -70,4 +74,12 @@ Phase 5-7 gates:
 python3 -B scripts/verify_phase5.py
 python3 -B scripts/verify_phase6.py
 python3 -B scripts/verify_phase7.py
+```
+
+Phase 8-10 gates:
+
+```sh
+python3 -B scripts/verify_phase8.py
+python3 -B scripts/verify_phase9.py
+python3 -B scripts/verify_release.py
 ```

@@ -5,7 +5,7 @@ import random
 from dataclasses import dataclass, field
 from typing import Any
 
-from profile_builder.package.build import verify_package
+from .profiles import load_profile
 
 
 @dataclass
@@ -36,8 +36,10 @@ class DisturbanceEngine:
         stratum: str = "double|all_zeros",
         known_target_row: int = 10,
         mitigation: str = "none",
+        profile_id: str = "ddr4_vts25_v1",
     ) -> None:
-        self.profile = verify_package()
+        self.profile = load_profile(profile_id)
+        self.profile_id = profile_id
         if not self.profile["validation"]["passed"]:
             raise ValueError("profile validation did not pass")
         if self.profile["standard"] != "DDR4":
