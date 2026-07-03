@@ -491,7 +491,12 @@ final milestone sign-off.
 **Goal.** Prove the whole system still meets SPEC §12 acceptance on the v2.1.0
 pin, with no skips and no mocks.
 
-**Prerequisites.** All admitted release-scope phases above.
+**Prerequisites.** All admitted release-scope phases above, **then the standalone
+pre-release restructure (`spec/PRE_RELEASE_RESTRUCTURE.md`, handle PR)** — a solo,
+behavior-preserving cleanup that collapses the `phaseN_*` files into the component
+layout and removes every "phase" reference from the product surface. PR runs after
+P11–P19 and immediately before P20; P20 then runs the component `tests/` suite +
+`scripts/verify_release.py` (the per-phase gates no longer exist after PR).
 
 **Tasks.**
 1. **Rebuild everything** against v2.1.0; run the full `verify_phase{0..19}` +
