@@ -4,7 +4,9 @@ import base64
 from typing import Any
 
 from .disturbance import DisturbanceEngine
+from .geometry import Geometry
 from .phase2_env import Phase2Observation, RowHammerEnv
+from .worker_protocol import WorkerRequest
 
 
 class RowHammerDisturbanceEnv(RowHammerEnv):
@@ -26,7 +28,13 @@ class RowHammerDisturbanceEnv(RowHammerEnv):
         if obs.error:
             return obs
         try:
+            geometry = self._fetch_geometry()
+        except RuntimeError as exc:
+            self.close()
+            return self._error("INTERNAL_SIMULATOR_ERROR", str(exc))
+        try:
             self.disturbance = DisturbanceEngine(
+                geometry=geometry,
                 seed=seed or 0,
                 mitigation=self.mitigation["name"],
                 profile_id=self.profile_id,
@@ -49,18 +57,26 @@ class RowHammerDisturbanceEnv(RowHammerEnv):
         }
         return obs
 
+    def _fetch_geometry(self) -> Geometry:
+        if self._worker is None:
+            raise RuntimeError("worker is unavailable")
+        payload = self._worker.call(WorkerRequest("INFO", "info", ()))
+        if not payload.get("ok") or "geometry" not in payload:
+            err = payload.get("error") or {}
+            raise RuntimeError(err.get("message", "worker did not report geometry"))
+        return Geometry(payload["geometry"])
+
     def _from_worker(self, payload: dict[str, Any]) -> Phase2Observation:
         obs = super()._from_worker(payload)
         if obs.error or self.disturbance is None:
             return obs
 
-        result = self.disturbance.consume(payload.get("events", []))
-        if obs.data_b64 and payload.get("events"):
-            event = payload["events"][-1]
-            if event.get("op") == "RD":
-                raw = base64.b64decode(obs.data_b64)
-                flipped = self.disturbance.apply(int(event["addr"]), raw)
-                obs.data_b64 = base64.b64encode(flipped).decode()
+        request = payload.get("request", {})
+        result = self.disturbance.consume(payload.get("events", []), request)
+        if obs.data_b64 and request.get("op") == "RD":
+            raw = base64.b64decode(obs.data_b64)
+            flipped = self.disturbance.apply(int(request["addr"]), raw)
+            obs.data_b64 = base64.b64encode(flipped).decode()
 
         obs.feedback["new_public_flips"] = result.new_flips
         obs.feedback["oracle_refreshes"] = result.oracle_refreshes

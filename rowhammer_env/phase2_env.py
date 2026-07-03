@@ -41,7 +41,10 @@ class RowHammerEnv(Environment[Phase2Action, Phase2Observation, Phase2State]):
     ) -> None:
         super().__init__()
         self.worker_path = worker_path or ROOT / "build/phase2/ramulator_worker"
-        self.config_path = config_path or ROOT / "build/phase1/p1_external_ddr4.yaml"
+        # Phase 2+ uses the plugin-enabled config so the worker emits the real
+        # issued-command stream (P11). Phase 1's smoke binary keeps the plain
+        # phase-1 config, which has no IssuedEventRecorder registered.
+        self.config_path = config_path or ROOT / "build/phase2/p2_external_ddr4.yaml"
         self._state = Phase2State(episode_id=None, step_count=0, cycle=0)
         self._worker: WorkerClient | None = None
 
