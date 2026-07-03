@@ -11,8 +11,8 @@ SOURCES = [
     (
         "third_party/ramulator2",
         "https://github.com/CMU-SAFARI/ramulator2.git",
-        "v2.1",
-        "278f1effc3838099a6ffe0ad5f9f572fea80c948",
+        "v2.1.0",
+        "38c51d40a976c6b07fbc09de869a7e08dc187d29",
     ),
     (
         "third_party/openenv",

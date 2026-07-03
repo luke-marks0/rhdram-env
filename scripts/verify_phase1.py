@@ -33,7 +33,7 @@ def main() -> int:
     require(ROOT / "third_party/openenv/src")
     require(ROOT / "build/phase1/ramulator_external_smoke")
     require(ROOT / "build/phase1/p1_external_ddr4.yaml")
-    require_commit(ROOT / "third_party/ramulator2", "278f1effc3838099a6ffe0ad5f9f572fea80c948")
+    require_commit(ROOT / "third_party/ramulator2", "38c51d40a976c6b07fbc09de869a7e08dc187d29")
     require_commit(ROOT / "third_party/openenv", "7449c5dfe375c4c6e6f0827826925a46efd9249f")
 
     sys.path.insert(0, str(ROOT / "third_party/openenv/src"))

@@ -11,11 +11,12 @@ host_targets:
 sources:
   - id: ramulator2
     role: simulator
-    url: https://github.com/CMU-SAFARI/ramulator2/tree/v2.1
-    commit: 278f1effc3838099a6ffe0ad5f9f572fea80c948
+    url: https://github.com/CMU-SAFARI/ramulator2/tree/v2.1.0
+    commit: 38c51d40a976c6b07fbc09de869a7e08dc187d29
     license: MIT
-    sha256: 3be4b92559f3b0ca392a644b7a1acbf1e78f4b00e0ccdadb0d10fba69e391c1e
-    retrieved_utc: "2026-06-26T07:21:32Z"
+    sha256: 03c7ac5f67d7e372787d0b24ebb764b7fe0bb542b311daac77aaa1641cc7cf4c
+    sha256_meaning: sha256 of `git archive --format=tar <commit>` of the pinned tree (reproducible from the commit)
+    retrieved_utc: "2026-07-03T12:08:22Z"
     admission: admitted
 
   - id: openenv
