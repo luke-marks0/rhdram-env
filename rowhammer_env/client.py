@@ -22,6 +22,10 @@ class RowHammerClient(EnvClient[Phase2Action, Phase2Observation, Phase2State]):
         obs_data["reward"] = payload.get("reward")
         obs_data["done"] = payload.get("done", False)
         observation = Phase2Observation.model_validate(obs_data)
+        # The server folds ``metadata`` into ``info`` on the wire (OpenEnv strips
+        # ``metadata``); restore it so wire observations read like in-process ones.
+        if observation.info and not observation.metadata:
+            observation.metadata = dict(observation.info)
         return StepResult(
             observation=observation,
             reward=payload.get("reward"),

@@ -92,3 +92,16 @@ python3 -m pip install -r requirements.txt
 python3 -B scripts/verify_phase17.py
 python3 -m rowhammer_env.server.app
 ```
+
+Episodes are stateful only over the WebSocket `/ws` transport — use
+`rowhammer_env.client.RowHammerClient` (or the policy-side SDK on
+`PYTHONPATH=sdk`: `from rh_sdk import connect`). The HTTP `POST /reset` and
+`/step` endpoints are stateless (a fresh env per request) and cannot carry an
+episode; set `RH_SERVER_MODE=production` to drop them and expose only
+`/ws`, `/health`, `/schema`, `/metadata`, `/mcp`.
+
+Server env vars: `MAX_CONCURRENT_ENVS` (default 8), `RH_SERVER_MODE`
+(`simulation`/`production`), and `RH_TASK` (a JSON task config that pins the
+default served family). An orchestrator can also override the task per episode by
+passing `task=` to `reset` over the WebSocket transport, e.g.
+`await client.reset(seed=17, task={"family": "any_flip"})`.

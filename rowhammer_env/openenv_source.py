@@ -72,7 +72,7 @@ def load_openenv_http_server() -> tuple[Any, Any, Any]:
                 "OpenEnv HTTP serving requires fastapi, uvicorn, and fastmcp; install the P17 runtime dependencies"
             ) from exc
         raise
-    return http_server.HTTPEnvServer, http_server.create_app, types_mod.ConcurrencyConfig
+    return http_server.HTTPEnvServer, types_mod.ConcurrencyConfig, types_mod.ServerMode
 
 
 def load_openenv_client_types() -> tuple[Any, Any]:

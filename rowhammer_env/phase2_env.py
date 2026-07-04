@@ -18,7 +18,12 @@ Environment, Action, Observation, State = load_openenv_server_types()
 
 
 class Phase2Action(Action):
-    tool: str
+    # ``tool`` defaults to empty so a malformed action (missing tool) parses at the
+    # transport layer and is rejected by ``step`` with the SPEC §8 ``BAD_SCHEMA``
+    # code, instead of surfacing OpenEnv's transport-level ``VALIDATION_ERROR``
+    # (which is not in the stable error set). The normative structural contract
+    # still requires ``tool`` (spec/schemas/action.schema.json).
+    tool: str = ""
     args: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -29,6 +34,18 @@ class Phase2Observation(Observation):
     public_counters: dict[str, Any] = Field(default_factory=dict)
     feedback: dict[str, Any] = Field(default_factory=dict)
     error: dict[str, str] | None = None
+    # Policy-facing mirror of ``metadata``. OpenEnv's ``serialize_observation``
+    # drops ``metadata`` from the wire payload (it treats it as server-internal),
+    # which would strip the SPEC §8 initial/step observation fields (objective,
+    # target, disclosure, budget_remaining) for any policy attached over HTTP.
+    # ``model_dump`` folds ``metadata`` into this serialized field so they survive.
+    info: dict[str, Any] = Field(default_factory=dict)
+
+    def model_dump(self, **kwargs: Any) -> dict[str, Any]:
+        data = super().model_dump(**kwargs)
+        if "info" in data:
+            data["info"] = {**self.metadata, **(self.info or {})}
+        return data
 
 
 class Phase2State(State):
@@ -81,6 +98,10 @@ class RowHammerEnv(Environment[Phase2Action, Phase2Observation, Phase2State]):
 
     def step(self, action: Phase2Action, timeout_s: float | None = None, **_: Any) -> Phase2Observation:
         del timeout_s
+        if not action.tool:
+            # Malformed action (no tool): reject with a stable SPEC §8 code and no
+            # state mutation, rather than OpenEnv's transport-level VALIDATION_ERROR.
+            return self._error("BAD_SCHEMA", "action.tool is required")
         self._state.step_count += 1
         try:
             if action.tool == "dram.info":

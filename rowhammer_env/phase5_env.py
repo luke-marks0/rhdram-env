@@ -7,7 +7,7 @@ from .geometry import Geometry
 from .phase2_env import Phase2Action, Phase2Observation
 from .phase4_env import RowHammerDisturbanceEnv
 from .script_sandbox import RestrictedScriptBroker, ScriptViolation
-from .tasks.compiler import CompiledTask, TaskSpec
+from .tasks.compiler import CompiledTask, TaskConfigError, TaskSpec
 
 ALLOWED_TOOLS = ["dram.info", "dram.read", "dram.write", "dram.issue", "script.run", "episode.finish"]
 
@@ -53,7 +53,35 @@ class RowHammerTaskEnv(RowHammerDisturbanceEnv):
         self._target_handle: str | None = None
         self._candidate_handles: list[str] = []
 
-    def reset(self, seed: int | None = None, episode_id: str | None = None, **kwargs: Any) -> Phase2Observation:
+    def reset(
+        self,
+        seed: int | None = None,
+        episode_id: str | None = None,
+        task: dict[str, Any] | None = None,
+        budgets: dict[str, int] | None = None,
+        **kwargs: Any,
+    ) -> Phase2Observation:
+        # Per-episode task selection (P17): an orchestrator can pass a task config
+        # (SPEC §10 shape or the ``{"family": ...}`` shorthand) at reset to drive a
+        # curriculum without restarting the server. Task selection is a training-
+        # orchestration control (it flows through the WS ``reset``), not a policy
+        # action. Profile/mitigation are honoured too — the disturbance engine is
+        # rebuilt from ``self.profile_id``/``self.mitigation`` on every reset.
+        if task is not None:
+            try:
+                self.spec = TaskSpec.from_config(task)
+            except TaskConfigError as exc:
+                self.close()
+                return self._error("BAD_SCHEMA", f"invalid task config: {exc}")
+            self.task_family = self.spec.family
+            if self.spec.profile_id:
+                self.profile_id = self.spec.profile_id
+            if self.spec.mitigation:
+                self.mitigation = self.spec.mitigation
+            self._budgets_override = budgets
+        elif budgets is not None:
+            self._budgets_override = budgets
+        self.initial_budgets = self._budgets_override or self.spec.resolved_budgets()
         self.budget_remaining = dict(self.initial_budgets)
         self.success = False
         self._acts_prev = 0
