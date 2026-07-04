@@ -9,6 +9,7 @@ Files:
 - `TEST_PLAN.md` — release-oriented test suite.
 - `REPOSITORY_TREE.md` — proposed repository skeleton.
 - `SOURCE_MANIFEST.template.yaml` — source/provenance manifest template.
+- `SBOM.md` — release software bill of materials.
 - `schemas/*.schema.json` — compact structural schemas for the policy action, observation, and task config contracts.
 - `examples/*.json` — small examples validated against the schemas.
 - `VALIDATION_REPORT.md` — local validation summary.

@@ -26,7 +26,15 @@ Current scope:
   fail closed.
 - phase 10 release gate for admitted phase checks, provenance, unit tests, and
   tracked-file hygiene.
+- phase 16 mitigation capability discovery: admitted mitigations are listed in
+  `dram.info`, while unvalidated Ramulator mitigations fail closed.
 - phase 17 OpenEnv HTTP/WebSocket serving with a policy-side client.
+- phase 18 OS-isolated `script.run` using `unshare` + `bwrap` and JSON-line
+  IPC back to the normal tool surface.
+- phase 19 HTTP policy adapter, rollout/eval metrics, and a reward-updated
+  training example for the LLM-testable milestone.
+- phase 20 release re-qualification: full admitted gate matrix, zero-skip unit
+  suite, deterministic replay, no-mock executable scan, and release provenance.
 
 Ramulator and OpenEnv are admitted for the Phase 1 bootstrap; the `ddr4_vts25`
 source and the `ddr4_vts25_v1` profile are admitted. HBM2 remains non-admitted
@@ -85,6 +93,12 @@ python3 -B scripts/verify_phase9.py
 python3 -B scripts/verify_release.py
 ```
 
+Phase 16 checks admitted mitigation discovery and fail-closed behavior:
+
+```sh
+python3 -B scripts/verify_phase16.py
+```
+
 Phase 17 serves the task environment through the vendored OpenEnv HTTP transport:
 
 ```sh
@@ -105,3 +119,23 @@ Server env vars: `MAX_CONCURRENT_ENVS` (default 8), `RH_SERVER_MODE`
 default served family). An orchestrator can also override the task per episode by
 passing `task=` to `reset` over the WebSocket transport, e.g.
 `await client.reset(seed=17, task={"family": "any_flip"})`.
+
+Phase 18 verifies the OS-level sandbox and trace-equivalent IPC broker:
+
+```sh
+python3 -B scripts/verify_phase18.py
+```
+
+Phase 19 verifies the HTTP policy adapter, held-out eval metrics, and training
+example:
+
+```sh
+python3 -B scripts/verify_phase19.py
+```
+
+Phase 20 runs the release re-qualification gate:
+
+```sh
+python3 -B scripts/verify_release.py
+python3 -B scripts/verify_phase20.py
+```

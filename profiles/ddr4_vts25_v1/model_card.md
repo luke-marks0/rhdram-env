@@ -49,6 +49,9 @@
 - Cross-module gate: median within factor 2.5 (KS reported as diagnostic)
 - Gated checks: 64 of 77 (0 failed)
 - Result: PASS
+- Release qualification: included in the P20 matrix through
+  `scripts/verify_phase3.py`, `scripts/verify_phase14.py`,
+  `scripts/verify_phase15.py`, and `scripts/verify_release.py`.
 
 ## Limitations
 

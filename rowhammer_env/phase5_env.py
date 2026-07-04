@@ -4,9 +4,10 @@ from typing import Any
 
 from . import rewards
 from .geometry import Geometry
+from .mitigations import normalize_mitigation
 from .phase2_env import Phase2Action, Phase2Observation
-from .phase4_env import RowHammerDisturbanceEnv
-from .script_sandbox import RestrictedScriptBroker, ScriptViolation
+from .phase4_env import DEFAULT_PROFILE_ID, RowHammerDisturbanceEnv
+from .script_sandbox import RestrictedScriptBroker, ScriptError
 from .tasks.compiler import CompiledTask, TaskConfigError, TaskSpec
 
 ALLOWED_TOOLS = ["dram.info", "dram.read", "dram.write", "dram.issue", "script.run", "episode.finish"]
@@ -35,6 +36,8 @@ class RowHammerTaskEnv(RowHammerDisturbanceEnv):
         **kwargs: Any,
     ) -> None:
         self.spec = TaskSpec.from_config(task)
+        self._explicit_mitigation = mitigation
+        explicit_profile_id = kwargs.get("profile_id") if "profile_id" in kwargs else None
         # Task config carries the mitigation and profile; an explicit kwarg wins so
         # existing callers (e.g. RowHammerTaskEnv(mitigation=..., profile_id=...))
         # keep their meaning.
@@ -42,6 +45,7 @@ class RowHammerTaskEnv(RowHammerDisturbanceEnv):
         if "profile_id" not in kwargs and self.spec.profile_id:
             kwargs["profile_id"] = self.spec.profile_id
         super().__init__(*args, mitigation=effective_mitigation, **kwargs)
+        self._explicit_profile_id = explicit_profile_id
         self._budgets_override = budgets
         self.initial_budgets = budgets or self.spec.resolved_budgets()
         self.budget_remaining = dict(self.initial_budgets)
@@ -69,19 +73,13 @@ class RowHammerTaskEnv(RowHammerDisturbanceEnv):
         # rebuilt from ``self.profile_id``/``self.mitigation`` on every reset.
         if task is not None:
             try:
-                self.spec = TaskSpec.from_config(task)
+                self._configure_task(task, budgets=budgets)
             except TaskConfigError as exc:
                 self.close()
                 return self._error("BAD_SCHEMA", f"invalid task config: {exc}")
-            self.task_family = self.spec.family
-            if self.spec.profile_id:
-                self.profile_id = self.spec.profile_id
-            if self.spec.mitigation:
-                self.mitigation = self.spec.mitigation
-            self._budgets_override = budgets
         elif budgets is not None:
             self._budgets_override = budgets
-        self.initial_budgets = self._budgets_override or self.spec.resolved_budgets()
+            self.initial_budgets = self._budgets_override or self.spec.resolved_budgets()
         self.budget_remaining = dict(self.initial_budgets)
         self.success = False
         self._acts_prev = 0
@@ -96,6 +94,18 @@ class RowHammerTaskEnv(RowHammerDisturbanceEnv):
         self._register_handles()
         obs.metadata.update(self._task_metadata(seed))
         return obs
+
+    def _configure_task(self, task: dict[str, Any], budgets: dict[str, int] | None = None) -> None:
+        self.spec = TaskSpec.from_config(task)
+        if self._explicit_mitigation is None:
+            self.mitigation = normalize_mitigation(self.spec.mitigation)
+        if self._explicit_profile_id is None:
+            self.profile_id = self.spec.profile_id or DEFAULT_PROFILE_ID
+        if budgets is not None:
+            self._budgets_override = budgets
+        self.initial_budgets = self._budgets_override or self.spec.resolved_budgets()
+        self.budget_remaining = dict(self.initial_budgets)
+        self.task_family = self.spec.family
 
     def step(self, action: Phase2Action, timeout_s: float | None = None, **kwargs: Any) -> Phase2Observation:
         if action.tool == "script.run":
@@ -144,9 +154,20 @@ class RowHammerTaskEnv(RowHammerDisturbanceEnv):
 
     def _script(self, action: Phase2Action) -> Phase2Observation:
         code = str(action.args.get("code", ""))
+        language = str(action.args.get("language", "python-rh-sdk"))
+        if language != "python-rh-sdk":
+            return self._error("BAD_SCHEMA", "script.run requires language=python-rh-sdk")
         try:
-            result = RestrictedScriptBroker(self, max_calls=min(10_000, self.budget_remaining["tool_calls"])).run(code)
-        except ScriptViolation as exc:
+            timeout_ms = int(action.args.get("timeout_ms", 5000))
+        except (TypeError, ValueError):
+            return self._error("BAD_SCHEMA", "script.run timeout_ms must be an integer")
+        try:
+            result = RestrictedScriptBroker(
+                self,
+                max_calls=min(10_000, self.budget_remaining["tool_calls"]),
+                timeout_ms=timeout_ms,
+            ).run(code)
+        except ScriptError as exc:
             return self._error(exc.code, str(exc))
         self.success = self._trusted_success()
         obs = Phase2Observation(reward=1.0 if self.success else 0.0, done=self.success, cycle=self._state.cycle)
