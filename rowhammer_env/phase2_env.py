@@ -8,6 +8,8 @@ from typing import Any
 from pydantic import Field
 
 from .openenv_source import load_openenv_server_types
+from .tasks import AddressResolver
+from .tools.addressing import AddressError
 from .worker_protocol import WorkerClient, WorkerRequest
 
 
@@ -47,6 +49,9 @@ class RowHammerEnv(Environment[Phase2Action, Phase2Observation, Phase2State]):
         self.config_path = config_path or ROOT / "build/phase2/p2_external_ddr4.yaml"
         self._state = Phase2State(episode_id=None, step_count=0, cycle=0)
         self._worker: WorkerClient | None = None
+        # Address projection + disclosure enforcement (P12). Absent in the bare
+        # phase-2 env (no geometry yet), which then only accepts logical addresses.
+        self._resolver: AddressResolver | None = None
 
     def reset(
         self,
@@ -76,11 +81,12 @@ class RowHammerEnv(Environment[Phase2Action, Phase2Observation, Phase2State]):
         self._state.step_count += 1
         try:
             if action.tool == "dram.info":
+                forms = sorted(self._resolver.disclosure.allowed_forms()) if self._resolver else ["logical"]
                 return Phase2Observation(
                     reward=0.0,
                     done=False,
                     cycle=self._state.cycle,
-                    metadata={"address_forms": ["logical"], "commands": ["RD", "WR", "WAIT"]},
+                    metadata={"address_forms": forms, "commands": ["RD", "WR", "WAIT"]},
                 )
             if action.tool == "episode.finish":
                 self.close()
@@ -98,6 +104,8 @@ class RowHammerEnv(Environment[Phase2Action, Phase2Observation, Phase2State]):
             if action.tool == "dram.issue":
                 return self._issue(action.args)
             return self._error("UNSUPPORTED_TOOL", action.tool)
+        except AddressError as exc:
+            return self._error(exc.code, exc.message)
         except (KeyError, ValueError, TypeError, binascii.Error) as exc:
             return self._error("BAD_SCHEMA", str(exc))
 
@@ -136,9 +144,18 @@ class RowHammerEnv(Environment[Phase2Action, Phase2Observation, Phase2State]):
 
     def _addr_value(self, container: dict[str, Any]) -> int:
         addr = container.get("addr", container)
-        if not isinstance(addr, dict) or addr.get("kind") != "logical":
-            raise ValueError("Phase 2 admits logical addresses only")
-        return int(addr["addr"])
+        if self._resolver is not None:
+            return self._resolver.to_linear(addr)
+        # No disclosure/geometry wired yet: only logical addressing is available,
+        # and any other form fails closed rather than being silently accepted.
+        if not isinstance(addr, dict):
+            raise AddressError("BAD_SCHEMA", "address must be an object")
+        if addr.get("kind") != "logical":
+            raise AddressError("ADDRESS_NOT_DISCLOSED", "only logical addresses are disclosed")
+        try:
+            return int(addr["addr"])
+        except (KeyError, TypeError, ValueError):
+            raise AddressError("BAD_SCHEMA", "logical address requires an integer 'addr'")
 
     def _next_id(self) -> str:
         return f"a{self._state.step_count}"

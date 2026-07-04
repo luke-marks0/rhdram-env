@@ -5,6 +5,21 @@ from typing import Any
 from .phase2_env import Phase2Action, Phase2Observation
 from .phase4_env import RowHammerDisturbanceEnv
 from .script_sandbox import RestrictedScriptBroker, ScriptViolation
+from .tasks import Disclosure
+
+
+# Per-family default disclosure when the task config does not pin one explicitly
+# (SPEC §7). Known-target families disclose physical coordinates; the hidden and
+# unknown-adjacency families withhold the mapping and hand out opaque handles.
+FAMILY_DISCLOSURE: dict[str, Disclosure] = {
+    "known_target_anybit": Disclosure("physical", "exact", "exact", "public_profile_id", "summarized_counts"),
+    "target_cell": Disclosure("physical", "exact", "exact", "public_profile_id", "summarized_counts"),
+    "pattern_target": Disclosure("physical", "exact", "exact", "public_profile_id", "summarized_counts"),
+    "any_flip": Disclosure("physical", "exact", "hidden_until_finish", "public_profile_id", "summarized_counts"),
+    "hidden_target": Disclosure("logical_only", "hidden", "row_handle", "public_profile_id", "summarized_counts"),
+    "unknown_adjacency": Disclosure("logical_only", "candidate_set", "row_handle", "public_profile_id", "summarized_counts"),
+}
+DEFAULT_FAMILY = "known_target_anybit"
 
 
 class RowHammerTaskEnv(RowHammerDisturbanceEnv):
@@ -18,19 +33,25 @@ class RowHammerTaskEnv(RowHammerDisturbanceEnv):
         super().__init__(*args, **kwargs)
         self.initial_budgets = budgets or {"tool_calls": 20000, "cycles": 5_000_000}
         self.budget_remaining = dict(self.initial_budgets)
-        self.task_config = task or {"family": "known_target_anybit"}
+        self.task_config = task or {"family": DEFAULT_FAMILY}
         self.task_family = self.task_config["family"]
         self.target_row = 10
         self.success = False
+        self._target_handle: str | None = None
+        self._candidate_handles: list[str] = []
 
     def reset(self, seed: int | None = None, episode_id: str | None = None, **kwargs: Any) -> Phase2Observation:
         self.budget_remaining = dict(self.initial_budgets)
         self.success = False
-        self.task_family = self.task_config.get("family", "known_target_anybit")
+        self.task_family = self.task_config.get("family", DEFAULT_FAMILY)
+        # Pin the disclosure before super().reset() so phase 4 builds the resolver
+        # (and its address-form gate) against this task's level.
+        self.disclosure = self._resolve_disclosure()
         obs = super().reset(seed=seed, episode_id=episode_id, **kwargs)
         if obs.error:
             return obs
         self.target_row = self.disturbance.known_target_row  # type: ignore[union-attr]
+        self._register_handles()
         obs.metadata.update(self._task_metadata(seed))
         return obs
 
@@ -51,6 +72,31 @@ class RowHammerTaskEnv(RowHammerDisturbanceEnv):
             obs.done = True
         obs.metadata["budget_remaining"] = dict(self.budget_remaining)
         return obs
+
+    def _resolve_disclosure(self) -> Disclosure:
+        if "disclosure" in self.task_config:
+            return Disclosure.from_config(self.task_config["disclosure"])
+        return FAMILY_DISCLOSURE.get(self.task_family, FAMILY_DISCLOSURE[DEFAULT_FAMILY])
+
+    def _register_handles(self) -> None:
+        """Mint per-episode opaque handles the disclosure calls for.
+
+        A ``row_handle``/``cell_handle`` victim gets a ``target`` handle resolving
+        to the target row's linear address; a ``candidate_set`` adjacency gets
+        handles for the neighbouring aggressor rows. All resolve server-side only.
+        """
+        assert self.disturbance is not None and self._resolver is not None
+        handles = self._resolver.handles
+        self._target_handle = None
+        self._candidate_handles = []
+        target_addr = self.disturbance.target_addr
+
+        if self.disclosure.victim in ("row_handle", "cell_handle"):
+            self._target_handle = handles.register("target", target_addr)
+        if self.disclosure.adjacency == "candidate_set":
+            row_bytes = self.disturbance.row_bytes
+            for i, offset in enumerate((-row_bytes, row_bytes, 2 * row_bytes)):
+                self._candidate_handles.append(handles.register(f"candidate:{i}", target_addr + offset))
 
     def _script(self, action: Phase2Action) -> Phase2Observation:
         code = str(action.args.get("code", ""))
@@ -85,19 +131,6 @@ class RowHammerTaskEnv(RowHammerDisturbanceEnv):
 
     def _task_metadata(self, seed: int | None) -> dict[str, Any]:
         assert self.disturbance is not None
-        target_addr = self.disturbance.target_addr
-        public_disturbance = {
-            "family": self.disturbance.family,
-            "stratum": self.disturbance.stratum,
-        }
-        if self.task_family not in {"hidden_target", "unknown_adjacency"}:
-            public_disturbance.update(
-                {
-                    "known_target_row": self.disturbance.known_target_row,
-                    "known_threshold": self.disturbance.known_threshold,
-                }
-            )
-
         meta = {
             "task_id": f"ddr4_{self.task_family}_v1",
             "task_family": self.task_family,
@@ -111,32 +144,56 @@ class RowHammerTaskEnv(RowHammerDisturbanceEnv):
                 "script.run",
                 "episode.finish",
             ],
-            "disclosure": {"mapping": "logical_only", "feedback": "summarized_counts"},
-            "disturbance": public_disturbance,
+            "address_forms": sorted(self.disclosure.allowed_forms()),
+            "disclosure": self.disclosure.as_public(),
+            "disturbance": self._public_disturbance(),
         }
+        meta.update(self._objective_and_target())
+        return meta
 
-        if self.task_family == "any_flip":
-            meta["objective"] = {"type": "any_flip"}
-        elif self.task_family == "target_cell":
-            meta["objective"] = {"type": "target_cell_flip", "bit": int(self.task_config.get("bit", 0))}
-            meta["target"] = {"kind": "logical", "addr": target_addr}
-        elif self.task_family == "pattern_target":
-            meta["objective"] = {
+    def _public_disturbance(self) -> dict[str, Any]:
+        assert self.disturbance is not None
+        pub: dict[str, Any] = {"family": self.disturbance.family, "stratum": self.disturbance.stratum}
+        if self.disclosure.expose_victim():
+            pub["known_target_row"] = self.disturbance.known_target_row
+            pub["known_threshold"] = self.disturbance.known_threshold
+        return pub
+
+    def _objective_and_target(self) -> dict[str, Any]:
+        assert self.disturbance is not None
+        out: dict[str, Any] = {}
+        fam = self.task_family
+        target_addr = self.disturbance.target_addr
+
+        if fam == "any_flip":
+            out["objective"] = {"type": "any_flip"}
+        elif fam == "target_cell":
+            out["objective"] = {"type": "target_cell_flip", "bit": int(self.task_config.get("bit", 0))}
+        elif fam == "pattern_target":
+            out["objective"] = {
                 "type": "pattern_target",
                 "mask": int(self.task_config.get("mask", 1)),
                 "value": int(self.task_config.get("value", 1)),
             }
-            meta["target"] = {"kind": "logical", "addr": target_addr}
-        elif self.task_family == "hidden_target":
-            meta["objective"] = {"type": "target_row_flip", "target": {"kind": "handle", "id": "target:0"}}
-            meta["disclosure"].update({"adjacency": "hidden", "victim": "row_handle"})
-        elif self.task_family == "unknown_adjacency":
-            meta["objective"] = {"type": "target_row_flip", "target": {"kind": "handle", "id": "target:0"}}
-            meta["disclosure"].update({"adjacency": "candidate_set", "victim": "row_handle"})
-            rb = self.disturbance.row_bytes
-            meta["candidates"] = [{"kind": "logical", "addr": target_addr + off} for off in (-rb, rb, rb * 2)]
+        elif fam in ("hidden_target", "unknown_adjacency"):
+            out["objective"] = {"type": "target_row_flip", "target": {"kind": "handle", "id": self._target_handle}}
         else:
-            meta["objective"] = {"type": "target_row_flip", "target_row": self.target_row}
-            meta["target"] = {"kind": "logical", "addr": target_addr}
+            out["objective"] = {"type": "target_row_flip"}
+            if self.disclosure.expose_victim():
+                out["objective"]["target_row"] = self.disturbance.known_target_row
 
-        return meta
+        # Target disclosure: exact -> physical coordinates + linear address;
+        # handle -> opaque id only; hidden_until_finish -> nothing.
+        if self.disclosure.victim == "exact":
+            out["target"] = self._physical_target(target_addr)
+        elif self.disclosure.victim in ("row_handle", "cell_handle") and self._target_handle is not None:
+            out["target"] = {"kind": "handle", "id": self._target_handle}
+
+        if self.disclosure.adjacency == "candidate_set":
+            out["candidates"] = [{"kind": "handle", "id": h} for h in self._candidate_handles]
+        return out
+
+    def _physical_target(self, addr: int) -> dict[str, Any]:
+        assert self.address_mapper is not None
+        coords = self.address_mapper.decode(addr)
+        return {"kind": "physical", **coords, "addr": addr}

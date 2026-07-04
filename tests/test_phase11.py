@@ -70,14 +70,21 @@ class ExposureModelTests(unittest.TestCase):
         self.assertTrue(victim.flipped)
         self.assertEqual(eng.flips.get(eng.target_addr), 0)
 
-    def test_single_sided_acts_do_not_flip(self) -> None:
+    def test_single_sided_uses_the_higher_single_stratum_threshold(self) -> None:
+        # P14: single-sided hammering is admitted but governed by the single
+        # stratum's (much higher) hcfirst, not the double-sided condition. Below
+        # that threshold the victim does not flip; crossing it flips.
         eng = engine()
         left_addr = eng.target_addr - eng.row_bytes
-        # Even far beyond threshold, one-sided activation never satisfies the
-        # min(left, right) double-sided condition.
-        for _ in range(eng.known_threshold * 2):
+        target_key = (0, 0, 0, 0, eng.known_target_row)
+        single_threshold = eng.known_single_threshold
+        self.assertGreater(single_threshold, eng.known_threshold)
+        for _ in range(single_threshold - 1):
             eng.consume([act(eng.known_target_row - 1)], {"op": "RD", "addr": left_addr, "size": 64})
+        self.assertFalse(eng.victims[target_key].flipped)
         self.assertEqual(eng.flips, {})
+        eng.consume([act(eng.known_target_row - 1)], {"op": "RD", "addr": left_addr, "size": 64})
+        self.assertTrue(eng.victims[target_key].flipped)
 
     def test_exposure_keyed_by_decoded_bank(self) -> None:
         eng = engine()
@@ -87,12 +94,14 @@ class ExposureModelTests(unittest.TestCase):
         self.assertIn((0, 0, 0, 0, 10), eng.victims)  # neighbour of bank-0 aggressor
         self.assertIn((0, 0, 0, 1, 10), eng.victims)  # neighbour of bank-1 aggressor
 
-    def test_write_restores_and_ref_is_stubbed(self) -> None:
+    def test_write_restores_and_refresh_does_not_correct_flips(self) -> None:
         eng = engine()
         addr = eng.target_addr
         eng.flips[addr] = 0
-        # A refresh event alone changes nothing in P11.
-        eng.consume([{"op": "REFab", "row": -1}], {"op": "WAIT", "addr": 0, "size": 0})
+        # A refresh rewrites the disturbed value it reads: it never corrects an
+        # existing flip (test D10), regardless of how many refreshes pass.
+        for _ in range(eng.refresh_window + 1):
+            eng.consume([{"op": "REFab", "row": -1}], {"op": "WAIT", "addr": 0, "size": 0})
         self.assertEqual(eng.flips.get(addr), 0)
         # A write to the region restores it.
         eng.consume([act(eng.known_target_row)], {"op": "WR", "addr": addr, "size": 1})
