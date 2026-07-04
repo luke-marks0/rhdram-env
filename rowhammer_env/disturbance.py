@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .geometry import Geometry
+from .mitigations import require_admitted_mitigation
 from .profiles import load_profile
 from .standards import StandardModel, UnsupportedStandard
 
@@ -150,9 +151,8 @@ class DisturbanceEngine:
         self.seed = seed
         self.family = family
         self.stratum = stratum
-        if mitigation not in {"none", "oracle"}:
-            raise ValueError(f"UNAVAILABLE_CAPABILITY:{mitigation}")
-        self.mitigation = mitigation
+        capability = require_admitted_mitigation(mitigation)
+        self.mitigation = capability.name
         params = mitigation_params or {}
         # OracleRH's activation-count threshold. Default to a conservative
         # fraction of the calibrated double-sided hcfirst so the victim-row

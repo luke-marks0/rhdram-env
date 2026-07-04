@@ -7,6 +7,7 @@ from typing import Any
 
 from pydantic import Field
 
+from .mitigations import public_mitigation_capabilities
 from .openenv_source import load_openenv_server_types
 from .tasks import AddressResolver
 from .tools.addressing import AddressError
@@ -64,6 +65,7 @@ class RowHammerEnv(Environment[Phase2Action, Phase2Observation, Phase2State]):
         # issued-command stream (P11). Phase 1's smoke binary keeps the plain
         # phase-1 config, which has no IssuedEventRecorder registered.
         self.config_path = config_path or ROOT / "build/phase2/p2_external_ddr4.yaml"
+        self._base_config_path = self.config_path
         self._state = Phase2State(episode_id=None, step_count=0, cycle=0)
         self._worker: WorkerClient | None = None
         # Address projection + disclosure enforcement (P12). Absent in the bare
@@ -93,6 +95,7 @@ class RowHammerEnv(Environment[Phase2Action, Phase2Observation, Phase2State]):
                 "seed": seed,
                 "allowed_tools": ["dram.info", "dram.read", "dram.write", "dram.issue", "episode.finish"],
                 "commands": ["RD", "WR", "WAIT"],
+                "mitigations": public_mitigation_capabilities(),
             },
         )
 
@@ -110,7 +113,11 @@ class RowHammerEnv(Environment[Phase2Action, Phase2Observation, Phase2State]):
                     reward=0.0,
                     done=False,
                     cycle=self._state.cycle,
-                    metadata={"address_forms": forms, "commands": ["RD", "WR", "WAIT"]},
+                    metadata={
+                        "address_forms": forms,
+                        "commands": ["RD", "WR", "WAIT"],
+                        "mitigations": public_mitigation_capabilities(),
+                    },
                 )
             if action.tool == "episode.finish":
                 self.close()

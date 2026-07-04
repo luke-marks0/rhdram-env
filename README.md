@@ -26,6 +26,8 @@ Current scope:
   fail closed.
 - phase 10 release gate for admitted phase checks, provenance, unit tests, and
   tracked-file hygiene.
+- phase 16 mitigation capability discovery: admitted mitigations are listed in
+  `dram.info`, while unvalidated Ramulator mitigations fail closed.
 - phase 17 OpenEnv HTTP/WebSocket serving with a policy-side client.
 
 Ramulator and OpenEnv are admitted for the Phase 1 bootstrap; the `ddr4_vts25`
@@ -83,6 +85,12 @@ Phase 8-10 gates:
 python3 -B scripts/verify_phase8.py
 python3 -B scripts/verify_phase9.py
 python3 -B scripts/verify_release.py
+```
+
+Phase 16 checks admitted mitigation discovery and fail-closed behavior:
+
+```sh
+python3 -B scripts/verify_phase16.py
 ```
 
 Phase 17 serves the task environment through the vendored OpenEnv HTTP transport:

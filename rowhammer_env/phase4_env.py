@@ -5,6 +5,7 @@ from typing import Any
 
 from .disturbance import DisturbanceEngine
 from .geometry import Geometry
+from .mitigations import normalize_mitigation, worker_config_for_mitigation
 from .phase2_env import Phase2Observation, RowHammerEnv
 from .tasks import AddressResolver, Disclosure, HandleTable
 from .tools.addressing import AddressMapper
@@ -35,13 +36,21 @@ class RowHammerDisturbanceEnv(RowHammerEnv):
     ) -> None:
         super().__init__(*args, **kwargs)
         self.disturbance = disturbance
-        self.mitigation = mitigation or {"name": "none", "params": {}}
+        self.mitigation = normalize_mitigation(mitigation)
         self.profile_id = profile_id
         self.temperature = temperature
         self.disclosure = FULL_DISCLOSURE
         self.address_mapper: AddressMapper | None = None
 
     def reset(self, seed: int | None = None, episode_id: str | None = None, **kwargs: Any) -> Phase2Observation:
+        try:
+            self.config_path = worker_config_for_mitigation(self._base_config_path, self.mitigation)
+        except ValueError as exc:
+            if str(exc).startswith("UNAVAILABLE_CAPABILITY:"):
+                return self._error("UNAVAILABLE_CAPABILITY", str(exc).split(":", 1)[1])
+            if str(exc).startswith("BAD_SCHEMA:"):
+                return self._error("BAD_SCHEMA", str(exc).split(":", 1)[1])
+            raise
         obs = super().reset(seed=seed, episode_id=episode_id, **kwargs)
         if obs.error:
             return obs
