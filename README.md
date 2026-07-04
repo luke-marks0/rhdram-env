@@ -29,6 +29,8 @@ Current scope:
 - phase 16 mitigation capability discovery: admitted mitigations are listed in
   `dram.info`, while unvalidated Ramulator mitigations fail closed.
 - phase 17 OpenEnv HTTP/WebSocket serving with a policy-side client.
+- phase 18 OS-isolated `script.run` using `unshare` + `bwrap` and JSON-line
+  IPC back to the normal tool surface.
 
 Ramulator and OpenEnv are admitted for the Phase 1 bootstrap; the `ddr4_vts25`
 source and the `ddr4_vts25_v1` profile are admitted. HBM2 remains non-admitted
@@ -113,3 +115,9 @@ Server env vars: `MAX_CONCURRENT_ENVS` (default 8), `RH_SERVER_MODE`
 default served family). An orchestrator can also override the task per episode by
 passing `task=` to `reset` over the WebSocket transport, e.g.
 `await client.reset(seed=17, task={"family": "any_flip"})`.
+
+Phase 18 verifies the OS-level sandbox and trace-equivalent IPC broker:
+
+```sh
+python3 -B scripts/verify_phase18.py
+```
