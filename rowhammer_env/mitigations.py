@@ -86,7 +86,6 @@ ADMITTED: dict[str, MitigationCapability] = {
         execution="python_reference_port",
         params=("tRH",),
         conformance="P14 OracleRH differential",
-        ramulator_impl="OracleRH",
     ),
 }
 

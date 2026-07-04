@@ -72,7 +72,7 @@ ERROR_CODES = {
     "INTERNAL_SIMULATOR_ERROR",
 }
 
-EXECUTABLE_ROOTS = ["cpp", "rowhammer_env", "profile_builder", "sdk"]
+EXECUTABLE_ROOTS = ["cpp", "rowhammer_env", "profile_builder", "sdk", "scripts", "tests"]
 
 FORBIDDEN_SYMBOLS = [
     "mock_dram",
@@ -84,6 +84,12 @@ FORBIDDEN_SYMBOLS = [
     "canned_reward",
     "noop_mitigation",
 ]
+
+SYMBOL_SCAN_EXEMPTIONS = {
+    "scripts/verify_phase0.py",
+    "scripts/verify_release.py",
+    "scripts/verify_phase20.py",
+}
 
 
 def fail(message: str) -> None:
@@ -184,6 +190,11 @@ def check_no_mock_symbols() -> None:
     for base in scanned_roots:
         for path in base.rglob("*"):
             if not path.is_file():
+                continue
+            rel = path.relative_to(ROOT).as_posix()
+            if "__pycache__" in path.parts or path.suffix in {".pyc", ".pyo"}:
+                continue
+            if rel in SYMBOL_SCAN_EXEMPTIONS:
                 continue
             text = path.read_text(errors="ignore").lower()
             for symbol in FORBIDDEN_SYMBOLS:

@@ -33,6 +33,8 @@ Current scope:
   IPC back to the normal tool surface.
 - phase 19 HTTP policy adapter, rollout/eval metrics, and a reward-updated
   training example for the LLM-testable milestone.
+- phase 20 release re-qualification: full admitted gate matrix, zero-skip unit
+  suite, deterministic replay, no-mock executable scan, and release provenance.
 
 Ramulator and OpenEnv are admitted for the Phase 1 bootstrap; the `ddr4_vts25`
 source and the `ddr4_vts25_v1` profile are admitted. HBM2 remains non-admitted
@@ -129,4 +131,11 @@ example:
 
 ```sh
 python3 -B scripts/verify_phase19.py
+```
+
+Phase 20 runs the release re-qualification gate:
+
+```sh
+python3 -B scripts/verify_release.py
+python3 -B scripts/verify_phase20.py
 ```

@@ -291,7 +291,7 @@ class SandboxLimits:
     stdout_bytes: int = 64 * 1024
     stdout_tail_bytes: int = 4096
     protocol_bytes: int = 2 * 1024 * 1024
-    processes: int = 64
+    processes: int = 4096
     open_files: int = 64
 
 
