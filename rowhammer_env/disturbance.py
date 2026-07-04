@@ -113,6 +113,7 @@ class DisturbanceEngine:
         family: str = "hisasa",
         stratum: str = "double|all_zeros",
         known_target_row: int = 10,
+        known_first_bit: int = 0,
         mitigation: str = "none",
         mitigation_params: dict[str, Any] | None = None,
         temperature: int = 50,
@@ -159,6 +160,9 @@ class DisturbanceEngine:
         self.tRH = int(params.get("tRH", max(1, self.known_threshold * 2 // 5)))
 
         self.known_target_row = known_target_row
+        # First bit the known target flips (bit 0 by default); the task compiler
+        # sets it so target-cell / pattern objectives can pin a specific bit.
+        self.known_first_bit = int(known_first_bit) & 0x7
         self.victims: dict[tuple[int, ...], Victim] = {}
         self.flips: dict[int, int] = {}
         # Written data pattern per physical row key, used for stratum + direction.
@@ -455,7 +459,7 @@ class DisturbanceEngine:
         if key == self._known_target_key():
             double_threshold = self.known_threshold
             single_threshold = self.known_single_threshold
-            first_bit = 0
+            first_bit = self.known_first_bit
         else:
             double_threshold = self._sample_threshold(key, "double", aggr_pattern)
             single_threshold = self._sample_threshold(key, "single", aggr_pattern)

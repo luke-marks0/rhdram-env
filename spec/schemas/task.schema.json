@@ -19,6 +19,30 @@
       "type": "string",
       "pattern": "^[a-zA-Z0-9_.:-]+$"
     },
+    "family": {
+      "type": "string",
+      "enum": [
+        "known_target",
+        "known_target_anybit",
+        "target_row",
+        "target_cell",
+        "pattern_target",
+        "any_flip",
+        "hidden_target",
+        "unknown_adjacency",
+        "mitigation_aware",
+        "low_disclosure",
+        "profile_generalization"
+      ]
+    },
+    "difficulty": {
+      "type": "string",
+      "enum": [
+        "easy",
+        "medium",
+        "hard"
+      ]
+    },
     "profile": {
       "type": "string"
     },

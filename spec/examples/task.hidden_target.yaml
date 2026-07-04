@@ -1,0 +1,23 @@
+# Task config (SPEC §7/§10). Compiled by rowhammer_env/tasks/compiler.py.
+id: ddr4_hidden_target_v1
+family: hidden_target
+profile: ddr4_vts25_v1
+standard: DDR4
+mitigation:
+  name: none
+  params: {}
+disclosure:
+  mapping: logical_only
+  adjacency: hidden
+  victim: row_handle
+  profile: public_profile_id
+  feedback: summarized_counts
+objective:
+  type: target_row_flip
+  target: row_handle
+budgets:
+  tool_calls: 200
+  acts: 100000
+  cycles: 5000000
+  script_ms: 0
+reward: sparse_success

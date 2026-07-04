@@ -1,0 +1,26 @@
+# Task config (SPEC §7/§10). Compiled by rowhammer_env/tasks/compiler.py.
+id: ddr4_target_cell_v1
+family: target_cell
+profile: ddr4_vts25_v1
+standard: DDR4
+mitigation:
+  name: none
+  params: {}
+disclosure:
+  mapping: physical
+  adjacency: exact
+  victim: exact
+  profile: public_profile_id
+  feedback: summarized_counts
+objective:
+  type: target_cell_flip
+  target:
+    bank: sampled
+    row: sampled
+    bit: sampled
+budgets:
+  tool_calls: 200
+  acts: 100000
+  cycles: 5000000
+  script_ms: 0
+reward: sparse_success

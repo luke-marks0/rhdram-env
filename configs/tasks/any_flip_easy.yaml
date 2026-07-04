@@ -1,0 +1,23 @@
+# Task config (SPEC §7/§10). Compiled by rowhammer_env/tasks/compiler.py.
+id: ddr4_any_flip_easy_v1
+family: any_flip
+profile: ddr4_vts25_v1
+standard: DDR4
+mitigation:
+  name: none
+  params: {}
+disclosure:
+  mapping: physical
+  adjacency: exact
+  victim: hidden_until_finish
+  profile: public_profile_id
+  feedback: summarized_counts
+objective:
+  type: any_flip
+budgets:
+  tool_calls: 200
+  acts: 150000
+  cycles: 5000000
+  script_ms: 0
+reward: sparse_success
+difficulty: easy

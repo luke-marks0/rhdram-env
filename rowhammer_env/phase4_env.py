@@ -55,19 +55,26 @@ class RowHammerDisturbanceEnv(RowHammerEnv):
         except ValueError as exc:
             self.close()
             return self._error("UNAVAILABLE_CAPABILITY", f"geometry not projectable: {exc}")
-        # Build the resolver first so any address form the disclosure permits is
-        # usable as soon as the episode is live; the task layer (P13) registers
-        # handles into this same table after reset.
+        # Let the task layer (P13) compile its task against the real geometry —
+        # sampling the target row, choosing the disclosure, and picking the engine
+        # overrides (known target row / first bit / disturbance family) — before
+        # the resolver and engine are built.
+        overrides = self._disturbance_overrides(geometry, seed or 0)
+        # Build the resolver next so any address form the disclosure permits is
+        # usable as soon as the episode is live; the task layer registers handles
+        # into this same table after reset.
         self._resolver = AddressResolver(self.address_mapper, self.disclosure, HandleTable(seed or 0))
+        engine_kwargs: dict[str, Any] = dict(
+            geometry=geometry,
+            seed=seed or 0,
+            mitigation=self.mitigation["name"],
+            mitigation_params=self.mitigation.get("params"),
+            temperature=self.temperature,
+            profile_id=self.profile_id,
+        )
+        engine_kwargs.update(overrides)
         try:
-            self.disturbance = DisturbanceEngine(
-                geometry=geometry,
-                seed=seed or 0,
-                mitigation=self.mitigation["name"],
-                mitigation_params=self.mitigation.get("params"),
-                temperature=self.temperature,
-                profile_id=self.profile_id,
-            )
+            self.disturbance = DisturbanceEngine(**engine_kwargs)
         except ValueError as exc:
             if str(exc).startswith("UNAVAILABLE_CAPABILITY:"):
                 self.close()
@@ -82,6 +89,16 @@ class RowHammerDisturbanceEnv(RowHammerEnv):
         obs.metadata["disclosure"] = self.disclosure.as_public()
         obs.metadata["disturbance"] = self._disturbance_metadata()
         return obs
+
+    def _disturbance_overrides(self, geometry: Geometry, seed: int) -> dict[str, Any]:
+        """Engine constructor overrides for this episode (hook for the task layer).
+
+        The bare disturbance env keeps the default fixed known target (row 10);
+        ``RowHammerTaskEnv`` overrides this to compile the task and inject the
+        sampled target row, first-flip bit, and disturbance family.
+        """
+        del geometry, seed
+        return {}
 
     def _disturbance_metadata(self) -> dict[str, Any]:
         assert self.disturbance is not None

@@ -1,0 +1,23 @@
+# Task config (SPEC §7/§10). Compiled by rowhammer_env/tasks/compiler.py.
+id: ddr4_low_disclosure_v1
+family: low_disclosure
+profile: ddr4_vts25_v1
+standard: DDR4
+mitigation:
+  name: none
+  params: {}
+disclosure:
+  mapping: logical_only
+  adjacency: hidden
+  victim: hidden_until_finish
+  profile: family_only
+  feedback: reward_only
+objective:
+  type: target_row_flip
+  target: hidden_until_finish
+budgets:
+  tool_calls: 200
+  acts: 100000
+  cycles: 5000000
+  script_ms: 0
+reward: sparse_success

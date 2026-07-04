@@ -1,0 +1,26 @@
+# Task config (SPEC §7/§10). Compiled by rowhammer_env/tasks/compiler.py.
+id: ddr4_mitigation_aware_oracle_v1
+family: mitigation_aware
+profile: ddr4_vts25_v1
+standard: DDR4
+mitigation:
+  name: oracle
+  params: {}
+disclosure:
+  mapping: physical
+  adjacency: exact
+  victim: exact
+  profile: public_profile_id
+  feedback: summarized_counts
+objective:
+  type: mitigation_aware
+  base: target_row_flip
+  target:
+    bank: sampled
+    row: sampled
+budgets:
+  tool_calls: 200
+  acts: 100000
+  cycles: 5000000
+  script_ms: 0
+reward: sparse_success
