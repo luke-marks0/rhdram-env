@@ -7,6 +7,7 @@ import resource
 import select
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -247,10 +248,21 @@ raise SystemExit(_main())
 
 PROBE_RUNNER = r"""
 import json
+import os
 import socket
+import struct
+
+# Each probe is chosen so it returns False (i.e. "not blocked") when this code is
+# run WITHOUT the sandbox — otherwise the attestation would pass vacuously and
+# could not distinguish a working sandbox from no sandbox at all.
 
 
-def blocked_path(path):
+def host_fs_blocked():
+    # A real host file (the sandbox module itself) that exists on the host but is
+    # outside every bind mount; readable off-sandbox, absent inside it.
+    path = os.environ.get("RH_PROBE_HOST_FILE", "")
+    if not path:
+        return False
     try:
         with open(path, "rb") as handle:
             handle.read(1)
@@ -259,9 +271,45 @@ def blocked_path(path):
         return True
 
 
-def network_blocked():
+def proc_pagemap_blocked():
+    # The real interface is /proc/self/pagemap; the disclosure risk is a nonzero
+    # physical frame number. The unprivileged user namespace zeroes it.
     try:
-        with socket.create_connection(("127.0.0.1", 9), timeout=0.2):
+        maps = open("/proc/self/maps").read().splitlines()
+        pagemap = open("/proc/self/pagemap", "rb")
+    except OSError:
+        return True
+    try:
+        for line in maps[:16]:
+            start = int(line.split(" ", 1)[0].split("-", 1)[0], 16)
+            pagemap.seek((start // 4096) * 8)
+            entry = pagemap.read(8)
+            if len(entry) < 8:
+                continue
+            value = struct.unpack("<Q", entry)[0]
+            if (value & (1 << 63)) and (value & ((1 << 55) - 1)):
+                return False  # physical frame number disclosed
+        return True
+    finally:
+        pagemap.close()
+
+
+def device_absent(path):
+    # bwrap --dev provides a minimal /dev; the physical-memory device nodes must be
+    # absent. os.path.exists (unlike open) is not masked by DAC permission bits,
+    # so this reads False off-sandbox where the node exists.
+    return not os.path.exists(path)
+
+
+def network_blocked():
+    # The broker holds a live loopback listener and passes its port. With the net
+    # namespace isolated the connection fails; without it (shared host net ns) it
+    # succeeds, so this reads False off-sandbox.
+    port = int(os.environ.get("RH_PROBE_PORT", "0") or "0")
+    if port <= 0:
+        return False
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=0.5):
             return False
     except OSError:
         return True
@@ -271,11 +319,14 @@ print(
     json.dumps(
         {
             "runtime": "unshare+bwrap",
-            "host_fs_blocked": blocked_path("/home/arch/repos/rhdram-env/README.md"),
-            "proc_pagemap_blocked": blocked_path("/proc/pagemap"),
-            "dev_mem_blocked": blocked_path("/dev/mem"),
-            "dev_kvm_blocked": blocked_path("/dev/kvm"),
+            "host_fs_blocked": host_fs_blocked(),
+            "proc_pagemap_blocked": proc_pagemap_blocked(),
+            "dev_mem_blocked": device_absent("/dev/mem"),
+            "dev_kvm_blocked": device_absent("/dev/kvm"),
             "network_blocked": network_blocked(),
+            # Positive control: a bound path IS readable, so an environment where
+            # everything merely looks "blocked" (nothing exists) fails attestation.
+            "control_usr_readable": os.path.exists("/usr/lib"),
         },
         sort_keys=True,
     )
@@ -311,11 +362,16 @@ class SandboxRuntime:
         runtime = cls(unshare=unshare, bwrap=bwrap, python=python)
         attestation = runtime.attest()
         required = ("host_fs_blocked", "proc_pagemap_blocked", "dev_mem_blocked", "dev_kvm_blocked", "network_blocked")
-        if not all(attestation.get(key) is True for key in required):
+        # The positive control must hold too: it guards against a probe environment
+        # in which every surface merely looks "blocked" because nothing exists.
+        if attestation.get("control_usr_readable") is not True or not all(attestation.get(key) is True for key in required):
             raise SandboxUnavailable(f"sandbox runtime failed attestation: {attestation}")
         return runtime
 
-    def command(self, code: str) -> list[str]:
+    def command(self, code: str, *, setenv: list[tuple[str, str]] | None = None) -> list[str]:
+        env_args: list[str] = []
+        for key, value in setenv or []:
+            env_args += ["--setenv", key, value]
         return [
             self.unshare,
             "--net",
@@ -349,6 +405,7 @@ class SandboxRuntime:
             "--setenv",
             "PYTHONHASHSEED",
             "0",
+            *env_args,
             "--chdir",
             "/tmp",
             "--",
@@ -361,14 +418,28 @@ class SandboxRuntime:
 
     def attest(self) -> dict[str, Any]:
         limits = SandboxLimits(wall_time_s=2.0)
-        proc = subprocess.run(
-            self.command(PROBE_RUNNER),
-            input="",
-            text=True,
-            capture_output=True,
-            timeout=limits.wall_time_s,
-            preexec_fn=_limit_process(limits),
-        )
+        # A real host file outside every bind mount (this module's own path) and a
+        # live loopback listener give the fs and network probes a true differential:
+        # both are reachable off-sandbox and must be blocked inside it.
+        host_file = str(pathlib.Path(__file__).resolve())
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            listener.bind(("127.0.0.1", 0))
+            listener.listen(1)
+            port = listener.getsockname()[1]
+            proc = subprocess.run(
+                self.command(
+                    PROBE_RUNNER,
+                    setenv=[("RH_PROBE_HOST_FILE", host_file), ("RH_PROBE_PORT", str(port))],
+                ),
+                input="",
+                text=True,
+                capture_output=True,
+                timeout=limits.wall_time_s,
+                preexec_fn=_limit_process(limits),
+            )
+        finally:
+            listener.close()
         if proc.returncode != 0:
             raise SandboxUnavailable((proc.stderr or proc.stdout or "sandbox probe failed")[:500])
         try:

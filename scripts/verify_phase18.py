@@ -25,15 +25,19 @@ def _require_worker() -> None:
 def check_attestation() -> None:
     attestation = sandbox_attestation()
     required = ("host_fs_blocked", "proc_pagemap_blocked", "dev_mem_blocked", "dev_kvm_blocked", "network_blocked")
-    if attestation.get("runtime") != "unshare+bwrap" or not all(attestation.get(key) is True for key in required):
+    if (
+        attestation.get("runtime") != "unshare+bwrap"
+        or attestation.get("control_usr_readable") is not True
+        or not all(attestation.get(key) is True for key in required)
+    ):
         raise SystemExit(f"sandbox attestation failed: {attestation}")
-    print("  attestation: unshare+bwrap blocks host fs, /proc/pagemap, devices, and network")
+    print("  attestation: unshare+bwrap blocks host fs, /proc/self/pagemap, devices, and network")
 
 
 def check_escape_attempts() -> None:
     cases = {
         "import os\n": "SANDBOX_VIOLATION",
-        "open('/home/arch/repos/rhdram-env/README.md').read()\n": "SANDBOX_VIOLATION",
+        "open('/etc/hostname').read()\n": "SANDBOX_VIOLATION",
         "print.__self__.__import__('os')\n": "SANDBOX_VIOLATION",
         "while True:\n    pass\n": "SCRIPT_TIMEOUT",
     }

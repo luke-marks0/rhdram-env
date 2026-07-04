@@ -33,6 +33,9 @@ class SandboxRuntimeTests(unittest.TestCase):
         self.assertEqual(attestation["runtime"], "unshare+bwrap")
         for key in ("host_fs_blocked", "proc_pagemap_blocked", "dev_mem_blocked", "dev_kvm_blocked", "network_blocked"):
             self.assertIs(attestation[key], True, key)
+        # Positive control: a bound path must be readable, so the *_blocked results
+        # above cannot all be True merely because nothing exists in the probe env.
+        self.assertIs(attestation["control_usr_readable"], True)
 
     def test_broker_uses_ipc_and_returns_observations(self) -> None:
         env = _DummyEnv()
@@ -49,7 +52,7 @@ class SandboxRuntimeTests(unittest.TestCase):
     def test_escape_attempts_fail_closed(self) -> None:
         scripts = [
             "import os\n",
-            "open('/home/arch/repos/rhdram-env/README.md').read()\n",
+            "open('/etc/hostname').read()\n",
             "print.__self__.__import__('os')\n",
             "from rh_sdk import not_rh\n",
         ]
