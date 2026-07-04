@@ -6,6 +6,8 @@ import unittest
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
+WORKER = ROOT / "build/phase2/ramulator_worker"
+CONFIG = ROOT / "build/phase2/p2_external_ddr4.yaml"
 
 from rowhammer_env import Phase2Action, RowHammerEnv
 
@@ -16,7 +18,7 @@ class Phase2EnvTests(unittest.TestCase):
         obs = env.reset()
         self.assertEqual(obs.error["code"], "UNAVAILABLE_CAPABILITY")
 
-    @unittest.skipUnless((ROOT / "build/phase2/ramulator_worker").is_file(), "Phase 2 worker not built")
+    @unittest.skipUnless(WORKER.is_file() and CONFIG.is_file(), "Phase 2 worker/config not built")
     def test_read_write_overlay(self) -> None:
         env = RowHammerEnv()
         env.reset()
@@ -29,4 +31,3 @@ class Phase2EnvTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
