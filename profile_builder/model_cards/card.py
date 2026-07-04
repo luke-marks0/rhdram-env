@@ -44,6 +44,25 @@ def render_model_card(profile: dict, report: dict) -> str:
     add(f"- Data patterns: {domain['data_patterns']}")
     add("")
 
+    topology = profile.get("topology")
+    dims = profile.get("standard_dimensions")
+    refresh = profile.get("refresh")
+    if topology and dims and refresh:
+        neighbours = ", ".join(f"±{d} (w={w})" for d, w in topology["blast_neighbors"])
+        add("## Standard dimensions")
+        add("")
+        add(f"- Blast neighbours: {neighbours}")
+        add(f"- Half-double (±2) modelled: {topology['half_double_supported']}")
+        add(
+            f"- Refresh: {refresh['commands_per_window']} all-bank refreshes per window "
+            f"(RFM: {refresh['rfm_supported']}, VRR: {refresh['vrr_supported']})"
+        )
+        add(
+            f"- Pseudo-channel: {dims['pseudo_channel']}; die stacking: {dims['die_stacking']}; "
+            f"on-die ECC: {dims['on_die_ecc']}; sub-array resolved: {dims['subarray_resolved']}"
+        )
+        add("")
+
     add("## Families")
     add("")
     add("| Family | Train chips | Held-out chips | single/double (all_ones) | Dominant direction |")

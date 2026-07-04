@@ -25,6 +25,13 @@
 - RowPress: True
 - Data patterns: ['all_ones', 'all_zeros']
 
+## Standard dimensions
+
+- Blast neighbours: ±1 (w=1.0)
+- Half-double (±2) modelled: False
+- Refresh: 8192 all-bank refreshes per window (RFM: False, VRR: False)
+- Pseudo-channel: False; die stacking: False; on-die ECC: False; sub-array resolved: False
+
 ## Families
 
 | Family | Train chips | Held-out chips | single/double (all_ones) | Dominant direction |

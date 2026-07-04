@@ -21,6 +21,7 @@ from ..fit.profile import AGGR_CLASSES, build_profile_fit
 from ..manifest import load_source_pin
 from ..model_cards import render_model_card
 from ..paths import CONFIG, OUT_DIR, ROOT, TRUST_DIR
+from ..standards import as_profile_blocks, facts_for
 from ..validate.heldout import build_report
 from . import canonical_bytes, public_key_hex, sign, verify
 
@@ -75,8 +76,16 @@ def build(write: bool = True) -> dict:
             f"held-out validation failed: {report['n_failed']}/{report['n_checks']} checks"
         )
 
+    # Schema v2 stamps the standard's read-disturbance dimensions (blast
+    # topology, refresh divisor + RFM/VRR, and standard-specific dimensions such
+    # as pseudo-channel / on-die ECC / die stacking) into the package, so a
+    # consumer can see exactly which standard the profile covers (P15). These are
+    # standard facts, not fitted calibration; the DDR4 profile carries the DDR4
+    # values (no HBM dimensions), and the loader still accepts a v1 package.
+    standard_blocks = as_profile_blocks(facts_for(config["standard"]))
+
     profile = {
-        "schema_version": "1",
+        "schema_version": "2",
         "profile_id": config["profile_id"],
         "standard": config["standard"],
         "labeling": config["labeling"],
@@ -92,6 +101,9 @@ def build(write: bool = True) -> dict:
         },
         "build_basis": {"config_sha256": config_sha, "canonical_table_sha256": table_sha},
         "domain": _derive_domain(config, fit, tables),
+        "topology": standard_blocks["topology"],
+        "refresh": standard_blocks["refresh"],
+        "standard_dimensions": standard_blocks["standard_dimensions"],
         "fit": fit,
         "validation": {
             "gates": report["gates"],

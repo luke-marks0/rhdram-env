@@ -34,14 +34,25 @@ class Geometry:
         """Linear bytes between two physically adjacent rows in the same bank.
 
         RoBaRaCoCh lays out (from the LSB, above the transaction offset): the
-        prefetch-adjusted Column field, then Rank, BankGroup, Bank, and finally
-        Row as the most-significant field. Advancing the Row index by one thus
-        advances the linear address by ``2 ** (bits of every level below Row)``.
+        prefetch-adjusted Column field, then every other non-Channel level in
+        ``DRAMSpec`` order up to and including Row, with Row as the most-significant
+        mapped field (``addr_mapper_base.cpp``: Column is sliced first, then levels
+        ``0..row_idx``). Advancing the Row index by one thus advances the linear
+        address by ``2 ** (bits of every level below Row)``.
+
+        The set of levels below Row is read straight from the reported
+        ``level_names`` (``level_names[1:row_index]``, excluding the LSB Channel and
+        the separately-placed Column), so the stride is derived from the real
+        geometry for *any* standard — DDR (Rank/BankGroup/Bank) as well as HBM
+        (PseudoChannel/BankGroup/Bank) — rather than a hardcoded DDR level set.
         """
+        if "row" not in self.level_names:
+            raise ValueError("geometry has no Row level")
+        if self.level_names[-1] != "column":
+            raise ValueError("RoBaRaCoCh geometry assumes Column is the last level")
+        row_index = self.level_names.index("row")
         tx_offset = _log2_exact(self.tx_bytes)
-        column_bits = _log2_exact(self.level_sizes["column"]) - _log2_exact(self.prefetch)
-        below_row = column_bits
-        for name in ("rank", "bankgroup", "bank"):
-            if name in self.level_sizes:
-                below_row += _log2_exact(self.level_sizes[name])
+        below_row = _log2_exact(self.level_sizes["column"]) - _log2_exact(self.prefetch)
+        for name in self.level_names[1:row_index]:
+            below_row += _log2_exact(self.level_sizes[name])
         return 1 << (tx_offset + below_row)

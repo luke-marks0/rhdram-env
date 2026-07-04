@@ -8,17 +8,8 @@ from typing import Any
 
 from .geometry import Geometry
 from .profiles import load_profile
+from .standards import StandardModel, UnsupportedStandard
 
-
-# Blast topology per DRAM standard: (row distance from the aggressor, coupling
-# weight). Distance 1 is the immediate physical neighbour (classic RowHammer);
-# distance 2 is the "half-double" next-nearest row, which couples far more
-# weakly. The set is standard-driven (SPEC §5.3 / P14 task 5), not a hardcoded
-# ``±1`` logical loop. DDR4 is modelled with immediate neighbours only unless a
-# profile enables half-double.
-STANDARD_BLAST: dict[str, list[tuple[int, float]]] = {
-    "DDR4": [(1, 1.0)],
-}
 
 # A same-row activation that is precharged again after longer than this many
 # controller cycles is treated as an open-row *dwell* (RowPress regime, SPEC
@@ -33,13 +24,6 @@ ROWPRESS_DWELL_SATURATION = 100_000
 
 # Upper bound on how many bits a single victim row may flip (bounded multiplicity).
 MAX_FLIPPED_BITS_PER_ROW = 64
-
-# DDR4 all-bank auto-refresh commands per refresh window (tREFW / tREFI = 8192):
-# one window refreshes every row exactly once. Accumulated read-disturbance
-# survives only within a window — a hammer fast enough to cross its threshold
-# inside one window flips; one slow enough to straddle a window boundary is
-# reset by the intervening refresh (SPEC §5.7, test D8).
-REFRESH_COMMANDS_PER_WINDOW = 8192
 
 
 @dataclass
@@ -123,8 +107,24 @@ class DisturbanceEngine:
         self.profile_id = profile_id
         if not self.profile["validation"]["passed"]:
             raise ValueError("profile validation did not pass")
-        if self.profile["standard"] != "DDR4":
-            raise ValueError("Phase 4 admits DDR4 only")
+        # Standard is profile-driven, not DDR4-gated (P15, defect F). The profile's
+        # standard must have an admitted read-disturbance adapter, and the geometry
+        # the worker reports must be of that same standard — a profile fitted on one
+        # standard is never run against another's geometry (no parameter pooling).
+        self.standard = str(self.profile["standard"])
+        if geometry.standard != self.standard:
+            raise ValueError(
+                f"PROFILE_REJECTED:profile standard {self.standard} does not match "
+                f"geometry standard {geometry.standard}"
+            )
+        # Half-double ±2 coupling is added only when the profile characterises it
+        # (schema-v2 ``topology`` block; absent/False for the DDR4 VTS25 profile).
+        topology = self.profile.get("topology") or {}
+        half_double = bool(topology.get("half_double_supported", False))
+        try:
+            self.standard_model = StandardModel.from_geometry(geometry, half_double=half_double)
+        except UnsupportedStandard as exc:
+            raise ValueError(str(exc))
         domain = self.profile["domain"]
         if domain["temperature_extrapolation"] or domain["timing_extrapolation"]:
             raise ValueError("profile extrapolation is not admitted")
@@ -139,12 +139,13 @@ class DisturbanceEngine:
         self.temperature = temperature
 
         self.geometry = geometry
-        # Logical stride between adjacent physical rows (derived from the real
-        # DDR4 geometry, not the fictitious 8192 the old model used).
+        # Standard-specific parameters, all derived from the real geometry + the
+        # standard adapter (not DDR4 constants): the linear stride between adjacent
+        # physical rows, the blast neighbourhood, and the refresh-window length.
         self.row_bytes = geometry.row_stride
         self.tx_bytes = geometry.tx_bytes
-        self.blast = STANDARD_BLAST.get(self.profile["standard"], [(1, 1.0)])
-        self.refresh_window = REFRESH_COMMANDS_PER_WINDOW
+        self.blast = list(self.standard_model.blast)
+        self.refresh_window = self.standard_model.refresh_window
 
         self.seed = seed
         self.family = family
@@ -380,8 +381,9 @@ class DisturbanceEngine:
         """Decay accumulated exposure over the auto-refresh window (SPEC §5.7).
 
         One all-bank refresh restores ~1/8192 of the rows; a full window of
-        ``REFRESH_COMMANDS_PER_WINDOW`` refreshes restores every row exactly
-        once. At each window boundary the rank's accumulated activations are
+        ``self.refresh_window`` refreshes (the standard's JEDEC refresh divisor)
+        restores every row exactly once. At each window boundary the rank's
+        accumulated activations are
         cleared: a hammer slow enough to straddle the boundary is refreshed away
         and must re-accumulate, while a fast burst that crosses its threshold
         inside a single window still flips. Already-flipped cells are *not*
