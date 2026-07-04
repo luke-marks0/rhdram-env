@@ -22,6 +22,7 @@ FULL_DISCLOSURE = Disclosure(
     profile="public_profile_id",
     feedback="full_trace",
 )
+DEFAULT_PROFILE_ID = "ddr4_vts25_v1"
 
 
 class RowHammerDisturbanceEnv(RowHammerEnv):
@@ -30,7 +31,7 @@ class RowHammerDisturbanceEnv(RowHammerEnv):
         *args: Any,
         disturbance: DisturbanceEngine | None = None,
         mitigation: dict[str, Any] | None = None,
-        profile_id: str = "ddr4_vts25_v1",
+        profile_id: str = DEFAULT_PROFILE_ID,
         temperature: int = 50,
         **kwargs: Any,
     ) -> None:

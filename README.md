@@ -31,6 +31,8 @@ Current scope:
 - phase 17 OpenEnv HTTP/WebSocket serving with a policy-side client.
 - phase 18 OS-isolated `script.run` using `unshare` + `bwrap` and JSON-line
   IPC back to the normal tool surface.
+- phase 19 HTTP policy adapter, rollout/eval metrics, and a reward-updated
+  training example for the LLM-testable milestone.
 
 Ramulator and OpenEnv are admitted for the Phase 1 bootstrap; the `ddr4_vts25`
 source and the `ddr4_vts25_v1` profile are admitted. HBM2 remains non-admitted
@@ -120,4 +122,11 @@ Phase 18 verifies the OS-level sandbox and trace-equivalent IPC broker:
 
 ```sh
 python3 -B scripts/verify_phase18.py
+```
+
+Phase 19 verifies the HTTP policy adapter, held-out eval metrics, and training
+example:
+
+```sh
+python3 -B scripts/verify_phase19.py
 ```

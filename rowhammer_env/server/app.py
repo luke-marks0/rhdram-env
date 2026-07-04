@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import pathlib
 from typing import Any
 
 from fastapi import FastAPI
@@ -14,31 +15,42 @@ _HTTPEnvServer, _ConcurrencyConfig, _ServerMode = load_openenv_http_server()
 
 
 def _default_task() -> dict[str, Any] | None:
-    """Optional server-pinned default task (JSON) from ``RH_TASK``."""
-    raw = os.getenv("RH_TASK")
-    if not raw:
+    """Optional server-pinned default task from env JSON or a JSON file."""
+    raw = os.getenv("RH_TASK") or os.getenv("ROW_HAMMER_TASK_JSON")
+    if raw:
+        try:
+            task = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise SystemExit(f"task environment JSON is not valid: {exc}") from exc
+        if not isinstance(task, dict):
+            raise SystemExit("task environment JSON must be an object")
+        return task
+
+    task_file = os.getenv("ROW_HAMMER_TASK_FILE")
+    if not task_file:
         return None
     try:
-        task = json.loads(raw)
+        task = json.loads(pathlib.Path(task_file).read_text())
     except json.JSONDecodeError as exc:
-        raise SystemExit(f"RH_TASK is not valid JSON: {exc}") from exc
+        raise SystemExit(f"ROW_HAMMER_TASK_FILE is not valid JSON: {exc}") from exc
     if not isinstance(task, dict):
-        raise SystemExit("RH_TASK must be a JSON object")
+        raise SystemExit("ROW_HAMMER_TASK_FILE must contain a JSON object")
     return task
 
 
-def make_env() -> RowHammerTaskEnv:
+def make_env(task: dict[str, Any] | None = None) -> RowHammerTaskEnv:
     """Factory used by OpenEnv; each session receives a fresh worker episode.
 
     The default task can be pinned with the ``RH_TASK`` env var (a JSON task
     config); an orchestrator can also override it per-episode by passing ``task``
     to ``reset`` over the WebSocket transport.
     """
-    return RowHammerTaskEnv(task=_default_task())
+    return RowHammerTaskEnv(task=task if task is not None else _default_task())
 
 
 def create_rowhammer_app(
     *,
+    task: dict[str, Any] | None = None,
     max_concurrent_envs: int | None = None,
     session_timeout_s: float | None = None,
     mode: str | None = None,
@@ -55,8 +67,12 @@ def create_rowhammer_app(
         max_concurrent_envs=max_concurrent_envs,
         session_timeout=session_timeout_s,
     )
+
+    def factory() -> RowHammerTaskEnv:
+        return make_env(task=task)
+
     server = _HTTPEnvServer(
-        make_env,
+        factory,
         Phase2Action,
         Phase2Observation,
         concurrency_config=concurrency_config,

@@ -19,6 +19,9 @@ class RowHammerClient(EnvClient[Phase2Action, Phase2Observation, Phase2State]):
 
     def _parse_result(self, payload: dict[str, Any]) -> Any:
         obs_data = dict(payload.get("observation", {}))
+        wire_metadata = obs_data.get("wire_metadata")
+        if wire_metadata and not obs_data.get("metadata"):
+            obs_data["metadata"] = wire_metadata
         obs_data["reward"] = payload.get("reward")
         obs_data["done"] = payload.get("done", False)
         observation = Phase2Observation.model_validate(obs_data)
