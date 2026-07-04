@@ -1,0 +1,10 @@
+pydantic>=2
+PyYAML>=6
+jsonschema>=4
+numpy>=2
+cryptography>=45
+fastapi>=0.110,<0.116
+uvicorn>=0.27
+websockets>=12
+fastmcp>=2
+requests>=2

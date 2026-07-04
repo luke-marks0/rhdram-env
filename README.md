@@ -26,6 +26,7 @@ Current scope:
   fail closed.
 - phase 10 release gate for admitted phase checks, provenance, unit tests, and
   tracked-file hygiene.
+- phase 17 OpenEnv HTTP/WebSocket serving with a policy-side client.
 
 Ramulator and OpenEnv are admitted for the Phase 1 bootstrap; the `ddr4_vts25`
 source and the `ddr4_vts25_v1` profile are admitted. HBM2 remains non-admitted
@@ -82,4 +83,12 @@ Phase 8-10 gates:
 python3 -B scripts/verify_phase8.py
 python3 -B scripts/verify_phase9.py
 python3 -B scripts/verify_release.py
+```
+
+Phase 17 serves the task environment through the vendored OpenEnv HTTP transport:
+
+```sh
+python3 -m pip install -r requirements.txt
+python3 -B scripts/verify_phase17.py
+python3 -m rowhammer_env.server.app
 ```

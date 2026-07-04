@@ -24,6 +24,8 @@ class RowHammerTaskEnv(RowHammerDisturbanceEnv):
     ``target_row=10`` / monolithic ``_trusted_success``.
     """
 
+    SUPPORTS_CONCURRENT_SESSIONS = True
+
     def __init__(
         self,
         *args: Any,

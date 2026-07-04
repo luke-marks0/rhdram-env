@@ -61,11 +61,14 @@ class RowHammerEnv(Environment[Phase2Action, Phase2Observation, Phase2State]):
     ) -> Phase2Observation:
         self.close()
         self._state = Phase2State(episode_id=episode_id or "p2_episode", step_count=0, cycle=0)
+        if not self.worker_path.is_file() or not self.config_path.is_file():
+            self._worker = None
+            return self._error("UNAVAILABLE_CAPABILITY", "Phase 2 worker/config is not built")
         try:
             self._worker = WorkerClient(self.worker_path, self.config_path)
         except FileNotFoundError:
             self._worker = None
-            return self._error("UNAVAILABLE_CAPABILITY", "Phase 2 worker is not built")
+            return self._error("UNAVAILABLE_CAPABILITY", "Phase 2 worker/config is not built")
         return Phase2Observation(
             reward=0.0,
             done=False,
