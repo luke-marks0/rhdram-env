@@ -22,6 +22,26 @@ OpenAI-compatible chat-completions endpoint configured with
 `RHD_LLM_CHAT_COMPLETIONS_URL`, `RHD_LLM_MODEL`, and optionally
 `RHD_LLM_API_KEY`.
 
+## Discovery families and the secret address mapping
+
+Discovery families (`bounded_sweep`, and the Tier 2b numeric-address family) hide
+which candidate rows are same-bank physical neighbours of the victim. For these,
+the DRAM **address→bank mapping is a per-episode secret**: the worker runs the
+authored `RoBaRaCoChRowXOR` mapper (RoBaRaCoCh decode plus a Row→Bank XOR with a
+seedable offset), so `victim ± row_stride` lands in a *different* bank and
+adjacency cannot be computed from a numeric address — it must be reverse-engineered
+through the bank-conflict timing channel (`public_counters.acts` /
+`last_action.cycle_delta` / the `timing_digest`, disclosed under `full_trace`). The
+mapper identity/offset is never disclosed in any observation, error, handle name,
+or digest. The disclosed geometry (`dram.info.geometry`) is unchanged — the row
+stride is identical to the public mapper. Success is scored on the trusted decoded
+victim flip, never on a policy read or claim. See
+`docs/adr-0004-secret-address-mapping.md`.
+
+The server-internal `DECODE` request (true coordinates under the active mapper) is
+used only by the task compiler to build candidate sets; it is **not** in the policy
+tool surface and cannot be reached through `step`.
+
 ## CI Fixture Policy
 
 `CIHammerFixturePolicy` is a deterministic test fixture for CI. It is not

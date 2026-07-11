@@ -4,11 +4,12 @@ from typing import Any
 
 from . import rewards
 from .geometry import Geometry
+from .mappers import DEFAULT_MAPPER, is_python_projectable, select_secret_mapper
 from .mitigations import normalize_mitigation
 from .phase2_env import Phase2Action, Phase2Observation
 from .phase4_env import DEFAULT_PROFILE_ID, RowHammerDisturbanceEnv
 from .script_sandbox import RestrictedScriptBroker, ScriptError
-from .tasks.compiler import CompiledTask, TaskConfigError, TaskSpec
+from .tasks.compiler import FAMILIES, CompiledTask, TaskConfigError, TaskSpec
 
 ALLOWED_TOOLS = ["dram.info", "dram.read", "dram.write", "dram.issue", "script.run", "episode.finish"]
 
@@ -125,9 +126,29 @@ class RowHammerTaskEnv(RowHammerDisturbanceEnv):
         obs.metadata["budget_remaining"] = dict(self.budget_remaining)
         return obs
 
+    # ---- secret address mapping (P24) ---------------------------------------
+    def _active_mapper(self, seed: int) -> tuple[str, dict[str, int]]:
+        """Discovery families get a per-episode secret mapper; others stay public.
+
+        Secret-mapping families must be ``logical_only`` (the policy never gets a
+        physical decoder, so a secret bank function cannot leak through
+        ``physical`` addressing); fail closed otherwise.
+        """
+        fam = FAMILIES.get(self.spec.family)
+        if fam is not None and fam.secret_mapping:
+            if fam.disclosure.mapping != "logical_only":
+                raise TaskConfigError(
+                    f"secret-mapping family {self.spec.family!r} must be logical_only"
+                )
+            return select_secret_mapper(self.spec.task_id, seed)
+        return (DEFAULT_MAPPER, {})
+
     # ---- task compilation hook ----------------------------------------------
     def _disturbance_overrides(self, geometry: Geometry, seed: int) -> dict[str, Any]:
-        self._compiled = self.spec.compile(seed, geometry)
+        # Discovery families build their candidate window against the true (secret)
+        # mapping via the worker DECODE op; RoBaRaCoCh families need no decoder.
+        decode = self._decode if not is_python_projectable(self._active_mapper_impl) else None
+        self._compiled = self.spec.compile(seed, geometry, decode=decode)
         self.disclosure = self._compiled.disclosure
         self.task_family = self._compiled.family
         return self._compiled.disturbance_overrides()
@@ -149,7 +170,13 @@ class RowHammerTaskEnv(RowHammerDisturbanceEnv):
         if self.disclosure.victim in ("row_handle", "cell_handle"):
             self._target_handle = handles.register("target", target_addr)
         if self.disclosure.adjacency == "candidate_set":
-            for i, offset in enumerate((-row_bytes, row_bytes, 2 * row_bytes)):
+            # ``bounded_sweep`` (P23) compiles an explicit N-candidate window; the
+            # legacy ``unknown_adjacency`` keeps its fixed 3 same-bank offsets.
+            if self._compiled.candidates:
+                offsets = [c.offset for c in self._compiled.candidates]
+            else:
+                offsets = [-row_bytes, row_bytes, 2 * row_bytes]
+            for i, offset in enumerate(offsets):
                 self._candidate_handles.append(handles.register(f"candidate:{i}", target_addr + offset))
 
     def _script(self, action: Phase2Action) -> Phase2Observation:
@@ -238,7 +265,7 @@ class RowHammerTaskEnv(RowHammerDisturbanceEnv):
             out["objective"] = {"type": "target_cell_flip", "bit": ct.target_bit}
         elif ct.objective_type == "pattern_target":
             out["objective"] = {"type": "pattern_target", "mask": ct.target_mask, "value": ct.target_value}
-        elif fam in ("hidden_target", "unknown_adjacency"):
+        elif fam in ("hidden_target", "unknown_adjacency", "bounded_sweep"):
             out["objective"] = {"type": "target_row_flip", "target": {"kind": "handle", "id": self._target_handle}}
         else:
             out["objective"] = {"type": ct.objective_type}
@@ -258,5 +285,12 @@ class RowHammerTaskEnv(RowHammerDisturbanceEnv):
 
     def _physical_target(self, addr: int) -> dict[str, Any]:
         assert self.address_mapper is not None
+        # The Python projection only reproduces the public RoBaRaCoCh mapper; under
+        # a secret mapper it would emit the wrong (and bank-secret-leaking)
+        # coordinates, so physical disclosure fails closed (P24 task 4). Only
+        # ``victim: exact`` families reach here, and those never use a secret
+        # mapper — this is a defensive guard, not a live path.
+        if not is_python_projectable(self._active_mapper_impl):
+            raise TaskConfigError("physical target disclosure is unavailable under a secret mapper")
         coords = self.address_mapper.decode(addr)
         return {"kind": "physical", **coords, "addr": addr}

@@ -30,6 +30,7 @@
         "any_flip",
         "hidden_target",
         "unknown_adjacency",
+        "bounded_sweep",
         "mitigation_aware",
         "low_disclosure",
         "profile_generalization"

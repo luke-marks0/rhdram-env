@@ -19,6 +19,7 @@
 #define RHDRAM_ISSUED_EVENT_RECORDER_H
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -63,6 +64,20 @@ class IssuedEventSink {
   }
   const Geometry& geometry() const { return m_geometry; }
 
+  // A side-effect-free decode of a linear (intra-channel) address into decoded
+  // coordinates under the *active* mapper. Published by the recorder plugin at
+  // setup (it holds the controller, hence the constructed addr_mapper), so the
+  // worker's DECODE op reuses the real mapper instead of duplicating its logic in
+  // Python — which would drift for any mapper other than RoBaRaCoCh (P24). First
+  // controller to publish wins, mirroring the geometry rule.
+  void set_decoder(std::function<std::vector<int>(uint64_t)> decoder) {
+    if (!m_decoder) m_decoder = std::move(decoder);
+  }
+  bool has_decoder() const { return static_cast<bool>(m_decoder); }
+  std::vector<int> decode(uint64_t linear) const {
+    return m_decoder ? m_decoder(linear) : std::vector<int>{};
+  }
+
   void push(IssuedEvent&& ev) { m_events.push_back(std::move(ev)); }
 
   // Return everything captured since the last drain and reset the buffer.
@@ -78,6 +93,7 @@ class IssuedEventSink {
   IssuedEventSink() = default;
   Geometry m_geometry;
   std::vector<IssuedEvent> m_events;
+  std::function<std::vector<int>(uint64_t)> m_decoder;
 };
 
 }  // namespace rhdram

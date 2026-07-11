@@ -53,8 +53,17 @@ def compile_task(config, seed=13):
 
 
 class CompilerParsingTests(unittest.TestCase):
-    def test_ten_families_registered(self) -> None:
-        self.assertEqual(len(FAMILIES), 10)
+    def test_families_registered(self) -> None:
+        # The ten SPEC §7 core families, plus the Tier 2a ``bounded_sweep``
+        # discovery family added by IMPLEMENTATION_PLAN_V3 P23.
+        spec_families = {
+            "known_target_anybit", "target_row", "target_cell", "pattern_target", "any_flip",
+            "hidden_target", "unknown_adjacency", "mitigation_aware", "low_disclosure",
+            "profile_generalization",
+        }
+        self.assertTrue(spec_families <= set(FAMILIES))
+        self.assertIn("bounded_sweep", FAMILIES)
+        self.assertEqual(len(FAMILIES), 11)
 
     def test_legacy_shorthand_and_alias(self) -> None:
         spec = TaskSpec.from_config({"family": "known_target"})  # alias

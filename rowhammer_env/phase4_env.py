@@ -5,6 +5,7 @@ from typing import Any
 
 from .disturbance import DisturbanceEngine
 from .geometry import Geometry
+from .mappers import DEFAULT_MAPPER, worker_config_for_mapper
 from .mitigations import normalize_mitigation, worker_config_for_mitigation
 from .phase2_env import Phase2Observation, RowHammerEnv
 from .tasks import AddressResolver, Disclosure, HandleTable
@@ -42,10 +43,28 @@ class RowHammerDisturbanceEnv(RowHammerEnv):
         self.temperature = temperature
         self.disclosure = FULL_DISCLOSURE
         self.address_mapper: AddressMapper | None = None
+        # The per-episode active mapper (impl name + params). The bare disturbance
+        # env always uses the public default; the task layer overrides
+        # ``_active_mapper`` to pick a per-episode secret for discovery families.
+        # Server-internal only — never disclosed to the policy (P24 leakage guard).
+        self._active_mapper_impl = DEFAULT_MAPPER
+        self._active_mapper_params: dict[str, int] = {}
+
+    def _active_mapper(self, seed: int) -> tuple[str, dict[str, int]]:
+        """The address mapper for this episode: default public unless overridden."""
+        return (DEFAULT_MAPPER, {})
 
     def reset(self, seed: int | None = None, episode_id: str | None = None, **kwargs: Any) -> Phase2Observation:
+        # Select the (possibly per-episode-secret) address mapper *before* the
+        # worker is built, then compose the mitigation plugins on top. The default
+        # mapper reuses the base config verbatim, so the non-discovery path is
+        # byte-identical to before.
+        self._active_mapper_impl, self._active_mapper_params = self._active_mapper(seed or 0)
         try:
-            self.config_path = worker_config_for_mitigation(self._base_config_path, self.mitigation)
+            mapped_config = worker_config_for_mapper(
+                self._base_config_path, self._active_mapper_impl, self._active_mapper_params
+            )
+            self.config_path = worker_config_for_mitigation(mapped_config, self.mitigation)
         except ValueError as exc:
             if str(exc).startswith("UNAVAILABLE_CAPABILITY:"):
                 return self._error("UNAVAILABLE_CAPABILITY", str(exc).split(":", 1)[1])
@@ -106,6 +125,21 @@ class RowHammerDisturbanceEnv(RowHammerEnv):
         if self.address_mapper is None:
             return None
         return self.address_mapper.geometry.public_block()
+
+    def _decode(self, linear: int) -> dict[str, int]:
+        """Decode a linear address under the *active* worker mapper (P24).
+
+        Server-internal only: the ``DECODE`` op is never in ``ALLOWED_TOOLS`` and is
+        never reachable through ``step``. The task compiler uses it to build
+        candidate sets against the true (per-episode-secret) mapping without
+        re-deriving the bit function in Python. Raises if the worker is down.
+        """
+        if self._worker is None:
+            raise RuntimeError("worker unavailable for decode")
+        resp = self._worker.call(WorkerRequest("DECODE", self._next_id(), (str(int(linear)),)))
+        if not resp.get("ok"):
+            raise RuntimeError((resp.get("error") or {}).get("message", "decode failed"))
+        return resp["addr_vec"]
 
     def _disturbance_overrides(self, geometry: Geometry, seed: int) -> dict[str, Any]:
         """Engine constructor overrides for this episode (hook for the task layer).

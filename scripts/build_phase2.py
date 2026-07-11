@@ -94,6 +94,7 @@ def main() -> int:
             str(EXTENSIONS),
             "cpp/simulator_service/ramulator_worker.cpp",
             str(EXTENSIONS / "issued_event_recorder.cpp"),
+            str(EXTENSIONS / "row_xor_addr_mapper.cpp"),
             "-L",
             str(RAMULATOR),
             f"-Wl,-rpath,{RAMULATOR}",

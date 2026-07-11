@@ -109,6 +109,22 @@ aggressor. Two consequences:
   adjacency must be reverse-engineered by timing (DRAMA), exactly as on real
   hardware where the controller's bank-XOR function is undocumented.
 
+> **CORRECTION (P24 as-built, 2026-07-12 — see `docs/adr-0004-secret-address-
+> mapping.md`).** The `MOP4CLXOR` premise below is **wrong** and was not used.
+> Verified against the code and the worker `DECODE` op: `MOP4CLXOR` XORs
+> **column** bits into the bank index (cache-line/bank interleaving), *not* row
+> bits — so `addr + row_stride` stays in the **same bank** under it (measured
+> 0/200 different-bank), exactly as under `RoBaRaCoCh`. No stock Ramulator v2.1.0
+> mapper XORs Row→Bank, so none makes `victim ± row_stride` non-computable. P24
+> instead **authors** a real, source-cited Row→Bank XOR mapper,
+> **`RoBaRaCoChRowXOR`** (`cpp/ramulator_extensions/row_xor_addr_mapper.cpp`):
+> RoBaRaCoCh decode (so the row stride and disclosed geometry are unchanged) plus
+> a Row→Bank/BankGroup XOR with a seedable `xor_offset` — bit 0 of Row always
+> folds into Bank, so `addr + row_stride` lands in a **different bank** (measured
+> 300/300). This is address mapping (a real, documented controller function;
+> DRAMA / Pessl et al.), not fabricated physics, so it is within SPEC §2. Read
+> `MOP4CLXOR` as `RoBaRaCoChRowXOR` throughout the rest of this section and P24.
+
 Ramulator v2.1.0 ships a **real, source-traced** mapper for this: **`MOP4CLXOR`**
 ("Multi-Offset Physical with 4-CL XOR", `addr_mapper/impl/mop4clxor.cpp`) XORs row
 bits into the bank/bankgroup indices, so linearly-adjacent addresses scatter

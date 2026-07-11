@@ -3,9 +3,10 @@ from __future__ import annotations
 import hashlib
 import random
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 from ..geometry import Geometry
+from ..tools.addressing import AddressMapper
 from .disclosure import Disclosure
 
 
@@ -28,6 +29,18 @@ BAND_WINDOW: dict[str, tuple[float, float]] = {
     "hard": (0.0, 0.20),
 }
 DEFAULT_BAND = "medium"
+
+# Candidate-window width for the Tier 2a ``bounded_sweep`` discovery family (P23).
+# Difficulty scales with how many candidate handles the policy must narrow by
+# bank-conflict timing before hammering the survivors — ``N`` per band. Only the
+# two true aggressors (the victim's immediate same-bank neighbours) actually flip;
+# the rest are same-bank-far / different-bank decoys.
+BAND_CANDIDATES: dict[str, int] = {"easy": 4, "medium": 16, "hard": 64}
+
+# A same-bank decoy must sit well outside the physical blast neighbourhood
+# (DDR4 blast is distance 1) so it is a genuine non-aggressor — no exposure ever
+# reaches the victim from it, whatever the profile.
+FAR_ROW_MARGIN = 64
 
 # Legacy budgets for the ``{"family": ...}`` shorthand (no acts budget so the
 # deterministic phase-4..9 fixtures, which hammer freely, stay unbounded).
@@ -53,6 +66,27 @@ class FamilyDef:
     disclosure: Disclosure
     target_kind: str  # "known" (fixed calibrated hcfirst) | "sampled" (graded)
     graded: bool = False  # difficulty band drives an acts budget
+    secret_mapping: bool = False  # per-episode secret address mapper (P24 discovery)
+
+
+@dataclass(frozen=True)
+class Candidate:
+    """One entry in a ``bounded_sweep`` candidate window (P23, Tier 2a).
+
+    ``offset`` is the linear byte distance from the victim's address (so the
+    handle registers at ``target_addr + offset``); ``role`` is the trusted ground
+    truth — used only server-side for calibration/tests, never disclosed. The
+    policy sees an opaque handle whose *position* in the candidate list carries no
+    role information (the list is shuffled per episode), so which handle is the
+    real aggressor is derivable only from the trusted final flip.
+    """
+
+    offset: int
+    role: str  # "aggressor" | "same_bank_far" | "different_bank"
+
+    @property
+    def is_aggressor(self) -> bool:
+        return self.role == "aggressor"
 
 
 _P = "physical"
@@ -86,6 +120,20 @@ FAMILIES: dict[str, FamilyDef] = {
     "unknown_adjacency": FamilyDef(
         "target_row_flip", Disclosure(_L, "candidate_set", "row_handle", "public_profile_id", "summarized_counts"),
         "known",
+    ),
+    "bounded_sweep": FamilyDef(
+        # Tier 2a (P23): an ``N``-handle candidate window at a controlled mix of
+        # same-bank/different-bank, adjacent/far offsets, only the two immediate
+        # same-bank neighbours of which are true aggressors. ``full_trace`` so the
+        # bank-conflict timing side channel (§0.2) actually reaches the policy;
+        # ``known`` target so a found aggressor flips reliably (the discovery
+        # difficulty is the candidate window, not a variable threshold).
+        # ``secret_mapping`` (P24): a per-episode secret row->bank mapper makes bank
+        # membership non-computable from the linear address, so the candidate
+        # window is built against the true mapping via the worker DECODE op and the
+        # success predicate reads the *decoded* victim key, not linear arithmetic.
+        "target_row_flip", Disclosure(_L, "candidate_set", "row_handle", "public_profile_id", "full_trace"),
+        "known", secret_mapping=True,
     ),
     "mitigation_aware": FamilyDef(
         "mitigation_aware", Disclosure(_P, "exact", "exact", "public_profile_id", "summarized_counts"), "known"
@@ -253,7 +301,21 @@ class TaskSpec:
             budgets = dict(LEGACY_BUDGETS)
         return budgets
 
-    def compile(self, seed: int, geometry: Geometry) -> "CompiledTask":
+    def compile(
+        self,
+        seed: int,
+        geometry: Geometry,
+        decode: "Callable[[int], dict[str, int]] | None" = None,
+    ) -> "CompiledTask":
+        """Compile the episode target + candidate window against the real geometry.
+
+        ``decode`` (the worker ``DECODE`` op, P24) is provided by the env for
+        discovery families running under a per-episode *secret* address mapper: the
+        candidate window is built against the true mapping, and the victim's decoded
+        ``(bankgroup, bank)`` is recorded so the success predicate reads the trusted
+        decoded key instead of assuming the public RoBaRaCoCh linear layout. For
+        RoBaRaCoCh families ``decode`` is ``None`` and the victim sits in bank 0.
+        """
         fam = FAMILIES[self.family]
         row_count = int(geometry.level_sizes.get("row", 1 << 16))
         row_bytes = geometry.row_stride
@@ -282,6 +344,19 @@ class TaskSpec:
 
         disturbance_family = self._resolve_disturbance_family(seed)
 
+        target_addr = target_row * row_bytes
+        target_bankgroup = 0
+        target_bank = 0
+        candidates: tuple[Candidate, ...] = ()
+        if decode is not None:
+            dv = decode(target_addr)
+            target_bankgroup = int(dv.get("bankgroup", 0))
+            target_bank = int(dv.get("bank", 0))
+            if self.family == "bounded_sweep":
+                candidates = self._build_candidates(
+                    seed, geometry, target_row, row_count, (target_bankgroup, target_bank), decode
+                )
+
         return CompiledTask(
             task_id=self.task_id,
             family=self.family,
@@ -297,12 +372,95 @@ class TaskSpec:
             target_bit=bit,
             target_value=int(value) & 0xFF,
             target_mask=int(mask) & 0xFF,
-            target_addr=target_row * row_bytes,
+            target_addr=target_addr,
+            target_bank=target_bank,
+            target_bankgroup=target_bankgroup,
             engine_known_row=engine_known_row,
             disturbance_family=disturbance_family,
             seed=seed,
             row_bytes=row_bytes,
+            candidates=candidates,
         )
+
+    def _build_candidates(
+        self,
+        seed: int,
+        geometry: Geometry,
+        target_row: int,
+        row_count: int,
+        victim_bank: tuple[int, int],
+        decode: "Callable[[int], dict[str, int]]",
+    ) -> tuple[Candidate, ...]:
+        """Build the ``bounded_sweep`` candidate window against the *secret* mapper (P24).
+
+        Bank membership under the per-episode secret mapper is not computable from
+        the linear address, so candidates are found by the worker ``DECODE`` op — no
+        mapper logic is duplicated in Python. The *raw* RoBaRaCoCh bit positions
+        (where the Bank/BankGroup/Row fields sit before the secret XOR) are public
+        geometry; enumerating the raw bank slots at a fixed row and decoding each
+        yields the full decoded-bank → linear-address map for that row (a bijection
+        over the bank space), from which the true same-bank neighbours (aggressors),
+        same-bank-far decoys, and different-bank decoys are selected against the
+        real mapping. The list is shuffled per episode so position leaks no role.
+        """
+        mapper = AddressMapper(geometry)  # public raw RoBaRaCoCh field positions
+        row_bytes = geometry.row_stride
+        target_addr = target_row * row_bytes
+        sh_bank = mapper.shifts["bank"]
+        bank_w = mapper.widths["bank"]
+        sh_bg = mapper.shifts.get("bankgroup", 0)
+        bg_w = mapper.widths.get("bankgroup", 0)
+        rng = self._rng(seed, "candidates")
+
+        def bank_map_at_row(r: int) -> dict[tuple[int, int], int]:
+            """Decoded (bankgroup, bank) -> a linear address at row ``r``, column 0."""
+            out: dict[tuple[int, int], int] = {}
+            for bg in range(1 << bg_w):
+                for bank in range(1 << bank_w):
+                    addr = r * row_bytes + (bg << sh_bg) + (bank << sh_bank)
+                    d = decode(addr)
+                    out[(int(d["bankgroup"]), int(d["bank"]))] = addr
+            return out
+
+        cands: list[Candidate] = []
+
+        # Two true aggressors: the victim's immediate physical neighbours — the
+        # linear addresses that *decode* to (victim bank, row ± 1) under the secret
+        # mapping (not victim ± row_bytes, which the row->bank XOR sends elsewhere).
+        for drow in (-1, 1):
+            addr = bank_map_at_row(target_row + drow)[victim_bank]
+            cands.append(Candidate(addr - target_addr, "aggressor"))
+
+        n_decoy = BAND_CANDIDATES[self.difficulty] - len(cands)
+        n_banks = (1 << bg_w) * (1 << bank_w)
+        n_diff = n_decoy // 2 if n_banks > 1 else 0
+        n_far = n_decoy - n_diff
+
+        # Same-bank, far-from-victim decoys: the victim's bank at a row well outside
+        # the blast neighbourhood, so no exposure reaches the victim.
+        far_pool = [r for r in range(row_count) if abs(r - target_row) > FAR_ROW_MARGIN]
+        for r in rng.sample(far_pool, min(n_far, len(far_pool))):
+            cands.append(Candidate(bank_map_at_row(r)[victim_bank] - target_addr, "same_bank_far"))
+
+        # Different-bank decoys: any decoded bank other than the victim's, spread
+        # over rows so decoys reusing a bank still yield distinct addresses.
+        made = 0
+        r = (target_row + FAR_ROW_MARGIN + 1) % row_count
+        while made < n_diff:
+            others = [(b, a) for b, a in bank_map_at_row(r).items() if b != victim_bank]
+            rng.shuffle(others)
+            for _bank, addr in others:
+                if made >= n_diff:
+                    break
+                cands.append(Candidate(addr - target_addr, "different_bank"))
+                made += 1
+            r = (r + FAR_ROW_MARGIN + 1) % row_count
+            if abs(r - target_row) <= FAR_ROW_MARGIN:
+                r = (r + FAR_ROW_MARGIN + 1) % row_count
+
+        # Shuffle so a candidate's list position never encodes its role.
+        rng.shuffle(cands)
+        return tuple(cands)
 
     def _resolve_disturbance_family(self, seed: int) -> str | None:
         if self.disturbance_family:
@@ -340,6 +498,14 @@ class CompiledTask:
     disturbance_family: str | None
     seed: int
     row_bytes: int
+    # Decoded victim (bankgroup, bank). 0/0 under the public RoBaRaCoCh mapper (the
+    # victim's linear address sits in bank 0); under a secret mapper (P24) these are
+    # the true decoded coordinates, so the fixed known threshold and the success
+    # predicate land on the real victim key rather than an assumed bank 0.
+    target_bank: int = 0
+    target_bankgroup: int = 0
+    # Tier 2a candidate window (P23); empty for every non-``bounded_sweep`` family.
+    candidates: tuple[Candidate, ...] = ()
 
     def disturbance_overrides(self) -> dict[str, Any]:
         """Engine constructor overrides implied by this compiled task."""
@@ -348,6 +514,11 @@ class CompiledTask:
             # The known target's first flipped bit is the (sampled or explicit)
             # target bit, so target-cell / pattern objectives land on it.
             overrides["known_first_bit"] = self.target_bit
+            # Pin the known threshold to the victim's *decoded* bank. Defaults to
+            # bank 0 (RoBaRaCoCh victim), so non-secret families are unchanged;
+            # under a secret mapper the victim's scrambled bank is used instead.
+            overrides["known_target_bank"] = self.target_bank
+            overrides["known_target_bankgroup"] = self.target_bankgroup
         if self.disturbance_family:
             overrides["family"] = self.disturbance_family
         return overrides
