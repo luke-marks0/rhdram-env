@@ -1,0 +1,313 @@
+#!/usr/bin/env python3
+"""TRL GRPO training against the RowHammer OpenEnv environment.
+
+A small (default 4B) instruction model is trained with Group Relative Policy
+Optimization (GRPO). Each dataset row is one *task instance* (a task config +
+seed); the environment discloses its objective/target at reset, which is baked
+into the prompt. For every prompt GRPO samples ``num_generations`` completions;
+each completion is parsed into a tool-call sequence and **replayed through the
+real OpenEnv server** (``rowhammer_env.llm.grpo_env``). Reward is the trusted,
+sparse episode reward — ``1.0`` only when the simulator + disturbance engine
+produce a real flip satisfying the objective, ``0.0`` otherwise. No mock reward,
+no reward from model-declared success (SPEC §2/§9).
+
+The reward-from-trusted-state rollout path is the same one the P19 gate
+verifies (``run_episode`` + the sparse trusted reward in ``RowHammerTaskEnv``).
+
+Usage
+-----
+    # 1) (optional) let the trainer launch its own server, or start one yourself:
+    #    python3 -m rowhammer_env.server.app
+    # 2) run training:
+    python3 -B scripts/train_grpo.py --config configs/training/grpo_qwen4b.yaml
+
+    # dry run: build the dataset + score the reference hammer, no model load:
+    python3 -B scripts/train_grpo.py --config configs/training/grpo_qwen4b.yaml --dry-run
+
+Requires the training extras (``requirements-train.txt``) and the P17 HTTP
+runtime (``requirements.txt``), plus a built Phase-2 worker (``build/phase2``).
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import dataclasses
+import json
+import pathlib
+import sys
+
+import yaml
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from rowhammer_env.llm.grpo_env import (  # noqa: E402
+    RolloutItem,
+    build_messages,
+    completion_text,
+    disclose_metadata,
+    evaluate_rewards,
+    hint_actions,
+    launch_server,
+    parse_actions,
+)
+
+
+# --------------------------------------------------------------------------- #
+# Config
+# --------------------------------------------------------------------------- #
+def load_config(path: pathlib.Path) -> dict:
+    cfg = yaml.safe_load(path.read_text())
+    if not isinstance(cfg, dict):
+        raise SystemExit(f"config {path} must be a mapping")
+    return cfg
+
+
+def resolve_task(entry: dict) -> tuple[dict | None, str]:
+    """Resolve a task-list entry into a (task_config, label) pair.
+
+    An entry is either ``{config: path/to.yaml}`` (a full SPEC §10 task config)
+    or ``{family: <name>}`` (the shorthand the env also accepts).
+    """
+    if "config" in entry:
+        task_path = (ROOT / entry["config"]).resolve()
+        task = yaml.safe_load(task_path.read_text())
+        if not isinstance(task, dict):
+            raise SystemExit(f"task config {task_path} must be a mapping")
+        return task, str(task.get("id") or task.get("family") or task_path.stem)
+    if "family" in entry:
+        return {"family": str(entry["family"])}, str(entry["family"])
+    raise SystemExit(f"task entry needs 'config' or 'family': {entry}")
+
+
+# --------------------------------------------------------------------------- #
+# Dataset: one row per (task, seed). Prompts baked from the disclosed reset obs.
+# --------------------------------------------------------------------------- #
+async def _build_rows(base_url: str, task_entries: list[dict], seeds: list[int]) -> list[dict]:
+    rows: list[dict] = []
+    for entry in task_entries:
+        task, label = resolve_task(entry)
+        for seed in seeds:
+            metadata = await disclose_metadata(base_url, seed, task)
+            rows.append(
+                {
+                    "messages": build_messages(metadata),
+                    "seed": int(seed),
+                    "task_json": json.dumps(task) if task is not None else "",
+                    "task_id": str(metadata.get("task_id") or label),
+                    "family": str(metadata.get("task_family") or label),
+                }
+            )
+    return rows
+
+
+def build_rows(base_url: str, task_entries: list[dict], seeds: list[int]) -> list[dict]:
+    return asyncio.run(_build_rows(base_url, task_entries, seeds))
+
+
+def render_prompts(rows: list[dict], tokenizer, enable_thinking: bool) -> None:
+    """Bake each row's chat messages into a text ``prompt`` for GRPO.
+
+    ``enable_thinking`` is passed straight to the chat template. For Qwen3 this
+    toggles the ``<think>`` reasoning block; other templates ignore the kwarg.
+    Pre-rendering (rather than a conversational dataset) gives version-independent
+    control of the thinking toggle across TRL releases.
+    """
+    for row in rows:
+        messages = row.pop("messages")
+        try:
+            row["prompt"] = tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=enable_thinking,
+            )
+        except TypeError:
+            # Template doesn't accept enable_thinking; render without it.
+            row["prompt"] = tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+
+
+# --------------------------------------------------------------------------- #
+# Reward functions (trusted, sparse) + optional format shaping
+# --------------------------------------------------------------------------- #
+def make_reward_functions(base_url: str, *, concurrency: int, max_steps: int):
+    def reward_env_success(completions, seed=None, task_json=None, **_):
+        texts = [completion_text(c) for c in completions]
+        items: list[RolloutItem] = []
+        for i, text in enumerate(texts):
+            actions = parse_actions(text)
+            task = json.loads(task_json[i]) if task_json and task_json[i] else None
+            items.append(
+                RolloutItem(
+                    seed=int(seed[i]) if seed else 0,
+                    task=task,
+                    actions=actions,
+                    episode_id=f"grpo_reward_{i}_{int(seed[i]) if seed else 0}",
+                )
+            )
+        return evaluate_rewards(base_url, items, concurrency=concurrency, max_steps=max_steps)
+
+    def reward_format(completions, **_):
+        # Small dense shaping: reward a well-formed, parseable tool-call response.
+        out = []
+        for c in completions:
+            actions = parse_actions(completion_text(c))
+            out.append(1.0 if actions else 0.0)
+        return out
+
+    reward_env_success.__name__ = "env_success"
+    reward_format.__name__ = "format_ok"
+    return reward_env_success, reward_format
+
+
+# --------------------------------------------------------------------------- #
+# Dry run: no model, just prove the data + reward pipeline end-to-end.
+# --------------------------------------------------------------------------- #
+def dry_run(base_url: str, task_entries: list[dict], seeds: list[int], concurrency: int, max_steps: int) -> int:
+    rows = build_rows(base_url, task_entries, seeds)
+    print(f"built {len(rows)} task-instance rows")
+    print("--- sample prompt (messages) ---")
+    print(json.dumps(rows[0]["messages"], indent=2)[:2000])
+
+    # Score the reference double-sided hammer (should earn 1.0 on known targets).
+    items: list[RolloutItem] = []
+    for i, row in enumerate(rows):
+        task = json.loads(row["task_json"]) if row["task_json"] else None
+        meta = asyncio.run(disclose_metadata(base_url, row["seed"], task))
+        items.append(
+            RolloutItem(seed=row["seed"], task=task, actions=hint_actions(meta), episode_id=f"grpo_dry_{i}")
+        )
+    rewards = evaluate_rewards(base_url, items, concurrency=concurrency, max_steps=max_steps)
+    for row, r in zip(rows, rewards):
+        print(f"  {row['family']:<28} seed={row['seed']:<3} reference-hammer reward={r}")
+    print(f"reference-hammer mean reward = {sum(rewards) / len(rewards):.3f}")
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+# Main
+# --------------------------------------------------------------------------- #
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--config", required=True, type=pathlib.Path)
+    parser.add_argument("--base-url", default=None, help="override env.base_url (skip launching a server)")
+    parser.add_argument("--dry-run", action="store_true", help="build data + score the reference hammer, no training")
+    args = parser.parse_args()
+
+    cfg = load_config(args.config)
+    env_cfg = cfg.get("env", {})
+    task_entries = cfg.get("tasks") or [{"family": "known_target_anybit"}]
+    seeds = [int(s) for s in cfg.get("seeds", list(range(1, 9)))]
+    concurrency = int(env_cfg.get("concurrency", env_cfg.get("max_concurrent_envs", 8)))
+    max_steps = int(env_cfg.get("max_steps", 4))
+
+    # ---- server: connect to an existing one or launch our own ---------------
+    server = None
+    base_url = args.base_url or env_cfg.get("base_url")
+    if base_url is None:
+        if not env_cfg.get("launch_server", True):
+            raise SystemExit("no env.base_url set and env.launch_server is false")
+        server = launch_server(
+            root=str(ROOT),
+            host=str(env_cfg.get("server_host", "127.0.0.1")),
+            port=env_cfg.get("server_port"),
+            max_concurrent_envs=int(env_cfg.get("max_concurrent_envs", 8)),
+            mode=str(env_cfg.get("server_mode", "production")),
+        )
+        base_url = server.base_url
+        print(f"launched OpenEnv server at {base_url}")
+
+    try:
+        if args.dry_run:
+            return dry_run(base_url, task_entries, seeds, concurrency, max_steps)
+
+        # Heavy training imports live here so --dry-run needs no torch/trl.
+        from datasets import Dataset
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        from trl import GRPOConfig, GRPOTrainer
+
+        model_cfg = cfg.get("model", {})
+        model_name = str(model_cfg.get("name", "Qwen/Qwen3-4B"))
+        enable_thinking = bool(model_cfg.get("enable_thinking", False))
+        print(f"model={model_name} enable_thinking={enable_thinking}")
+
+        tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+
+        rows = build_rows(base_url, task_entries, seeds)
+        render_prompts(rows, tokenizer, enable_thinking)
+        dataset = Dataset.from_list([{k: r[k] for k in ("prompt", "seed", "task_json", "task_id", "family")} for r in rows])
+        print(f"dataset: {len(dataset)} task-instance prompts")
+
+        import torch
+
+        dtype_name = str(model_cfg.get("torch_dtype", "bfloat16"))
+        torch_dtype = getattr(torch, dtype_name, torch.bfloat16)
+        model_kwargs = {"torch_dtype": torch_dtype, "trust_remote_code": True}
+        if model_cfg.get("attn_implementation"):
+            model_kwargs["attn_implementation"] = str(model_cfg["attn_implementation"])
+        model = AutoModelForCausalLM.from_pretrained(model_name, **model_kwargs)
+
+        # Optional LoRA (the practical default for a 4B model on one GPU).
+        peft_config = None
+        peft_cfg = cfg.get("peft", {})
+        if peft_cfg.get("enabled", True):
+            from peft import LoraConfig
+
+            peft_config = LoraConfig(
+                r=int(peft_cfg.get("r", 16)),
+                lora_alpha=int(peft_cfg.get("lora_alpha", 32)),
+                lora_dropout=float(peft_cfg.get("lora_dropout", 0.05)),
+                bias="none",
+                task_type="CAUSAL_LM",
+                target_modules=peft_cfg.get(
+                    "target_modules",
+                    ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+                ),
+            )
+
+        reward_env, reward_format = make_reward_functions(base_url, concurrency=concurrency, max_steps=max_steps)
+        reward_cfg = cfg.get("reward", {})
+        reward_weights = [float(reward_cfg.get("success_weight", 1.0)), float(reward_cfg.get("format_weight", 0.1))]
+
+        grpo_cfg = dict(cfg.get("grpo", {}))
+        grpo_cfg.setdefault("output_dir", "runs/grpo_rowhammer")
+        # Only forward keys GRPOConfig actually defines, so a newer/older TRL
+        # doesn't reject the file (fail loud on genuinely unknown keys instead).
+        valid = {f.name for f in dataclasses.fields(GRPOConfig)}
+        # reward_weights is derived from the reward: section, not the grpo: section.
+        grpo_cfg.pop("reward_weights", None)
+        unknown = set(grpo_cfg) - valid
+        if unknown:
+            print(f"warning: dropping GRPO keys unsupported by installed TRL: {sorted(unknown)}")
+        training_args = GRPOConfig(
+            reward_weights=reward_weights,
+            **{k: v for k, v in grpo_cfg.items() if k in valid},
+        )
+
+        trainer = GRPOTrainer(
+            model=model,
+            reward_funcs=[reward_env, reward_format],
+            args=training_args,
+            train_dataset=dataset,
+            processing_class=tokenizer,
+            peft_config=peft_config,
+        )
+        trainer.train()
+        trainer.save_model(training_args.output_dir)
+        tokenizer.save_pretrained(training_args.output_dir)
+        print(f"saved policy to {training_args.output_dir}")
+        return 0
+    finally:
+        if server is not None:
+            server.stop()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

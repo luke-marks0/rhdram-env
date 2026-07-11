@@ -1,0 +1,12 @@
+# GRPO training extras for scripts/train_grpo.py.
+# Install on top of the core env deps:  python3 -m pip install -r requirements.txt -r requirements-train.txt
+# (These are intentionally NOT in requirements.txt so the server/CI stay light.)
+trl>=0.14
+transformers>=4.51        # Qwen3 chat template + enable_thinking support
+datasets>=2.19
+peft>=0.11
+accelerate>=0.30
+torch>=2.3
+# Optional but strongly recommended for fast 4B rollouts:
+# vllm>=0.6
+# flash-attn>=2.5

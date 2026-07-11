@@ -1,0 +1,90 @@
+# TRL GRPO training config for the RowHammer OpenEnv environment.
+#
+# Trains a small (4B) instruction model with Group Relative Policy Optimization.
+# Reward is the trusted, sparse episode reward from the real simulator (1.0 iff a
+# real bit flip satisfies the objective within budget); a format bonus gently
+# rewards well-formed tool-call output. Run with:
+#
+#   python3 -B scripts/train_grpo.py --config configs/training/grpo_qwen4b.yaml
+#
+# Sanity-check the data + reward pipeline first (no GPU/model load needed):
+#
+#   python3 -B scripts/train_grpo.py --config configs/training/grpo_qwen4b.yaml --dry-run
+
+model:
+  name: Qwen/Qwen3-4B          # any HF causal-LM; Qwen3-4B supports the thinking toggle
+  enable_thinking: false       # <- disable the model's <think> reasoning block (Qwen3).
+                               #    Set true to train with chain-of-thought enabled.
+  torch_dtype: bfloat16
+  # attn_implementation: flash_attention_2   # uncomment if flash-attn is installed
+
+# LoRA is the practical default for a 4B model on a single GPU. Set enabled:false
+# for a full fine-tune (needs far more memory).
+peft:
+  enabled: true
+  r: 16
+  lora_alpha: 32
+  lora_dropout: 0.05
+  target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+
+# Environment / OpenEnv server. If base_url is unset and launch_server is true,
+# the trainer starts its own server subprocess and tears it down at the end.
+env:
+  # base_url: http://127.0.0.1:8000   # set to attach to an already-running server
+  launch_server: true
+  server_host: 127.0.0.1
+  # server_port: 8000                 # omit to pick a free port
+  server_mode: production             # production => only the stateful /ws transport
+  max_concurrent_envs: 8              # server-side session cap
+  concurrency: 8                      # client-side parallel reward rollouts
+  max_steps: 4                        # max env steps replayed per completion
+
+# The training curriculum: one dataset row per (task, seed). Each entry is either
+# a full SPEC §10 task config (config:) or the {family:} shorthand.
+#
+# These three families disclose an EXACT physical victim, so the target's
+# vulnerable neighbourhood (and, for known-target, the threshold) is derivable
+# from disclosed fields alone — the reference double-sided hammer earns 1.0 on
+# them, so a policy that learns to emit a valid, sufficiently-large dram.issue
+# gets real positive reward. Verified with `--dry-run`.
+tasks:
+  - config: configs/tasks/known_target_anybit.yaml
+  - config: configs/tasks/target_cell.yaml
+  - config: configs/tasks/pattern_target.yaml
+seeds: [1, 2, 3, 4, 5, 6, 7, 8]
+# NOTE: families that hide the victim/threshold (any_flip, target_row with a
+# sampled row, hidden_target, unknown_adjacency) are NOT reliably solvable by a
+# single disclosed-hint action — they need multi-step probing/inference, which is
+# beyond this single-shot GRPO setup. Adding them yields all-zero reward (no GRPO
+# advantage signal). Run `--dry-run` after any curriculum change to confirm the
+# reference hammer still reaches reward on every task you include.
+
+reward:
+  success_weight: 1.0    # trusted sparse episode reward (real flip => 1.0)
+  format_weight: 0.1     # small shaping for parseable tool-call output
+
+# GRPOConfig hyperparameters (TRL). Unknown keys for your installed TRL version
+# are dropped with a warning, so this file stays portable across releases.
+grpo:
+  output_dir: runs/grpo_qwen4b
+  learning_rate: 1.0e-6
+  beta: 0.0                       # KL-to-reference coefficient (0 = no KL penalty)
+  num_generations: 8              # completions per prompt (the GRPO "group")
+  per_device_train_batch_size: 8  # must be divisible by num_generations
+  gradient_accumulation_steps: 4
+  num_train_epochs: 1
+  max_steps: 200
+  max_prompt_length: 1024
+  max_completion_length: 512
+  temperature: 1.0
+  top_p: 1.0
+  bf16: true
+  gradient_checkpointing: true
+  logging_steps: 1
+  save_steps: 50
+  report_to: none
+  seed: 42
+  # --- vLLM generation (strongly recommended for a 4B policy) ---------------
+  # use_vllm: true
+  # vllm_mode: colocate
+  # vllm_gpu_memory_utilization: 0.3

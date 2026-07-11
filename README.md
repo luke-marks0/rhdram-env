@@ -139,3 +139,25 @@ Phase 20 runs the release re-qualification gate:
 python3 -B scripts/verify_release.py
 python3 -B scripts/verify_phase20.py
 ```
+
+## GRPO training (TRL)
+
+`scripts/train_grpo.py` trains a small (default `Qwen/Qwen3-4B`) model against the
+served environment with TRL's `GRPOTrainer`. Each dataset row is one task instance
+(task config + seed); the environment discloses its objective/target at reset,
+which is baked into the prompt. GRPO samples several completions per prompt, each
+is parsed into a tool-call sequence and **replayed through the real OpenEnv
+server**, and the reward is the trusted sparse episode reward (`1.0` only on a real
+flip). Hyperparameters — including the `enable_thinking` toggle that disables the
+Qwen3 `<think>` block — live in `configs/training/grpo_qwen4b.yaml`.
+
+```sh
+python3 -m pip install -r requirements.txt -r requirements-train.txt
+
+# Validate the data + reward pipeline first (no GPU/model load; needs a built
+# Phase-2 worker and the P17 HTTP deps):
+python3 -B scripts/train_grpo.py --config configs/training/grpo_qwen4b.yaml --dry-run
+
+# Train (launches its own server unless env.base_url is set):
+python3 -B scripts/train_grpo.py --config configs/training/grpo_qwen4b.yaml
+```
