@@ -342,6 +342,9 @@ class SandboxLimits:
     stdout_bytes: int = 64 * 1024
     stdout_tail_bytes: int = 4096
     protocol_bytes: int = 2 * 1024 * 1024
+    # Additional tasks the sandboxed script may spawn, as headroom over the host's
+    # current per-UID task count (see _nproc_headroom_limit): RLIMIT_NPROC is a
+    # system-wide per-UID counter, so this cannot be a small absolute value.
     processes: int = 4096
     open_files: int = 64
 
@@ -463,14 +466,64 @@ def _runtime() -> SandboxRuntime:
     return _RUNTIME
 
 
+def _uid_task_count() -> int:
+    """Threads (tasks) currently charged to the real UID, system-wide.
+
+    ``RLIMIT_NPROC`` is enforced per real UID across the *whole system* and counts
+    threads, not processes. On a busy interactive host the user's own session
+    (desktop, browser, IDE) already runs thousands of threads, so the sandbox's
+    process cap has to sit *above* that live baseline — otherwise lowering
+    ``RLIMIT_NPROC`` below it makes the sandbox child's very first ``clone()`` (the
+    namespace setup) fail ``EAGAIN`` before it can start. This counts the baseline
+    so the cap can be expressed as headroom on top of it.
+    """
+    uid = os.getuid()
+    total = 0
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return 0
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        try:
+            if os.stat("/proc/" + entry).st_uid != uid:
+                continue
+            total += len(os.listdir("/proc/" + entry + "/task"))
+        except OSError:
+            # The process exited between listing and stat — skip it.
+            continue
+    return total
+
+
+def _nproc_headroom_limit(headroom: int) -> int | None:
+    """The ``RLIMIT_NPROC`` soft cap: current UID task count + ``headroom``.
+
+    Bounds how many *additional* tasks the sandboxed script may spawn (the real
+    anti-fork-bomb guard) without being defeated by, or breaking on, the host's
+    existing per-UID usage. Capped at the inherited hard limit. Returns ``None``
+    when the platform has no ``RLIMIT_NPROC`` (nothing to set)."""
+    if not hasattr(resource, "RLIMIT_NPROC"):
+        return None
+    _soft, hard = resource.getrlimit(resource.RLIMIT_NPROC)
+    target = _uid_task_count() + max(0, headroom)
+    if hard != resource.RLIM_INFINITY:
+        target = min(target, hard)
+    return target
+
+
 def _limit_process(limits: SandboxLimits):
+    # Computed in the parent (before fork): scanning /proc inside the fragile
+    # post-fork preexec context is best avoided, and the baseline is the parent's.
+    nproc = _nproc_headroom_limit(limits.processes)
+
     def apply() -> None:
         resource.setrlimit(resource.RLIMIT_CPU, (limits.cpu_seconds, limits.cpu_seconds + 1))
         resource.setrlimit(resource.RLIMIT_AS, (limits.memory_bytes, limits.memory_bytes))
         resource.setrlimit(resource.RLIMIT_FSIZE, (limits.stdout_bytes, limits.stdout_bytes))
         resource.setrlimit(resource.RLIMIT_NOFILE, (limits.open_files, limits.open_files))
-        if hasattr(resource, "RLIMIT_NPROC"):
-            resource.setrlimit(resource.RLIMIT_NPROC, (limits.processes, limits.processes))
+        if nproc is not None:
+            resource.setrlimit(resource.RLIMIT_NPROC, (nproc, nproc))
         os.setsid()
 
     return apply
