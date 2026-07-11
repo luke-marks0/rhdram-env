@@ -8,6 +8,6 @@ peft>=0.11
 accelerate>=0.30
 torch>=2.3
 wandb>=0.17           # rollout + training-metric monitoring (configs/training/*.yaml wandb:)
-# Optional but strongly recommended for fast 4B rollouts:
-# vllm>=0.6
-# flash-attn>=2.5
+vllm>=0.6             # fast 8B generation; config defaults to use_vllm: true (vllm_mode: colocate)
+# Optional, further speeds attention if your GPU/toolchain supports it:
+# flash-attn>=2.5      # enables model.attn_implementation: flash_attention_2

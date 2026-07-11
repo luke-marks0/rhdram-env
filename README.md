@@ -170,17 +170,17 @@ which is baked into the prompt. GRPO samples several completions per prompt, eac
 is parsed into a tool-call sequence and **replayed through the real OpenEnv
 server**, and the reward is the trusted sparse episode reward (`1.0` only on a real
 flip). Hyperparameters — including the `enable_thinking` toggle that disables the
-Qwen3 `<think>` block — live in `configs/training/grpo_qwen4b.yaml`.
+Qwen3 `<think>` block — live in `configs/training/grpo_qwen8b.yaml`.
 
 ```sh
 python3 -m pip install -r requirements.txt -r requirements-train.txt
 
 # Validate the data + reward pipeline first (no GPU/model load; needs a built
 # Phase-2 worker and the P17 HTTP deps):
-python3 -B scripts/train_grpo.py --config configs/training/grpo_qwen4b.yaml --dry-run
+python3 -B scripts/train_grpo.py --config configs/training/grpo_qwen8b.yaml --dry-run
 
 # Train (launches its own server unless env.base_url is set):
-python3 -B scripts/train_grpo.py --config configs/training/grpo_qwen4b.yaml
+python3 -B scripts/train_grpo.py --config configs/training/grpo_qwen8b.yaml
 ```
 
 ### Monitoring (Weights & Biases)
