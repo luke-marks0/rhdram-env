@@ -131,6 +131,31 @@ def _coerce_action(item: Any) -> ToolCall | None:
     return ToolCall(name, args)
 
 
+def summarize_actions(actions: list[ToolCall]) -> dict[str, Any]:
+    """Compact, log-friendly summary of a parsed tool-call list.
+
+    ``n_commands`` / ``n_pairs`` expose the *size* of the emitted hammer, which is
+    the key diagnostic for this env: a valid flip needs on the order of the
+    disclosed ``known_threshold`` activations, so completions whose command list is
+    orders of magnitude smaller (or truncated at ``max_completion_length``) can
+    never earn the trusted reward.
+    """
+    n_commands = 0
+    n_rd = 0
+    for a in actions:
+        if a.name == "dram.issue":
+            cmds = a.args.get("commands")
+            if isinstance(cmds, list):
+                n_commands += len(cmds)
+                n_rd += sum(1 for c in cmds if isinstance(c, dict) and c.get("op") == "RD")
+    return {
+        "n_actions": len(actions),
+        "first_tool": actions[0].name if actions else "",
+        "n_commands": n_commands,
+        "n_pairs": n_rd // 2,
+    }
+
+
 def parse_actions(text: str) -> list[ToolCall]:
     """Best-effort parse of a completion into an ordered tool-call list.
 
@@ -435,4 +460,5 @@ __all__ = [
     "observation_metadata",
     "parse_actions",
     "public_hints",
+    "summarize_actions",
 ]

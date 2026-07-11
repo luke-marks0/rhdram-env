@@ -34,6 +34,7 @@ import argparse
 import asyncio
 import dataclasses
 import json
+import os
 import pathlib
 import sys
 
@@ -51,6 +52,7 @@ from rowhammer_env.llm.grpo_env import (  # noqa: E402
     hint_actions,
     launch_server,
     parse_actions,
+    summarize_actions,
 )
 
 
@@ -135,12 +137,14 @@ def render_prompts(rows: list[dict], tokenizer, enable_thinking: bool) -> None:
 # --------------------------------------------------------------------------- #
 # Reward functions (trusted, sparse) + optional format shaping
 # --------------------------------------------------------------------------- #
-def make_reward_functions(base_url: str, *, concurrency: int, max_steps: int):
-    def reward_env_success(completions, seed=None, task_json=None, **_):
+def make_reward_functions(base_url: str, *, concurrency: int, max_steps: int, record: bool = False):
+    def reward_env_success(completions, seed=None, task_json=None, family=None, task_id=None, **_):
         texts = [completion_text(c) for c in completions]
         items: list[RolloutItem] = []
+        parsed: list[list] = []
         for i, text in enumerate(texts):
             actions = parse_actions(text)
+            parsed.append(actions)
             task = json.loads(task_json[i]) if task_json and task_json[i] else None
             items.append(
                 RolloutItem(
@@ -150,7 +154,25 @@ def make_reward_functions(base_url: str, *, concurrency: int, max_steps: int):
                     episode_id=f"grpo_reward_{i}_{int(seed[i]) if seed else 0}",
                 )
             )
-        return evaluate_rewards(base_url, items, concurrency=concurrency, max_steps=max_steps)
+        rewards = evaluate_rewards(base_url, items, concurrency=concurrency, max_steps=max_steps)
+        if record:
+            # Stash each scored rollout for the wandb callback to flush on_log.
+            from rowhammer_env.llm.wandb_logging import record_rollout
+
+            for i, (text, actions, r) in enumerate(zip(texts, parsed, rewards)):
+                summary = summarize_actions(actions)
+                record_rollout(
+                    {
+                        "family": family[i] if family else "",
+                        "seed": int(seed[i]) if seed else 0,
+                        "task_id": task_id[i] if task_id else "",
+                        "reward_env": float(r),
+                        "reward_format": 1.0 if actions else 0.0,
+                        "completion": text,
+                        **summary,
+                    }
+                )
+        return rewards
 
     def reward_format(completions, **_):
         # Small dense shaping: reward a well-formed, parseable tool-call response.
@@ -163,6 +185,51 @@ def make_reward_functions(base_url: str, *, concurrency: int, max_steps: int):
     reward_env_success.__name__ = "env_success"
     reward_format.__name__ = "format_ok"
     return reward_env_success, reward_format
+
+
+# --------------------------------------------------------------------------- #
+# Weights & Biases: autorun rollout + metric monitoring when wandb.enabled.
+# --------------------------------------------------------------------------- #
+def setup_wandb(cfg: dict, grpo_cfg: dict) -> tuple[list, bool]:
+    """Configure wandb logging from the ``wandb:`` config section.
+
+    Returns ``(callbacks, enabled)``. When enabled, this:
+      * points the run at the configured project/entity/run name/mode,
+      * flips on TRL's own prompt/completion table (``log_completions``), and
+      * returns a callback that logs the per-rollout table + custom metrics.
+
+    It mutates ``grpo_cfg`` in place (``report_to`` + completion-logging keys);
+    unknown keys are dropped later by the GRPOConfig filter, so this stays
+    portable across TRL versions. Fails soft: a missing wandb install just
+    disables logging with a warning instead of aborting the run.
+    """
+    wandb_cfg = cfg.get("wandb", {})
+    if not wandb_cfg.get("enabled", False):
+        return [], False
+    try:
+        import wandb  # noqa: F401
+
+        from rowhammer_env.llm.wandb_logging import make_rollout_logger_callback
+    except ImportError:
+        print("warning: wandb not installed (pip install wandb); disabling wandb logging")
+        return [], False
+
+    os.environ.setdefault("WANDB_PROJECT", str(wandb_cfg.get("project", "rowhammer-grpo")))
+    if wandb_cfg.get("entity"):
+        os.environ.setdefault("WANDB_ENTITY", str(wandb_cfg["entity"]))
+    if wandb_cfg.get("run_name"):
+        os.environ.setdefault("WANDB_NAME", str(wandb_cfg["run_name"]))
+    if wandb_cfg.get("mode"):  # "online" | "offline" | "disabled"
+        os.environ.setdefault("WANDB_MODE", str(wandb_cfg["mode"]))
+
+    grpo_cfg["report_to"] = "wandb"
+    grpo_cfg.setdefault("log_completions", True)
+    grpo_cfg.setdefault("num_completions_to_print", int(wandb_cfg.get("num_completions_to_print", 8)))
+    grpo_cfg.setdefault("wandb_log_unique_prompts", True)
+
+    callback = make_rollout_logger_callback(max_table_rows=int(wandb_cfg.get("max_table_rows", 32)))
+    print(f"wandb logging enabled (project={os.environ['WANDB_PROJECT']})")
+    return [callback], True
 
 
 # --------------------------------------------------------------------------- #
@@ -272,12 +339,19 @@ def main() -> int:
                 ),
             )
 
-        reward_env, reward_format = make_reward_functions(base_url, concurrency=concurrency, max_steps=max_steps)
+        grpo_cfg = dict(cfg.get("grpo", {}))
+        grpo_cfg.setdefault("output_dir", "runs/grpo_rowhammer")
+
+        # Monitoring: autorun wandb rollout/metric logging when wandb.enabled.
+        # Must run before make_reward_functions so the reward fn records rollouts.
+        wandb_callbacks, wandb_enabled = setup_wandb(cfg, grpo_cfg)
+
+        reward_env, reward_format = make_reward_functions(
+            base_url, concurrency=concurrency, max_steps=max_steps, record=wandb_enabled
+        )
         reward_cfg = cfg.get("reward", {})
         reward_weights = [float(reward_cfg.get("success_weight", 1.0)), float(reward_cfg.get("format_weight", 0.1))]
 
-        grpo_cfg = dict(cfg.get("grpo", {}))
-        grpo_cfg.setdefault("output_dir", "runs/grpo_rowhammer")
         # Only forward keys GRPOConfig actually defines, so a newer/older TRL
         # doesn't reject the file (fail loud on genuinely unknown keys instead).
         valid = {f.name for f in dataclasses.fields(GRPOConfig)}
@@ -298,6 +372,7 @@ def main() -> int:
             train_dataset=dataset,
             processing_class=tokenizer,
             peft_config=peft_config,
+            callbacks=wandb_callbacks or None,
         )
         trainer.train()
         trainer.save_model(training_args.output_dir)
