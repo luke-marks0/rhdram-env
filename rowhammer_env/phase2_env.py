@@ -17,6 +17,86 @@ from .worker_protocol import WorkerClient, WorkerRequest
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 Environment, Action, Observation, State = load_openenv_server_types()
 
+# Upper bound on how many primitive activations a single ``dram.issue`` may expand
+# to. A real RowHammer flip needs O(10^4-10^5) activations (the DDR4 double-sided
+# hcfirst), so compact commands must be able to request tens of thousands; this
+# cap only guards the worker against a pathological/runaway compact command (the
+# per-episode ``acts`` budget is the real limiter and is charged from the worker's
+# true activation counter afterwards).
+MAX_ISSUE_ACTIVATIONS = 2_000_000
+
+
+class IssueExpansionError(Exception):
+    """Raised when a ``dram.issue`` command list cannot be expanded."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+def _repeat_count(command: dict[str, Any], *, keys: tuple[str, ...], default: int) -> int:
+    for key in keys:
+        if key in command:
+            value = command[key]
+            try:
+                n = int(value)
+            except (TypeError, ValueError):
+                raise IssueExpansionError("BAD_SCHEMA", f"'{key}' must be an integer, got {value!r}")
+            if n < 0:
+                raise IssueExpansionError("BAD_SCHEMA", f"'{key}' must be non-negative, got {n}")
+            return n
+    return default
+
+
+def expand_commands(commands: list[Any]) -> list[dict[str, Any]]:
+    """Expand a ``dram.issue`` command list into primitive RD/WR/WAIT commands.
+
+    Compact forms let a policy express a real hammer in a handful of tokens
+    instead of tens of thousands of literal command objects:
+
+    * ``{"op": "RD"|"WR"|"WAIT", ..., "repeat": N}`` (alias ``count``) issues that
+      primitive ``N`` times.
+    * ``{"op": "HAMMER", "rows": [addrA, addrB, ...], "pairs": N}`` (aliases
+      ``addrs`` for rows, ``count`` for pairs) issues ``N`` alternating sweeps of a
+      single RD to each listed row — the canonical double-sided hammer when two
+      rows are given. This expands to *exactly* the explicit alternating RD
+      sequence, so it is bit-for-bit equivalent at the worker (and thus in the
+      disturbance model and reward) to writing every RD out by hand.
+
+    Plain primitives without a repeat/expansion field pass through unchanged, so
+    existing explicit command lists behave identically. Raises
+    :class:`IssueExpansionError` on a malformed or oversized expansion.
+    """
+    out: list[dict[str, Any]] = []
+
+    def _emit(primitive: dict[str, Any], times: int) -> None:
+        if len(out) + times > MAX_ISSUE_ACTIVATIONS:
+            raise IssueExpansionError(
+                "ILLEGAL_COMMAND",
+                f"dram.issue expands beyond {MAX_ISSUE_ACTIVATIONS} activations",
+            )
+        out.extend(primitive for _ in range(times))
+
+    for command in commands:
+        if not isinstance(command, dict):
+            raise IssueExpansionError("BAD_SCHEMA", "each command must be an object")
+        op = command.get("op")
+        if op == "HAMMER":
+            rows = command.get("rows", command.get("addrs"))
+            if not isinstance(rows, list) or not rows:
+                raise IssueExpansionError("BAD_SCHEMA", "HAMMER requires a non-empty 'rows' list")
+            pairs = _repeat_count(command, keys=("pairs", "count", "repeat"), default=0)
+            for _ in range(pairs):
+                for addr in rows:
+                    _emit({"op": "RD", "addr": addr}, 1)
+        elif op in ("RD", "WR", "WAIT"):
+            times = _repeat_count(command, keys=("repeat", "count"), default=1)
+            _emit(command, times)
+        else:
+            raise IssueExpansionError("ILLEGAL_COMMAND", str(op))
+    return out
+
 
 class Phase2Action(Action):
     # ``tool`` defaults to empty so a malformed action (missing tool) parses at the
@@ -153,18 +233,24 @@ class RowHammerEnv(Environment[Phase2Action, Phase2Observation, Phase2State]):
         commands = args.get("commands")
         if not isinstance(commands, list) or not commands:
             return self._error("BAD_SCHEMA", "dram.issue requires commands")
+        try:
+            # Expand compact forms (repeat/HAMMER) into primitive RD/WR/WAIT
+            # commands. Each primitive still runs through the real worker below, so
+            # the activation count charged against the budget and seen by the
+            # disturbance model is the true expanded count — nothing is fabricated.
+            primitives = expand_commands(commands)
+        except IssueExpansionError as exc:
+            return self._error(exc.code, exc.message)
         last = Phase2Observation(reward=0.0, done=False, cycle=self._state.cycle)
-        for command in commands:
-            op = command.get("op")
+        for command in primitives:
+            op = command["op"]
             if op == "WAIT":
                 req = WorkerRequest("ISSUE", self._next_id(), ("WAIT", str(command.get("cycles", 0))))
             elif op == "RD":
                 req = WorkerRequest("ISSUE", self._next_id(), ("RD", str(self._addr_value(command))))
-            elif op == "WR":
+            else:  # WR (expand_commands only yields RD/WR/WAIT)
                 raw = base64.b64decode(str(command.get("data_b64", "")), validate=True)
                 req = WorkerRequest("ISSUE", self._next_id(), ("WR", str(self._addr_value(command)), raw.hex()))
-            else:
-                return self._error("ILLEGAL_COMMAND", str(op))
             last = self._from_worker(self._worker.call(req))  # type: ignore[union-attr]
             if last.error:
                 return last

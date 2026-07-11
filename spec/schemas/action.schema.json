@@ -82,6 +82,7 @@
         "op"
       ],
       "additionalProperties": false,
+      "description": "A primitive DRAM command, or a compact form the environment expands server-side into primitives before execution. `repeat`/`count` repeat a primitive; `HAMMER` expands to `pairs` alternating-read sweeps over `rows` (the canonical double-sided hammer). Expansion produces real issued events, so budget/disturbance accounting is on the expanded count.",
       "properties": {
         "op": {
           "enum": [
@@ -91,7 +92,8 @@
             "WR",
             "REF",
             "RFM",
-            "WAIT"
+            "WAIT",
+            "HAMMER"
           ]
         },
         "addr": {
@@ -107,6 +109,25 @@
         "tag": {
           "type": "string",
           "maxLength": 64
+        },
+        "repeat": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "pairs": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "rows": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/address"
+          },
+          "minItems": 1
         }
       }
     },
