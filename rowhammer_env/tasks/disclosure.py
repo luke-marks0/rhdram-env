@@ -142,6 +142,13 @@ class AddressResolver:
         self.handles = handles
 
     def to_linear(self, form: Any) -> int:
+        # A bare (non-bool) int is shorthand for {"kind":"logical","addr":N} — the
+        # compact HAMMER `rows`/`addrs` list (SPEC §8) is documented as a plain
+        # address list, so this is the one place that needs to accept it; it still
+        # goes through the normal `logical`-form disclosure/allowed_forms check
+        # below, so a task that hides logical addressing still fails closed.
+        if isinstance(form, int) and not isinstance(form, bool):
+            form = {"kind": "logical", "addr": form}
         if not isinstance(form, dict):
             raise AddressError("BAD_SCHEMA", "address must be an object")
         kind = form.get("kind")

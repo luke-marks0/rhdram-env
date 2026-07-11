@@ -125,7 +125,10 @@
         "rows": {
           "type": "array",
           "items": {
-            "$ref": "#/$defs/address"
+            "anyOf": [
+              {"$ref": "#/$defs/address"},
+              {"type": "integer", "minimum": 0}
+            ]
           },
           "minItems": 1
         }

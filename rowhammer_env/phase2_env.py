@@ -265,6 +265,10 @@ class RowHammerEnv(Environment[Phase2Action, Phase2Observation, Phase2State]):
             return self._resolver.to_linear(addr)
         # No disclosure/geometry wired yet: only logical addressing is available,
         # and any other form fails closed rather than being silently accepted.
+        # A bare int is shorthand for {"kind":"logical","addr":N}, same as
+        # AddressResolver.to_linear.
+        if isinstance(addr, int) and not isinstance(addr, bool):
+            addr = {"kind": "logical", "addr": addr}
         if not isinstance(addr, dict):
             raise AddressError("BAD_SCHEMA", "address must be an object")
         if addr.get("kind") != "logical":
