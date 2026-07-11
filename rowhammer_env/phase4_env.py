@@ -98,7 +98,14 @@ class RowHammerDisturbanceEnv(RowHammerEnv):
         obs.metadata["address_forms"] = sorted(self.disclosure.allowed_forms())
         obs.metadata["disclosure"] = self.disclosure.as_public()
         obs.metadata["disturbance"] = self._disturbance_metadata()
+        obs.metadata["geometry"] = geometry.public_block()
         return obs
+
+    def _geometry_block(self) -> dict[str, Any] | None:
+        # Available once the worker has reported geometry and the mapper is built.
+        if self.address_mapper is None:
+            return None
+        return self.address_mapper.geometry.public_block()
 
     def _disturbance_overrides(self, geometry: Geometry, seed: int) -> dict[str, Any]:
         """Engine constructor overrides for this episode (hook for the task layer).

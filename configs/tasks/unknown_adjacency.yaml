@@ -11,7 +11,9 @@ disclosure:
   adjacency: candidate_set
   victim: row_handle
   profile: public_profile_id
-  feedback: summarized_counts
+  # Discovery family: the policy must narrow candidates by bank-conflict timing
+  # (P22 §0.2), so it needs the issued-event trace + per-issue timing digest.
+  feedback: full_trace
 objective:
   type: target_row_flip
   target: row_handle
