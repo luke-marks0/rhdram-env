@@ -50,7 +50,24 @@ env:
   server_mode: production             # production => only the stateful /ws transport
   max_concurrent_envs: 16             # server-side session cap
   concurrency: 16                     # client-side parallel reward rollouts
-  max_steps: 4                        # max env steps replayed per completion
+  max_steps: 4                        # max env steps replayed per completion (single-shot)
+
+# Multi-turn training rollout (P27). When multi_turn:true, GRPO generation is replaced
+# by a genuine turn-by-turn episode per prompt (probe -> read timing digest -> narrow
+# candidates -> hammer), via a TRL custom rollout hook (rowhammer_env.llm.
+# multiturn_rollout). This is what the discovery families (bounded_sweep /
+# hidden_adjacency) need — a single disclosed HAMMER can't solve them. Requires a TRL
+# build exposing GRPOTrainer(rollout_func=...); the trainer FAILS CLOSED (never silently
+# single-shot) if absent — see IMPLEMENTATION_PLAN_V3 §2 open decision #1. Leave
+# multi_turn:false for the Tier 0 known-target families below (they are single-shot
+# solvable and train faster that way).
+#
+# THROUGHPUT (P27.4): each rollout is now O(max_turns) real env round-trips instead of
+# one, so round-trip latency — not model inference — dominates. Lower per-GPU generation
+# concurrency and raise parallel env sessions; MEASURE on the instance before assuming.
+rollout:
+  multi_turn: false
+  max_turns: 64                       # hard cap on turns/episode (budget usually binds first)
 
 # The training curriculum: one dataset row per (task, seed). Each entry is either
 # a full SPEC §10 task config (config:) or the {family:} shorthand.

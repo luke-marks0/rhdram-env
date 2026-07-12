@@ -33,6 +33,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import dataclasses
+import inspect
 import json
 import os
 import pathlib
@@ -54,6 +55,11 @@ from rowhammer_env.llm.grpo_env import (  # noqa: E402
     parse_actions,
     summarize_actions,
 )
+from rowhammer_env.llm.multiturn_rollout import (  # noqa: E402  (torch-free)
+    run_training_episode,
+    to_grpo_example,
+)
+from rowhammer_env.llm.rollout import RolloutConfig  # noqa: E402
 
 
 # --------------------------------------------------------------------------- #
@@ -188,6 +194,112 @@ def make_reward_functions(base_url: str, *, concurrency: int, max_steps: int, re
 
 
 # --------------------------------------------------------------------------- #
+# Multi-turn training rollouts (P27) — instance-only (needs torch/trl/GPU).
+#
+# The single-shot path above parses one completion into an action list and replays
+# it. The discovery families (bounded_sweep / hidden_adjacency) need genuine
+# turn-by-turn interaction: probe, read the timing digest, narrow candidates, hammer.
+# ``rowhammer_env.llm.multiturn_rollout`` owns the torch-free loop + completion-mask
+# assembly (unit-tested on the host); this section is the thin trl/torch binding.
+#
+# Reward stays trusted and sparse: the whole trajectory earns the final episode reward
+# from ``_trusted_success()`` (``to_grpo_example``'s ``reward``), never anything derived
+# from model text. GRPO's group-relative advantage is per full rollout.
+# --------------------------------------------------------------------------- #
+class HFCompletionGenerator:
+    """One assistant completion per turn from a HF causal LM (instance-only).
+
+    Renders the running transcript with the model's chat template, samples a short
+    continuation, and returns its text. ``torch``/``transformers`` are imported lazily
+    inside ``__call__`` so this file still imports (and ``--dry-run`` still runs) on a
+    host without them.
+    """
+
+    def __init__(self, model, tokenizer, *, max_new_tokens: int, enable_thinking: bool, temperature: float) -> None:
+        self.model = model
+        self.tokenizer = tokenizer
+        self.max_new_tokens = int(max_new_tokens)
+        self.enable_thinking = bool(enable_thinking)
+        self.temperature = float(temperature)
+
+    def __call__(self, messages, observation, transcript):
+        del observation, transcript
+        import torch
+
+        try:
+            prompt = self.tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True, enable_thinking=self.enable_thinking
+            )
+        except TypeError:
+            prompt = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
+        with torch.no_grad():
+            out = self.model.generate(
+                **inputs,
+                max_new_tokens=self.max_new_tokens,
+                do_sample=True,
+                temperature=self.temperature,
+                pad_token_id=self.tokenizer.pad_token_id,
+            )
+        gen = out[0][inputs["input_ids"].shape[1] :]
+        return self.tokenizer.decode(gen, skip_special_tokens=True)
+
+
+def make_multiturn_rollout_func(base_url, tokenizer, model, *, max_turns, max_new_tokens, enable_thinking, temperature):
+    """A TRL GRPO ``rollout_func`` that runs a real multi-turn episode per prompt.
+
+    Replaces the trainer's single-shot generation: for each prompt it drives the live
+    OpenEnv server through ``run_training_episode`` with an :class:`HFCompletionGenerator`
+    (the training model), then returns the token-level masked completion + the trusted
+    episode reward via ``to_grpo_example``.
+
+    IMPORTANT (instance-validated; open decision #1 in ``IMPLEMENTATION_PLAN_V3`` §2):
+    the exact ``rollout_func`` signature/return-keys vary across TRL releases. This
+    targets the documented contract — ``prompt_ids``/``completion_ids``/
+    ``completion_mask`` plus a ``trusted_reward`` extra column consumed by the reward
+    function — and returns them per prompt. Confirm the keys against the installed TRL
+    before a full run; a mismatch fails **loudly** at rollout time (never silently
+    single-shot). The dataset rows carry ``seed``/``task_json`` so the episode the model
+    interacts with is the one the reward is read from.
+    """
+
+    def rollout_func(prompts, seed=None, task_json=None, **_):
+        prompt_ids: list[list[int]] = []
+        completion_ids: list[list[int]] = []
+        completion_mask: list[list[int]] = []
+        trusted_reward: list[float] = []
+        for i in range(len(prompts)):
+            s = int(seed[i]) if seed else 0
+            task = json.loads(task_json[i]) if task_json and task_json[i] else None
+            generator = HFCompletionGenerator(
+                model, tokenizer, max_new_tokens=max_new_tokens, enable_thinking=enable_thinking, temperature=temperature
+            )
+            config = RolloutConfig(base_url=base_url, seed=s, task=task, episode_id=f"grpo_mt_{i}_{s}")
+            rollout = asyncio.run(run_training_episode(config, generator, max_turns=max_turns))
+            example = to_grpo_example(rollout, tokenizer)
+            prompt_ids.append(example["prompt_ids"])
+            completion_ids.append(example["completion_ids"])
+            completion_mask.append(example["completion_mask"])
+            trusted_reward.append(example["reward"])
+        return {
+            "prompt_ids": prompt_ids,
+            "completion_ids": completion_ids,
+            "completion_mask": completion_mask,
+            "trusted_reward": trusted_reward,
+        }
+
+    def reward_trusted(completions, trusted_reward=None, **_):
+        # The reward is the trusted episode reward carried from the rollout — not
+        # re-derived from completion text (SPEC §9).
+        if trusted_reward is None:
+            return [0.0] * len(completions)
+        return [float(r) for r in trusted_reward]
+
+    reward_trusted.__name__ = "env_success_multiturn"
+    return rollout_func, reward_trusted
+
+
+# --------------------------------------------------------------------------- #
 # Weights & Biases: autorun rollout + metric monitoring when wandb.enabled.
 # --------------------------------------------------------------------------- #
 def setup_wandb(cfg: dict, grpo_cfg: dict) -> tuple[list, bool]:
@@ -272,6 +384,9 @@ def main() -> int:
     seeds = [int(s) for s in cfg.get("seeds", list(range(1, 9)))]
     concurrency = int(env_cfg.get("concurrency", env_cfg.get("max_concurrent_envs", 8)))
     max_steps = int(env_cfg.get("max_steps", 4))
+    rollout_cfg = cfg.get("rollout", {})
+    multi_turn = bool(rollout_cfg.get("multi_turn", False))
+    max_turns = int(rollout_cfg.get("max_turns", 64))
 
     # ---- server: connect to an existing one or launch our own ---------------
     server = None
@@ -350,7 +465,12 @@ def main() -> int:
             base_url, concurrency=concurrency, max_steps=max_steps, record=wandb_enabled
         )
         reward_cfg = cfg.get("reward", {})
-        reward_weights = [float(reward_cfg.get("success_weight", 1.0)), float(reward_cfg.get("format_weight", 0.1))]
+        if multi_turn:
+            # One trusted reward func for the whole trajectory (no format shaping — the
+            # rollout already enforces well-formed turns by construction).
+            reward_weights = [float(reward_cfg.get("success_weight", 1.0))]
+        else:
+            reward_weights = [float(reward_cfg.get("success_weight", 1.0)), float(reward_cfg.get("format_weight", 0.1))]
 
         # Only forward keys GRPOConfig actually defines, so a newer/older TRL
         # doesn't reject the file (fail loud on genuinely unknown keys instead).
@@ -365,15 +485,41 @@ def main() -> int:
             **{k: v for k, v in grpo_cfg.items() if k in valid},
         )
 
-        trainer = GRPOTrainer(
+        trainer_kwargs = dict(
             model=model,
-            reward_funcs=[reward_env, reward_format],
             args=training_args,
             train_dataset=dataset,
             processing_class=tokenizer,
             peft_config=peft_config,
             callbacks=wandb_callbacks or None,
         )
+        if multi_turn:
+            # Genuine turn-by-turn trajectories via a TRL custom rollout. Fail closed if
+            # the installed TRL has no rollout_func hook — never silently fall back to
+            # single-shot (that would train on a different, easier problem; SPEC §2).
+            if "rollout_func" not in inspect.signature(GRPOTrainer.__init__).parameters:
+                raise SystemExit(
+                    "rollout.multi_turn requires a TRL build exposing GRPOTrainer(rollout_func=...); "
+                    f"installed trl {getattr(__import__('trl'), '__version__', '?')} does not. "
+                    "Upgrade TRL (see IMPLEMENTATION_PLAN_V3 §2 open decision #1) or unset rollout.multi_turn."
+                )
+            rollout_func, reward_trusted = make_multiturn_rollout_func(
+                base_url,
+                tokenizer,
+                model,
+                max_turns=max_turns,
+                max_new_tokens=int(grpo_cfg.get("max_completion_length", 256)),
+                enable_thinking=enable_thinking,
+                temperature=float(grpo_cfg.get("temperature", 1.0)),
+            )
+            print(f"multi-turn GRPO rollout enabled (max_turns={max_turns})")
+            trainer = GRPOTrainer(
+                reward_funcs=[reward_trusted],
+                rollout_func=rollout_func,
+                **trainer_kwargs,
+            )
+        else:
+            trainer = GRPOTrainer(reward_funcs=[reward_env, reward_format], **trainer_kwargs)
         trainer.train()
         trainer.save_model(training_args.output_dir)
         tokenizer.save_pretrained(training_args.output_dir)
