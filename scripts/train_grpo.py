@@ -245,7 +245,9 @@ class HFCompletionGenerator:
         return self.tokenizer.decode(gen, skip_special_tokens=True)
 
 
-def make_multiturn_rollout_func(base_url, tokenizer, model, *, max_turns, max_new_tokens, enable_thinking, temperature):
+def make_multiturn_rollout_func(
+    base_url, tokenizer, model, prompt_to_meta, *, max_turns, max_new_tokens, enable_thinking, temperature
+):
     """A TRL GRPO ``rollout_func`` that runs a real multi-turn episode per prompt.
 
     Replaces the trainer's single-shot generation: for each prompt it drives the live
@@ -253,39 +255,64 @@ def make_multiturn_rollout_func(base_url, tokenizer, model, *, max_turns, max_ne
     (the training model), then returns the token-level masked completion + the trusted
     episode reward via ``to_grpo_example``.
 
-    IMPORTANT (instance-validated; open decision #1 in ``IMPLEMENTATION_PLAN_V3`` §2):
-    the exact ``rollout_func`` signature/return-keys vary across TRL releases. This
-    targets the documented contract — ``prompt_ids``/``completion_ids``/
-    ``completion_mask`` plus a ``trusted_reward`` extra column consumed by the reward
-    function — and returns them per prompt. Confirm the keys against the installed TRL
-    before a full run; a mismatch fails **loudly** at rollout time (never silently
-    single-shot). The dataset rows carry ``seed``/``task_json`` so the episode the model
-    interacts with is the one the reward is read from.
+    TRL's contract (verified against TRL 1.8.0): the trainer calls
+    ``rollout_func(prompts, trainer)`` *positionally* — the second argument is the
+    ``GRPOTrainer`` itself, **not** the dataset columns. So ``seed``/``task`` are
+    recovered per prompt from ``prompt_to_meta`` (built from the pre-rendered dataset
+    rows; every generation of a given prompt shares its seed/task). The returned dict
+    uses TRL's keys ``prompt_ids``/``completion_ids``/``logprobs`` plus a token-level
+    ``completion_mask`` (assistant spans only) and a ``trusted_reward`` extra column the
+    reward function reads. A prompt missing from the lookup fails **loudly** (never a
+    silent wrong-episode reward).
     """
 
-    def rollout_func(prompts, seed=None, task_json=None, **_):
-        prompt_ids: list[list[int]] = []
-        completion_ids: list[list[int]] = []
-        completion_mask: list[list[int]] = []
-        trusted_reward: list[float] = []
-        for i in range(len(prompts)):
-            s = int(seed[i]) if seed else 0
-            task = json.loads(task_json[i]) if task_json and task_json[i] else None
+    def _logprobs(prompt_ids: list[int], completion_ids: list[int]) -> list[float]:
+        # Teacher-forcing pass over prompt+completion → per-completion-token logprob
+        # under the current policy. Autoregressive equivalence: each assistant token was
+        # generated left-to-right by this same model given exactly this left context, so
+        # a single forward pass reproduces the sampling logprobs (temperature 1.0). Tool
+        # tokens' logprobs are computed too but are masked out of the loss.
+        import torch
+
+        ids = torch.tensor([prompt_ids + completion_ids], device=model.device)
+        with torch.no_grad():
+            logits = model(ids).logits[0]
+        logp = torch.log_softmax(logits.float(), dim=-1)
+        start = len(prompt_ids)
+        return [float(logp[start + t - 1, tok]) for t, tok in enumerate(completion_ids)]
+
+    def rollout_func(prompts, trainer):
+        del trainer  # the model/tokenizer are captured; the trainer handle is unused
+        prompt_ids_b: list[list[int]] = []
+        completion_ids_b: list[list[int]] = []
+        completion_mask_b: list[list[int]] = []
+        logprobs_b: list[list[float]] = []
+        trusted_reward_b: list[float] = []
+        for prompt in prompts:
+            if prompt not in prompt_to_meta:
+                raise RuntimeError(
+                    "multi-turn rollout_func: prompt not found in the task lookup — the "
+                    "dataset 'prompt' column must match the rollout prompts verbatim. "
+                    "Check render_prompts()/chat-template consistency."
+                )
+            seed, task = prompt_to_meta[prompt]
             generator = HFCompletionGenerator(
                 model, tokenizer, max_new_tokens=max_new_tokens, enable_thinking=enable_thinking, temperature=temperature
             )
-            config = RolloutConfig(base_url=base_url, seed=s, task=task, episode_id=f"grpo_mt_{i}_{s}")
+            config = RolloutConfig(base_url=base_url, seed=seed, task=task, episode_id=f"grpo_mt_{seed}")
             rollout = asyncio.run(run_training_episode(config, generator, max_turns=max_turns))
             example = to_grpo_example(rollout, tokenizer)
-            prompt_ids.append(example["prompt_ids"])
-            completion_ids.append(example["completion_ids"])
-            completion_mask.append(example["completion_mask"])
-            trusted_reward.append(example["reward"])
+            prompt_ids_b.append(example["prompt_ids"])
+            completion_ids_b.append(example["completion_ids"])
+            completion_mask_b.append(example["completion_mask"])
+            logprobs_b.append(_logprobs(example["prompt_ids"], example["completion_ids"]))
+            trusted_reward_b.append(example["reward"])
         return {
-            "prompt_ids": prompt_ids,
-            "completion_ids": completion_ids,
-            "completion_mask": completion_mask,
-            "trusted_reward": trusted_reward,
+            "prompt_ids": prompt_ids_b,
+            "completion_ids": completion_ids_b,
+            "completion_mask": completion_mask_b,
+            "logprobs": logprobs_b,
+            "trusted_reward": trusted_reward_b,
         }
 
     def reward_trusted(completions, trusted_reward=None, **_):
@@ -503,10 +530,17 @@ def main() -> int:
                     f"installed trl {getattr(__import__('trl'), '__version__', '?')} does not. "
                     "Upgrade TRL (see IMPLEMENTATION_PLAN_V3 §2 open decision #1) or unset rollout.multi_turn."
                 )
+            # TRL calls rollout_func(prompts, trainer) with only the prompt strings, so
+            # map each pre-rendered prompt back to its (seed, task) for the episode.
+            prompt_to_meta = {
+                r["prompt"]: (int(r["seed"]), json.loads(r["task_json"]) if r["task_json"] else None)
+                for r in rows
+            }
             rollout_func, reward_trusted = make_multiturn_rollout_func(
                 base_url,
                 tokenizer,
                 model,
+                prompt_to_meta,
                 max_turns=max_turns,
                 max_new_tokens=int(grpo_cfg.get("max_completion_length", 256)),
                 enable_thinking=enable_thinking,
