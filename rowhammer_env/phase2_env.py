@@ -322,6 +322,14 @@ class RowHammerEnv(Environment[Phase2Action, Phase2Observation, Phase2State]):
         flips = 0
         oracle_refreshes = 0
         public_flips: list[dict[str, Any]] = []
+        # Absolute ceiling on the cumulative activation counter this issue may reach
+        # (``None`` = unbounded, the bare env). Because ``_issue`` drives the worker
+        # one primitive at a time, we stop *issuing* once the ceiling is reached, so
+        # the disturbance model never processes activations the budget can't pay for
+        # — a monolithic HAMMER is truncated at the budget instead of running to
+        # completion and crediting an over-budget flip (SPEC §8: ACTs are budgeted).
+        acts_ceiling = self._issue_acts_ceiling()
+        budget_truncated = False
         last = Phase2Observation(reward=0.0, done=False, cycle=self._state.cycle)
         for command in primitives:
             op = command["op"]
@@ -347,6 +355,12 @@ class RowHammerEnv(Environment[Phase2Action, Phase2Observation, Phase2State]):
             flips += int(last.feedback.get("new_public_flips", 0) or 0)
             oracle_refreshes += int(last.feedback.get("oracle_refreshes", 0) or 0)
             public_flips.extend(last.feedback.get("public_flips", []) or [])
+            # Stop before issuing any primitive the activation budget cannot pay for.
+            # The primitive just issued is within budget (its flips, if any, count);
+            # the rest of a truncated HAMMER are never sent to the worker.
+            if acts_ceiling is not None and int(last.public_counters.get("acts", 0)) >= acts_ceiling:
+                budget_truncated = True
+                break
         # Aggregate the whole issue's feedback onto the last primitive's observation
         # (which carries the final cumulative ``public_counters``/``cycle``) instead
         # of surfacing only the last primitive's slice (0.2.2).
@@ -360,7 +374,21 @@ class RowHammerEnv(Environment[Phase2Action, Phase2Observation, Phase2State]):
             last.feedback["trace_tail"] = trace_tail[-ISSUE_TRACE_TAIL_CAP:]
         if self._trace_disclosed():
             last.feedback["timing_digest"] = digest.as_dict()
+        if budget_truncated:
+            # The issue hit the activation ceiling mid-expansion: the flips above are
+            # the real ones the budget paid for; the episode terminates over budget.
+            last.error = {"code": "BUDGET_EXCEEDED", "message": "activation budget exhausted"}
+            last.done = True
         return last
+
+    def _issue_acts_ceiling(self) -> int | None:
+        """Absolute cumulative-ACT ceiling a single ``dram.issue`` may reach.
+
+        ``None`` in the bare env, which imposes no activation budget. The task env
+        (which owns ``budget_remaining``) overrides this so a single ``dram.issue``
+        cannot spend more activations than the episode's remaining ACT budget.
+        """
+        return None
 
     def _trace_disclosed(self) -> bool:
         """Whether the issued-event trace/timing is disclosed at this feedback level.

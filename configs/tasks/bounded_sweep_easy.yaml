@@ -23,13 +23,15 @@ disclosure:
 objective:
   type: target_row_flip
   target: row_handle
-# Placeholder budgets: P26's reference policy measures the real probe+hammer call
-# count and back-fills the calibrated bands (IMPLEMENTATION_PLAN_V3 P23 task 3 / P26
-# task 3). Sized generously here so the family instantiates and runs end-to-end.
+# Budgets calibrated by the P26 reference probe policy (ReferenceProbePolicy): its
+# measured worst-case probe+hammer activation cost across seeds, plus headroom for a
+# real policy. On the wider bands the timing-blind control (hammer-all) exceeds this
+# activation budget while the timing-narrowed reference stays within it, so the
+# discovery signal is load-bearing (IMPLEMENTATION_PLAN_V3 P23 task 3 / P26 task 3).
 budgets:
-  tool_calls: 200
-  acts: 200000
-  cycles: 60000000
+  tool_calls: 40
+  acts: 20000
+  cycles: 240000000
   script_ms: 0
 reward: sparse_success
 difficulty: easy

@@ -164,11 +164,121 @@ class TrainableHammerPolicy(CIHammerFixturePolicy):
         return {"pairs_before": before, "pairs_after": self.pairs, "reward": reward}
 
 
+class ReferenceProbePolicy:
+    """Deterministic DRAMA reference solver for the Tier 2 discovery families (P26).
+
+    This is a hand-written *reference* fixture — the P19 no-mock discipline of
+    labelling fixtures as fixtures, never advertised as the LLM policy — that proves
+    the disclosed signals are *sufficient* to solve ``bounded_sweep`` (Tier 2a) and
+    ``hidden_adjacency`` (Tier 2b) using exactly the tools/signals an LLM would have,
+    and nothing else. It runs on the host with no ``torch``.
+
+    Strategy (``TIER2_DISCOVERY_PLAN`` §0.2):
+
+    1. **Bank classification by timing.** For each disclosed candidate, warm the
+       candidate + victim rows open in one ``dram.issue``, then alternate them in a
+       small ``HAMMER`` in a *separate* ``dram.issue``. A same-bank pair evicts on
+       every access and forces new ``ACT``\\ s (``timing_digest.acts_delta`` > 0); a
+       different-bank pair stays open (``acts_delta`` == 0). The discriminator is the
+       ``acts``/``cycle`` delta, **never** the access's ``row_hit`` — a policy
+       ``RD``'s own ``row_hit`` is always true (§0.2.1). Only same-bank candidates
+       can be the victim's physical neighbours, so different-bank candidates are
+       dropped without spending a hammer on them.
+    2. **Budgeted confirmation.** Double-side the surviving same-bank candidates in
+       one compact ``HAMMER`` (both true aggressors — the victim's row ± 1 — are in
+       the survivor set, so the victim accumulates left+right exposure and flips).
+       Success is read only from the trusted environment reward / ``new_public_flips``.
+
+    ``use_timing=False`` yields the differential control: it skips the timing probes
+    and hammers *every* candidate. It still flips (the aggressors are in the set),
+    but hammering the different-bank candidates it failed to rule out costs markedly
+    more real activations — so under a budget the reference respects, the control
+    trips ``BUDGET_EXCEEDED``. This is what makes the timing signal load-bearing.
+    """
+
+    def __init__(self, *, use_timing: bool = True, probe_pairs: int = 8, hammer_pairs: int = 2700) -> None:
+        self.use_timing = bool(use_timing)
+        self.probe_pairs = int(probe_pairs)
+        self.hammer_pairs = int(hammer_pairs)
+        self._started = False
+        self._victim: dict[str, Any] | None = None
+        self._candidates: list[dict[str, Any]] = []
+        self._index = 0
+        self._phase = "warm"  # per-candidate: "warm" -> "alternate"
+        self._pending: dict[str, Any] | None = None  # candidate awaiting classification
+        self._same_bank: list[dict[str, Any]] = []
+        self._hammered = False
+
+    def next_tool(self, observation: Any, trajectory: list[dict[str, Any]]) -> ToolCall:
+        del trajectory
+        if not self._started:
+            self._start(observation)
+        # Classify the candidate whose alternating probe just ran: its result is the
+        # observation we were handed this turn.
+        if self._pending is not None:
+            if self._is_same_bank(observation) or not self.use_timing:
+                self._same_bank.append(self._pending)
+            self._pending = None
+            self._index += 1
+
+        if not self._candidates:
+            return ToolCall("episode.finish", {})
+
+        # Probe phase (timing on): classify each candidate against the victim.
+        if self.use_timing and self._index < len(self._candidates):
+            candidate = self._candidates[self._index]
+            if self._phase == "warm":
+                self._phase = "alternate"
+                return ToolCall(
+                    "dram.issue",
+                    {"commands": [{"op": "RD", "addr": candidate}, {"op": "RD", "addr": self._victim}]},
+                )
+            self._phase = "warm"
+            self._pending = candidate
+            return ToolCall(
+                "dram.issue",
+                {"commands": [{"op": "HAMMER", "rows": [candidate, self._victim], "pairs": self.probe_pairs}]},
+            )
+
+        # Confirmation phase: double-side the surviving same-bank candidates (or, in
+        # the timing-blind control, every candidate) in one budgeted HAMMER.
+        if not self._hammered:
+            self._hammered = True
+            rows = self._same_bank if self.use_timing else list(self._candidates)
+            if not rows:
+                rows = list(self._candidates)
+            return ToolCall("dram.issue", {"commands": [{"op": "HAMMER", "rows": rows, "pairs": self.hammer_pairs}]})
+
+        return ToolCall("episode.finish", {})
+
+    def _start(self, observation: Any) -> None:
+        metadata = _metadata(observation)
+        objective = metadata.get("objective") or {}
+        self._victim = objective.get("target") or metadata.get("target")
+        self._candidates = list(metadata.get("candidates") or [])
+        self._started = True
+
+    def _is_same_bank(self, observation: Any) -> bool:
+        feedback = _feedback(observation)
+        digest = feedback.get("timing_digest") or {}
+        return int(digest.get("acts_delta", 0) or 0) > 0
+
+
 def _metadata(observation: Any) -> dict[str, Any]:
-    if hasattr(observation, "metadata"):
+    if hasattr(observation, "metadata") and observation.metadata:
         return dict(observation.metadata)
+    if hasattr(observation, "info") and observation.info:
+        return dict(observation.info)
     if isinstance(observation, dict):
-        return dict(observation.get("metadata") or {})
+        return dict(observation.get("metadata") or observation.get("info") or {})
+    return {}
+
+
+def _feedback(observation: Any) -> dict[str, Any]:
+    if hasattr(observation, "feedback"):
+        return dict(observation.feedback or {})
+    if isinstance(observation, dict):
+        return dict(observation.get("feedback") or {})
     return {}
 
 

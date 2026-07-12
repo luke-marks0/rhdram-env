@@ -207,6 +207,17 @@ class RowHammerTaskEnv(RowHammerDisturbanceEnv):
         obs.metadata["budget_remaining"] = dict(self.budget_remaining)
         return obs
 
+    def _issue_acts_ceiling(self) -> int | None:
+        # Cap a single dram.issue at the episode's remaining ACT budget so a
+        # monolithic HAMMER is truncated at the budget rather than running to
+        # completion and crediting an over-budget flip. ``_acts_prev`` is the
+        # cumulative ACT counter as of the last charge; adding the remaining budget
+        # gives the absolute counter value this issue may reach. Only families that
+        # actually budget activations are constrained (others hammer freely).
+        if "acts" not in self.budget_remaining:
+            return None
+        return self._acts_prev + max(0, self.budget_remaining["acts"])
+
     def _charge(self, obs: Phase2Observation, before_cycle: int) -> None:
         self.budget_remaining["tool_calls"] -= 1
         self.budget_remaining["cycles"] -= max(0, obs.cycle - before_cycle)
