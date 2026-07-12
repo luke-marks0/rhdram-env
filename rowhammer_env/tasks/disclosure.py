@@ -63,6 +63,18 @@ class Disclosure:
         """Exact target coordinates are disclosed only at ``victim: exact``."""
         return self.victim == "exact"
 
+    def expose_victim_address(self) -> bool:
+        """Whether the victim's own *linear* address is disclosed to the policy.
+
+        ``exact`` hands physical coordinates (and the linear address); the Tier 2b
+        ``logical_addr`` level (P25) hands the victim's numeric logical address
+        *without* physical coordinates — the real-attacker-knowledge model, where
+        the attacker knows its own allocation's address but the address->bank
+        mapping is a per-episode secret (P24), so bank membership is not computable
+        from that number and must be reverse-engineered by timing (DRAMA).
+        """
+        return self.victim in ("exact", "logical_addr")
+
     def as_public(self) -> dict[str, str]:
         return {
             "mapping": self.mapping,

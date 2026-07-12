@@ -1,0 +1,40 @@
+# Task config (SPEC §7/§10). Compiled by rowhammer_env/tasks/compiler.py.
+#
+# Tier 2b discovery family (IMPLEMENTATION_PLAN_V3 P25): the real-attacker-knowledge
+# model. The victim's own numeric (logical) address and N numeric candidate
+# addresses are disclosed, but the address->bank mapping is a per-episode secret
+# (P24), so which candidates are same-bank neighbours must be reverse-engineered by
+# the bank-conflict timing channel (§0.2), not computed from the address. A control
+# that hammers ``victim ± row_stride`` fails: the row->bank XOR sends those to a
+# different bank. ``medium`` = N=16 candidates.
+id: ddr4_hidden_adjacency_medium_v1
+family: hidden_adjacency
+profile: ddr4_vts25_v1
+standard: DDR4
+mitigation:
+  name: none
+  params: {}
+disclosure:
+  mapping: logical_only
+  adjacency: candidate_set
+  # logical_addr: the victim's numeric address is disclosed (real-attacker
+  # knowledge), but NOT its physical coordinates — those would leak the secret
+  # bank mapping. Bank membership stays hidden and must be discovered by timing.
+  victim: logical_addr
+  profile: public_profile_id
+  # Discovery family: the bank-conflict timing side channel (P22 §0.2) only reaches
+  # the policy under full_trace + the per-issue timing digest.
+  feedback: full_trace
+objective:
+  type: target_row_flip
+  target: logical_addr
+# Placeholder budgets: P26's reference policy measures the real probe+hammer call
+# count and back-fills the calibrated bands (IMPLEMENTATION_PLAN_V3 P25 / P26 task 3).
+# Sized generously here so the family instantiates and runs end-to-end.
+budgets:
+  tool_calls: 200
+  acts: 200000
+  cycles: 60000000
+  script_ms: 0
+reward: sparse_success
+difficulty: medium

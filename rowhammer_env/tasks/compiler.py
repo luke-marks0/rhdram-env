@@ -114,8 +114,24 @@ FAMILIES: dict[str, FamilyDef] = {
         "any_flip", Disclosure(_P, "exact", "hidden_until_finish", "public_profile_id", "summarized_counts"),
         "sampled", graded=True,
     ),
+    # DEPRECATED (V3 §5): the fully-opaque, zero-addressability victim (a handle
+    # with no numeric address and no addressable neighbours) asks for stricter-than-
+    # real-attacker knowledge and is dropped in favour of ``hidden_adjacency`` (the
+    # numeric real-attacker redefinition, P25). Kept working for the existing low-
+    # disclosure regression/leakage tests; do not build new tasks on it.
     "hidden_target": FamilyDef(
         "target_row_flip", Disclosure(_L, "hidden", "row_handle", "public_profile_id", "summarized_counts"), "known"
+    ),
+    "hidden_adjacency": FamilyDef(
+        # Tier 2b (P25): the real-attacker-knowledge model. The victim's own numeric
+        # (logical) address and a set of *numeric* candidate addresses are disclosed
+        # (``victim: logical_addr``), but the address->bank mapping is a per-episode
+        # secret (``secret_mapping``), so which candidates are same-bank neighbours
+        # must be reverse-engineered from the bank-conflict timing channel (§0.2),
+        # not computed from the address. ``full_trace`` so that timing reaches the
+        # policy; ``known`` target so a found aggressor flips reliably.
+        "target_row_flip", Disclosure(_L, "candidate_set", "logical_addr", "public_profile_id", "full_trace"),
+        "known", secret_mapping=True,
     ),
     "unknown_adjacency": FamilyDef(
         "target_row_flip", Disclosure(_L, "candidate_set", "row_handle", "public_profile_id", "summarized_counts"),
@@ -180,6 +196,8 @@ def _derive_family(config: dict[str, Any]) -> str:
         return _OBJECTIVE_FAMILY[otype]
     # target_row_flip: disambiguate by disclosure.
     disc = Disclosure.from_config(config.get("disclosure"))
+    if disc.victim == "logical_addr":
+        return "hidden_adjacency"
     if disc.adjacency == "candidate_set":
         return "unknown_adjacency"
     if disc.mapping == "physical" and disc.victim == "exact":
@@ -356,6 +374,10 @@ class TaskSpec:
                 candidates = self._build_candidates(
                     seed, geometry, target_row, row_count, (target_bankgroup, target_bank), decode
                 )
+            elif self.family == "hidden_adjacency":
+                candidates = self._build_numeric_candidates(
+                    seed, geometry, target_row, row_count, (target_bankgroup, target_bank), decode
+                )
 
         return CompiledTask(
             task_id=self.task_id,
@@ -382,6 +404,37 @@ class TaskSpec:
             candidates=candidates,
         )
 
+    @staticmethod
+    def _bank_slot_addrs(
+        mapper: AddressMapper,
+        row_bytes: int,
+        r: int,
+        decode: "Callable[[int], dict[str, int]]",
+    ) -> dict[tuple[int, int], int]:
+        """Decoded ``(bankgroup, bank)`` -> a linear address at row ``r``, column 0.
+
+        Bank membership under the per-episode secret mapper is not computable from
+        the linear address, so it is read from the worker ``DECODE`` op — no mapper
+        logic is duplicated in Python. The *raw* RoBaRaCoCh bit positions (where the
+        Bank/BankGroup/Row fields sit before the secret XOR) are public geometry;
+        enumerating the raw bank slots at a fixed row and decoding each yields the
+        full decoded-bank → linear-address map for that row (a bijection over the
+        bank space), which both candidate builders use to select true same-bank
+        neighbours (aggressors) and same/different-bank decoys against the real
+        mapping.
+        """
+        sh_bank = mapper.shifts["bank"]
+        bank_w = mapper.widths["bank"]
+        sh_bg = mapper.shifts.get("bankgroup", 0)
+        bg_w = mapper.widths.get("bankgroup", 0)
+        out: dict[tuple[int, int], int] = {}
+        for bg in range(1 << bg_w):
+            for bank in range(1 << bank_w):
+                addr = r * row_bytes + (bg << sh_bg) + (bank << sh_bank)
+                d = decode(addr)
+                out[(int(d["bankgroup"]), int(d["bank"]))] = addr
+        return out
+
     def _build_candidates(
         self,
         seed: int,
@@ -393,34 +446,22 @@ class TaskSpec:
     ) -> tuple[Candidate, ...]:
         """Build the ``bounded_sweep`` candidate window against the *secret* mapper (P24).
 
-        Bank membership under the per-episode secret mapper is not computable from
-        the linear address, so candidates are found by the worker ``DECODE`` op — no
-        mapper logic is duplicated in Python. The *raw* RoBaRaCoCh bit positions
-        (where the Bank/BankGroup/Row fields sit before the secret XOR) are public
-        geometry; enumerating the raw bank slots at a fixed row and decoding each
-        yields the full decoded-bank → linear-address map for that row (a bijection
-        over the bank space), from which the true same-bank neighbours (aggressors),
-        same-bank-far decoys, and different-bank decoys are selected against the
-        real mapping. The list is shuffled per episode so position leaks no role.
+        Tier 2a candidates are opaque **handles** whose linear offset is hidden, so
+        decoy placement need only control the bank/adjacency *mix*: two same-bank
+        neighbours (aggressors), same-bank-far decoys, and different-bank decoys. The
+        list is shuffled per episode so position leaks no role. (Tier 2b —
+        :meth:`_build_numeric_candidates` — additionally hides proximity, because
+        there the address itself is disclosed.)
         """
         mapper = AddressMapper(geometry)  # public raw RoBaRaCoCh field positions
         row_bytes = geometry.row_stride
         target_addr = target_row * row_bytes
-        sh_bank = mapper.shifts["bank"]
         bank_w = mapper.widths["bank"]
-        sh_bg = mapper.shifts.get("bankgroup", 0)
         bg_w = mapper.widths.get("bankgroup", 0)
         rng = self._rng(seed, "candidates")
 
         def bank_map_at_row(r: int) -> dict[tuple[int, int], int]:
-            """Decoded (bankgroup, bank) -> a linear address at row ``r``, column 0."""
-            out: dict[tuple[int, int], int] = {}
-            for bg in range(1 << bg_w):
-                for bank in range(1 << bank_w):
-                    addr = r * row_bytes + (bg << sh_bg) + (bank << sh_bank)
-                    d = decode(addr)
-                    out[(int(d["bankgroup"]), int(d["bank"]))] = addr
-            return out
+            return self._bank_slot_addrs(mapper, row_bytes, r, decode)
 
         cands: list[Candidate] = []
 
@@ -457,6 +498,95 @@ class TaskSpec:
             r = (r + FAR_ROW_MARGIN + 1) % row_count
             if abs(r - target_row) <= FAR_ROW_MARGIN:
                 r = (r + FAR_ROW_MARGIN + 1) % row_count
+
+        # Shuffle so a candidate's list position never encodes its role.
+        rng.shuffle(cands)
+        return tuple(cands)
+
+    def _build_numeric_candidates(
+        self,
+        seed: int,
+        geometry: Geometry,
+        target_row: int,
+        row_count: int,
+        victim_bank: tuple[int, int],
+        decode: "Callable[[int], dict[str, int]]",
+    ) -> tuple[Candidate, ...]:
+        """Build the Tier 2b (``hidden_adjacency``) numeric candidate window (P25).
+
+        Same real-decode search as :meth:`_build_candidates`, but Tier 2b discloses
+        each candidate as its numeric *logical address*, so placement must defeat a
+        second shortcut on top of the secret bank function: **proximity/arithmetic**.
+        The two aggressors sit at the victim's immediate physical neighbours (same
+        bank, rows ± 1); they are camouflaged by *different-bank* decoys placed at
+        the **same two adjacent rows**, balanced across both sides, so the aggressors
+        are not the numerically-closest candidates and no disclosed address reveals
+        which candidate is the real one — only the bank-conflict timing channel and
+        the trusted final flip can (SPEC §8/§9). ``victim ± row_stride`` is itself one
+        of those different-bank near decoys (the row->bank XOR sends it to another
+        bank), so a numeric-arithmetic control hammers a different bank and fails
+        (P25 done-when). Any decoys beyond the adjacent shell (only needed for the
+        wider bands) are same-bank-far / different-bank far distractors.
+        """
+        mapper = AddressMapper(geometry)
+        row_bytes = geometry.row_stride
+        target_addr = target_row * row_bytes
+        bank_w = mapper.widths["bank"]
+        bg_w = mapper.widths.get("bankgroup", 0)
+        n_banks = (1 << bg_w) * (1 << bank_w)
+        rng = self._rng(seed, "candidates")
+
+        def bank_map_at_row(r: int) -> dict[tuple[int, int], int]:
+            return self._bank_slot_addrs(mapper, row_bytes, r, decode)
+
+        cands: list[Candidate] = []
+
+        # Two true aggressors: same bank, immediate physical neighbours (rows ± 1).
+        for drow in (-1, 1):
+            addr = bank_map_at_row(target_row + drow)[victim_bank]
+            cands.append(Candidate(addr - target_addr, "aggressor"))
+
+        n_decoy = BAND_CANDIDATES[self.difficulty] - len(cands)
+
+        # Adjacent shell: the *other* bank slots at rows ± 1 — same numeric proximity
+        # as the aggressors, so proximity/arithmetic cannot isolate them. Drawn
+        # round-robin from both adjacent rows so each aggressor is hidden among
+        # same-row, same-proximity different-bank decoys.
+        near_by_row: dict[int, list[int]] = {}
+        for drow in (-1, 1):
+            slots = bank_map_at_row(target_row + drow)
+            others = [addr for bank, addr in slots.items() if bank != victim_bank]
+            rng.shuffle(others)
+            near_by_row[drow] = others
+        while (near_by_row[-1] or near_by_row[1]) and len(cands) - 2 < n_decoy:
+            for drow in (-1, 1):
+                if near_by_row[drow] and len(cands) - 2 < n_decoy:
+                    cands.append(Candidate(near_by_row[drow].pop() - target_addr, "different_bank"))
+
+        # Outer decoys: only reached when the adjacent shell cannot fill the band
+        # (the widest bands). Same-bank-far survives the timing probe but never
+        # flips the victim; different-bank far adds volume. Proximity camouflage is
+        # already provided by the adjacent shell, so these may sit at far rows.
+        remaining = n_decoy - (len(cands) - 2)
+        if remaining > 0:
+            n_far_same = remaining // 2 if n_banks > 1 else remaining
+            far_pool = [r for r in range(row_count) if abs(r - target_row) > FAR_ROW_MARGIN]
+            for r in rng.sample(far_pool, min(n_far_same, len(far_pool))):
+                cands.append(Candidate(bank_map_at_row(r)[victim_bank] - target_addr, "same_bank_far"))
+            made = 0
+            n_far_diff = remaining - n_far_same
+            r = (target_row + FAR_ROW_MARGIN + 1) % row_count
+            while made < n_far_diff and n_banks > 1:
+                others = [(b, a) for b, a in bank_map_at_row(r).items() if b != victim_bank]
+                rng.shuffle(others)
+                for _bank, addr in others:
+                    if made >= n_far_diff:
+                        break
+                    cands.append(Candidate(addr - target_addr, "different_bank"))
+                    made += 1
+                r = (r + FAR_ROW_MARGIN + 1) % row_count
+                if abs(r - target_row) <= FAR_ROW_MARGIN:
+                    r = (r + FAR_ROW_MARGIN + 1) % row_count
 
         # Shuffle so a candidate's list position never encodes its role.
         rng.shuffle(cands)

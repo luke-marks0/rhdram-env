@@ -69,6 +69,7 @@ PREDICATES: dict[str, Callable[["CompiledTask", "DisturbanceEngine"], bool]] = {
     "hidden_target": _target_row_flip,
     "unknown_adjacency": _target_row_flip,
     "bounded_sweep": _target_bankrow_flip,
+    "hidden_adjacency": _target_bankrow_flip,
     "mitigation_aware": _target_row_flip,
     "low_disclosure": _target_row_flip,
     "any_flip": _any_flip,

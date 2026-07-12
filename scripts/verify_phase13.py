@@ -69,6 +69,14 @@ def _rd_handle(handle: str) -> dict:
     return {"op": "RD", "addr": {"kind": "handle", "id": handle}}
 
 
+def _rd_candidate(candidate: dict) -> dict:
+    """RD a disclosed candidate — an opaque handle (Tier 2a) or a numeric logical
+    address (Tier 2b ``hidden_adjacency``, P25)."""
+    if candidate.get("kind") == "handle":
+        return _rd_handle(candidate["id"])
+    return _rd(int(candidate["addr"]))
+
+
 class ReferencePolicy:
     """A simple double-sided hammering baseline used to exercise every family.
 
@@ -93,7 +101,7 @@ class ReferencePolicy:
             return [_rd(addr - row_bytes), _rd(addr + row_bytes)], "disclosed-target"
         candidates = meta.get("candidates")
         if candidates:
-            return [_rd_handle(candidates[0]["id"]), _rd_handle(candidates[1]["id"])], "candidate-handles"
+            return [_rd_candidate(candidates[0]), _rd_candidate(candidates[1])], "candidate-set"
         if env._compiled.target_kind == "sampled":
             # Graded/any-flip task with a hidden target: pick a victim row and
             # hammer its neighbours; the profile decides whether it crosses.

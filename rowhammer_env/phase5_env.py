@@ -169,7 +169,12 @@ class RowHammerTaskEnv(RowHammerDisturbanceEnv):
 
         if self.disclosure.victim in ("row_handle", "cell_handle"):
             self._target_handle = handles.register("target", target_addr)
-        if self.disclosure.adjacency == "candidate_set":
+        # Candidate *handles* are minted only for handle-victim discovery families
+        # (Tier 2a ``bounded_sweep`` / legacy ``unknown_adjacency``). The Tier 2b
+        # ``hidden_adjacency`` family (``victim: logical_addr``) discloses its
+        # candidates as numeric logical addresses instead (emitted directly in
+        # ``_objective_and_target``), so it registers no handles.
+        if self.disclosure.adjacency == "candidate_set" and self.disclosure.victim in ("row_handle", "cell_handle"):
             # ``bounded_sweep`` (P23) compiles an explicit N-candidate window; the
             # legacy ``unknown_adjacency`` keeps its fixed 3 same-bank offsets.
             if self._compiled.candidates:
@@ -265,6 +270,11 @@ class RowHammerTaskEnv(RowHammerDisturbanceEnv):
             out["objective"] = {"type": "target_cell_flip", "bit": ct.target_bit}
         elif ct.objective_type == "pattern_target":
             out["objective"] = {"type": "pattern_target", "mask": ct.target_mask, "value": ct.target_value}
+        elif fam == "hidden_adjacency":
+            # Tier 2b (P25): disclose the victim's own numeric address (real-attacker
+            # knowledge). Bank membership is not computable from it (secret mapper),
+            # so this leaks no adjacency — only the row, which is public geometry.
+            out["objective"] = {"type": "target_row_flip", "target": {"kind": "logical", "addr": ct.target_addr}}
         elif fam in ("hidden_target", "unknown_adjacency", "bounded_sweep"):
             out["objective"] = {"type": "target_row_flip", "target": {"kind": "handle", "id": self._target_handle}}
         else:
@@ -273,14 +283,26 @@ class RowHammerTaskEnv(RowHammerDisturbanceEnv):
                 out["objective"]["target_row"] = ct.target_row
 
         # Target disclosure: exact -> physical coordinates + linear address;
+        # logical_addr -> the victim's numeric linear address only (no coords, P25);
         # handle -> opaque id only; hidden_until_finish -> nothing.
         if self.disclosure.victim == "exact":
             out["target"] = self._physical_target(ct.target_addr)
+        elif self.disclosure.victim == "logical_addr":
+            out["target"] = {"kind": "logical", "addr": ct.target_addr}
         elif self.disclosure.victim in ("row_handle", "cell_handle") and self._target_handle is not None:
             out["target"] = {"kind": "handle", "id": self._target_handle}
 
+        # Candidate disclosure: opaque handles for handle-victim families (Tier 2a),
+        # numeric logical addresses for ``hidden_adjacency`` (Tier 2b). The ordering
+        # matches ``self._compiled.candidates`` in both cases so a fixed seed is
+        # reproducible; the list itself is already role-shuffled by the compiler.
         if self.disclosure.adjacency == "candidate_set":
-            out["candidates"] = [{"kind": "handle", "id": h} for h in self._candidate_handles]
+            if self._candidate_handles:
+                out["candidates"] = [{"kind": "handle", "id": h} for h in self._candidate_handles]
+            elif self._compiled.candidates:
+                out["candidates"] = [
+                    {"kind": "logical", "addr": ct.target_addr + c.offset} for c in self._compiled.candidates
+                ]
         return out
 
     def _physical_target(self, addr: int) -> dict[str, Any]:
