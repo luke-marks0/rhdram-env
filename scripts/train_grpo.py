@@ -382,7 +382,7 @@ def make_multiturn_rollout_func(
             )
             config = RolloutConfig(base_url=base_url, seed=seed, task=task, episode_id=f"grpo_mt_{seed}")
             rollout = asyncio.run(run_training_episode(config, generator, max_turns=max_turns))
-            example = to_grpo_example(rollout, tokenizer)
+            example = to_grpo_example(rollout, tokenizer, enable_thinking=enable_thinking)
             mask = example["completion_mask"]  # 1 = assistant/model token, 0 = tool/env
             logprobs = _logprobs(example["prompt_ids"], example["completion_ids"])
             # Zero logprobs on env/tool tokens, matching TRL's own tool-loop convention

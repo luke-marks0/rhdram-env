@@ -327,11 +327,33 @@ def _drive(
 # --------------------------------------------------------------------------- #
 # Completion mask: transcript -> (prompt_ids, completion_ids, completion_mask)
 # --------------------------------------------------------------------------- #
+def _as_token_ids(out: Any, tokenizer: Any) -> list[int]:
+    """Normalize an ``apply_chat_template`` result to a flat ``list[int]``.
+
+    ``apply_chat_template(tokenize=True)`` is *documented* to return token ids, but real
+    tokenizers vary: some return the templated **string** (tokenize effectively ignored),
+    some a ``BatchEncoding``/dict, some a tensor, some a ``[[...]]`` batch. The host fake
+    tokenizer always returns ``list[int]``, so this only bites against a real model. Force
+    a flat int list here (encoding a returned string with ``add_special_tokens=False`` —
+    in-text special tokens still map to their ids, so it stays prefix-consistent).
+    """
+    if isinstance(out, str):
+        out = tokenizer.encode(out, add_special_tokens=False)
+    elif isinstance(out, dict):
+        out = out.get("input_ids", [])
+    if hasattr(out, "tolist"):  # torch/np tensor
+        out = out.tolist()
+    if out and isinstance(out[0], (list, tuple)):  # unwrap a batch dim [[...]] -> [...]
+        out = out[0]
+    return [int(t) for t in out]
+
+
 def build_masked_completion(
     messages: list[dict[str, str]],
     tokenizer: Any,
     *,
     n_prompt_messages: int,
+    enable_thinking: bool = False,
 ) -> tuple[list[int], list[int], list[int]]:
     """Tokenize a full transcript and mark only assistant spans as trainable.
 
@@ -356,13 +378,23 @@ def build_masked_completion(
         raise ValueError(f"n_prompt_messages {n_prompt_messages} out of range for {len(messages)} messages")
 
     def render(upto: int, add_generation_prompt: bool) -> list[int]:
-        return list(
-            tokenizer.apply_chat_template(
+        # Pass enable_thinking so the prompt/mask render matches how the dataset prompt
+        # was baked (render_prompts); a template that doesn't accept the kwarg (the host
+        # fake, older templates) falls back to rendering without it.
+        try:
+            out = tokenizer.apply_chat_template(
+                messages[:upto],
+                tokenize=True,
+                add_generation_prompt=add_generation_prompt,
+                enable_thinking=enable_thinking,
+            )
+        except TypeError:
+            out = tokenizer.apply_chat_template(
                 messages[:upto],
                 tokenize=True,
                 add_generation_prompt=add_generation_prompt,
             )
-        )
+        return _as_token_ids(out, tokenizer)
 
     prompt_ids = render(n_prompt_messages, add_generation_prompt=True)
     completion_ids: list[int] = []
@@ -391,14 +423,21 @@ def build_masked_completion(
 def to_grpo_example(
     rollout: MultiTurnRollout,
     tokenizer: Any,
+    *,
+    enable_thinking: bool = False,
 ) -> dict[str, Any]:
     """Assemble the ``(prompt, completion, mask, reward)`` GRPO training example.
 
     The trusted trajectory reward is the single scalar for the whole rollout — GRPO's
     group-relative advantage is computed across a group of these, per full rollout.
+    ``enable_thinking`` must match the value used to bake the dataset prompt so the
+    prompt/mask token boundaries line up.
     """
     prompt_ids, completion_ids, completion_mask = build_masked_completion(
-        rollout.messages, tokenizer, n_prompt_messages=len(rollout.prompt_messages)
+        rollout.messages,
+        tokenizer,
+        n_prompt_messages=len(rollout.prompt_messages),
+        enable_thinking=enable_thinking,
     )
     return {
         "prompt_ids": prompt_ids,
