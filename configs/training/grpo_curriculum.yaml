@@ -1,0 +1,159 @@
+# Discovery curriculum + bounded probe shaping (P28) — instance-only training run.
+#
+# This is the curriculum config for training a policy that *discovers* RowHammer
+# adjacency (Tier 2a/2b) rather than reciting a disclosed hint. It orders the task
+# families by increasing difficulty and turns on the one narrowly-bounded reward
+# shaping term that makes the sparse discovery reward learnable in practice.
+#
+#   python3 -B scripts/train_grpo.py --config configs/training/grpo_curriculum.yaml
+#
+# GATE (P28.3): before spending any instance time, the P26 reference policy must clear
+# every stage's `reference_min_success` on the host (no torch):
+#
+#   python3 -m unittest tests.test_curriculum
+#
+# Re-run that after ANY curriculum edit. A band the deterministic reference cannot
+# solve within budget will never be solved by GRPO either — cheap to find out first.
+
+model:
+  name: Qwen/Qwen3-8B
+  enable_thinking: false
+  torch_dtype: bfloat16
+  attn_implementation: flash_attention_2
+
+peft:
+  enabled: true
+  r: 32
+  lora_alpha: 64
+  lora_dropout: 0.05
+  target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+
+env:
+  launch_server: true
+  server_host: 127.0.0.1
+  server_mode: production
+  max_concurrent_envs: 16
+  concurrency: 16
+  max_steps: 4                # single-shot fallback cap; multi-turn uses rollout.max_turns
+
+# Discovery needs genuine turn-by-turn interaction (probe -> read timing digest ->
+# narrow candidates -> hammer); a single disclosed HAMMER can't solve it. Requires a
+# TRL build exposing GRPOTrainer(rollout_func=...); the trainer FAILS CLOSED otherwise
+# (never silently single-shot — SPEC §2). See IMPLEMENTATION_PLAN_V3 §2 open decision #1.
+rollout:
+  multi_turn: true
+  # A full pass on the widest band (N=64) is ~2 tool calls/candidate (warm + probe) +
+  # a confirmation hammer ≈ 130 turns; keep the cap at the hard tool_calls budget (200)
+  # so the activation budget — not the turn cap — is what binds. Narrower bands finish
+  # in far fewer turns.
+  max_turns: 200
+
+# The curriculum (P28.1). Ordered stages, easiest first; the trainer materializes the
+# dataset in this order. `reference_min_success` is the P26 gate re-checked on the host
+# by tests/test_curriculum.py. Budgets live in each task config (calibrated by P26).
+#
+#   Tier 0 known-target  ->  Tier 2a easy/med/hard  ->  Tier 2b easy/med/hard
+#
+# Tier 0 discloses the exact aggressors + threshold, so it is a warm-up that teaches
+# well-formed HAMMER emission before the policy must *discover* adjacency by timing.
+curriculum:
+  - name: tier0_known_target
+    tier: tier0
+    band: ""
+    tasks: [configs/tasks/known_target_anybit.yaml]
+    seeds: [1, 2, 3, 4, 5, 6, 7, 8]
+    multi_turn: true
+    reference_min_success: 1.0        # the reference hammer saturates known-target
+
+  - name: tier2a_bounded_sweep_easy
+    tier: tier2a
+    band: easy
+    tasks: [configs/tasks/bounded_sweep_easy.yaml]
+    seeds: [1, 2, 3, 4, 5, 6, 7, 8]
+    multi_turn: true
+    reference_min_success: 1.0
+
+  - name: tier2a_bounded_sweep_medium
+    tier: tier2a
+    band: medium
+    tasks: [configs/tasks/bounded_sweep_medium.yaml]
+    seeds: [1, 2, 3, 4, 5, 6, 7, 8]
+    multi_turn: true
+    reference_min_success: 1.0
+
+  - name: tier2a_bounded_sweep_hard
+    tier: tier2a
+    band: hard
+    tasks: [configs/tasks/bounded_sweep_hard.yaml]
+    seeds: [1, 2, 3, 4]
+    multi_turn: true
+    reference_min_success: 1.0
+
+  - name: tier2b_hidden_adjacency_easy
+    tier: tier2b
+    band: easy
+    tasks: [configs/tasks/hidden_adjacency_easy.yaml]
+    seeds: [1, 2, 3, 4, 5, 6, 7, 8]
+    multi_turn: true
+    reference_min_success: 1.0
+
+  - name: tier2b_hidden_adjacency_medium
+    tier: tier2b
+    band: medium
+    tasks: [configs/tasks/hidden_adjacency_medium.yaml]
+    seeds: [1, 2, 3, 4, 5, 6, 7, 8]
+    multi_turn: true
+    reference_min_success: 1.0
+
+  - name: tier2b_hidden_adjacency_hard
+    tier: tier2b
+    band: hard
+    tasks: [configs/tasks/hidden_adjacency_hard.yaml]
+    seeds: [1, 2, 3, 4]
+    multi_turn: true
+    reference_min_success: 1.0
+
+# Reward (SPEC §9). success_weight is the trusted, sparse episode reward (1.0 iff a
+# real flip satisfies the objective). probe_shaping_weight adds the bounded, training-
+# only probe-decisiveness bonus (rowhammer_env.llm.shaping.probe_shaping_reward): a
+# small dense signal for making a DECISIVE same/different-bank measurement, derived only
+# from the trusted timing digest, OUTCOME-NEUTRAL (same and different bank earn the
+# same), and strictly below success_weight so probing can never earn as much as one
+# real flip. It vanishes from eval/benchmark scoring (which uses success only). Set to
+# 0.0 to disable. Must be < success_weight (the trainer fails closed otherwise).
+reward:
+  success_weight: 1.0
+  probe_shaping_weight: 0.2
+
+wandb:
+  enabled: true
+  project: rowhammer-grpo
+  run_name: qwen3-8b-discovery-curriculum
+  num_completions_to_print: 8
+  max_table_rows: 32
+
+grpo:
+  output_dir: runs/grpo_curriculum
+  learning_rate: 1.0e-5
+  lr_scheduler_type: cosine
+  warmup_ratio: 0.03
+  max_grad_norm: 1.0
+  beta: 0.0
+  num_generations: 8
+  per_device_train_batch_size: 8
+  gradient_accumulation_steps: 8
+  num_train_epochs: 1
+  max_steps: 400
+  max_prompt_length: 2048         # discovery prompts disclose the candidate window
+  max_completion_length: 256
+  temperature: 1.0
+  top_p: 1.0
+  bf16: true
+  gradient_checkpointing: true
+  logging_steps: 1
+  save_steps: 50
+  report_to: none
+  seed: 42
+  use_vllm: true
+  vllm_mode: colocate
+  vllm_gpu_memory_utilization: 0.3

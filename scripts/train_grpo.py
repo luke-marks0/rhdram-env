@@ -44,6 +44,10 @@ import yaml
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from rowhammer_env.llm.curriculum import (  # noqa: E402  (torch-free)
+    curriculum_task_seed_pairs,
+    load_curriculum,
+)
 from rowhammer_env.llm.grpo_env import (  # noqa: E402
     RolloutItem,
     build_messages,
@@ -60,6 +64,10 @@ from rowhammer_env.llm.multiturn_rollout import (  # noqa: E402  (torch-free)
     to_grpo_example,
 )
 from rowhammer_env.llm.rollout import RolloutConfig  # noqa: E402
+from rowhammer_env.llm.shaping import (  # noqa: E402  (torch-free)
+    probe_shaping_reward,
+    validate_shaping_weight,
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -92,26 +100,39 @@ def resolve_task(entry: dict) -> tuple[dict | None, str]:
 # --------------------------------------------------------------------------- #
 # Dataset: one row per (task, seed). Prompts baked from the disclosed reset obs.
 # --------------------------------------------------------------------------- #
-async def _build_rows(base_url: str, task_entries: list[dict], seeds: list[int]) -> list[dict]:
+def task_seed_pairs(cfg: dict, task_entries: list[dict], seeds: list[int]) -> list[tuple[dict, int]]:
+    """Ordered ``(task_entry, seed)`` pairs the dataset is built from.
+
+    When the config carries a ``curriculum:`` block (P28), the pairs follow the
+    curriculum's declared stage order (Tier 0 → 2a easy/med/hard → 2b easy/med/hard),
+    each stage with its own seeds — so the trainer meets the families easiest-first.
+    Otherwise it is the plain ``tasks × seeds`` cartesian product (the legacy path).
+    """
+    if cfg.get("curriculum"):
+        stages = load_curriculum(cfg)
+        return [({"config": path}, seed) for path, seed in curriculum_task_seed_pairs(stages)]
+    return [(entry, seed) for entry in task_entries for seed in seeds]
+
+
+async def _build_rows(base_url: str, pairs: list[tuple[dict, int]]) -> list[dict]:
     rows: list[dict] = []
-    for entry in task_entries:
+    for entry, seed in pairs:
         task, label = resolve_task(entry)
-        for seed in seeds:
-            metadata = await disclose_metadata(base_url, seed, task)
-            rows.append(
-                {
-                    "messages": build_messages(metadata),
-                    "seed": int(seed),
-                    "task_json": json.dumps(task) if task is not None else "",
-                    "task_id": str(metadata.get("task_id") or label),
-                    "family": str(metadata.get("task_family") or label),
-                }
-            )
+        metadata = await disclose_metadata(base_url, seed, task)
+        rows.append(
+            {
+                "messages": build_messages(metadata),
+                "seed": int(seed),
+                "task_json": json.dumps(task) if task is not None else "",
+                "task_id": str(metadata.get("task_id") or label),
+                "family": str(metadata.get("task_family") or label),
+            }
+        )
     return rows
 
 
-def build_rows(base_url: str, task_entries: list[dict], seeds: list[int]) -> list[dict]:
-    return asyncio.run(_build_rows(base_url, task_entries, seeds))
+def build_rows(base_url: str, pairs: list[tuple[dict, int]]) -> list[dict]:
+    return asyncio.run(_build_rows(base_url, pairs))
 
 
 def render_prompts(rows: list[dict], tokenizer, enable_thinking: bool) -> None:
@@ -283,7 +304,16 @@ class HFCompletionGenerator:
 
 
 def make_multiturn_rollout_func(
-    base_url, tokenizer, model, prompt_to_meta, *, max_turns, max_new_tokens, enable_thinking, temperature
+    base_url,
+    tokenizer,
+    model,
+    prompt_to_meta,
+    *,
+    max_turns,
+    max_new_tokens,
+    enable_thinking,
+    temperature,
+    emit_probe_shaping=False,
 ):
     """A TRL GRPO ``rollout_func`` that runs a real multi-turn episode per prompt.
 
@@ -298,11 +328,16 @@ def make_multiturn_rollout_func(
     recovered per prompt from ``prompt_to_meta`` (built from the pre-rendered dataset
     rows; every generation of a given prompt shares its seed/task). The returned dict
     uses TRL's keys ``prompt_ids``/``completion_ids``/``logprobs`` plus a token-level
-    ``completion_mask`` (assistant spans only) and a ``trusted_reward`` extra column the
-    reward function reads. The assistant-span mask is returned under TRL's ``env_mask``
-    key (1 = model tokens, 0 = external/tool tokens); a ``completion_mask`` key would be
-    ignored. A prompt missing from the lookup fails **loudly** (never a silent
-    wrong-episode reward).
+    ``completion_mask`` (assistant spans only) and two extra columns the reward
+    functions read: ``trusted_reward`` (the sparse episode reward) and ``probe_shaping``
+    (the bounded P28 probe-decisiveness bonus, computed from the rollout's trusted
+    timing digests — see :mod:`rowhammer_env.llm.shaping`). The assistant-span mask is
+    returned under TRL's ``env_mask`` key (1 = model tokens, 0 = external/tool tokens);
+    a ``completion_mask`` key would be ignored. A prompt missing from the lookup fails
+    **loudly** (never a silent wrong-episode reward).
+
+    Returns ``(rollout_func, reward_trusted, reward_probe_shaping)``; the caller adds
+    ``reward_probe_shaping`` (with its own weight) only when shaping is enabled.
     """
 
     def _logprobs(prompt_ids: list[int], completion_ids: list[int]) -> list[float]:
@@ -333,6 +368,7 @@ def make_multiturn_rollout_func(
         env_mask_b: list[list[int]] = []
         logprobs_b: list[list[float]] = []
         trusted_reward_b: list[float] = []
+        probe_shaping_b: list[float] = []
         for prompt in prompts:
             if prompt not in prompt_to_meta:
                 raise RuntimeError(
@@ -357,7 +393,11 @@ def make_multiturn_rollout_func(
             env_mask_b.append(mask)
             logprobs_b.append(logprobs)
             trusted_reward_b.append(example["reward"])
-        return {
+            # Bounded, outcome-neutral shaping computed here (torch-free) from the
+            # rollout's trusted timing digests — never from completion text (SPEC §9).
+            if emit_probe_shaping:
+                probe_shaping_b.append(probe_shaping_reward(rollout))
+        out = {
             "prompt_ids": prompt_ids_b,
             "completion_ids": completion_ids_b,
             # TRL 1.8 consumes env_mask (extra_fields.pop("env_mask")): 1 = model tokens,
@@ -369,6 +409,11 @@ def make_multiturn_rollout_func(
             "logprobs": logprobs_b,
             "trusted_reward": trusted_reward_b,
         }
+        # Only surface the shaping column when it's actually used, so the off-path
+        # returns exactly the P27 dict shape (no unused extra rollout columns).
+        if emit_probe_shaping:
+            out["probe_shaping"] = probe_shaping_b
+        return out
 
     def reward_trusted(completions, trusted_reward=None, **_):
         # The reward is the trusted episode reward carried from the rollout — not
@@ -377,8 +422,17 @@ def make_multiturn_rollout_func(
             return [0.0] * len(completions)
         return [float(r) for r in trusted_reward]
 
+    def reward_probe_shaping(completions, probe_shaping=None, **_):
+        # The bounded P28 probe-decisiveness bonus, carried from the rollout (already
+        # computed from the trusted timing digest). Read verbatim; the trainer scales it
+        # by probe_shaping_weight (kept strictly below success_weight, SPEC §9).
+        if probe_shaping is None:
+            return [0.0] * len(completions)
+        return [float(r) for r in probe_shaping]
+
     reward_trusted.__name__ = "env_success_multiturn"
-    return rollout_func, reward_trusted
+    reward_probe_shaping.__name__ = "probe_shaping"
+    return rollout_func, reward_trusted, reward_probe_shaping
 
 
 # --------------------------------------------------------------------------- #
@@ -429,8 +483,8 @@ def setup_wandb(cfg: dict, grpo_cfg: dict) -> tuple[list, bool]:
 # --------------------------------------------------------------------------- #
 # Dry run: no model, just prove the data + reward pipeline end-to-end.
 # --------------------------------------------------------------------------- #
-def dry_run(base_url: str, task_entries: list[dict], seeds: list[int], concurrency: int, max_steps: int) -> int:
-    rows = build_rows(base_url, task_entries, seeds)
+def dry_run(base_url: str, pairs: list[tuple[dict, int]], concurrency: int, max_steps: int) -> int:
+    rows = build_rows(base_url, pairs)
     print(f"built {len(rows)} task-instance rows")
     print("--- sample prompt (messages) ---")
     print(json.dumps(rows[0]["messages"], indent=2)[:2000])
@@ -464,6 +518,13 @@ def main() -> int:
     env_cfg = cfg.get("env", {})
     task_entries = cfg.get("tasks") or [{"family": "known_target_anybit"}]
     seeds = [int(s) for s in cfg.get("seeds", list(range(1, 9)))]
+    # Ordered dataset (task, seed) pairs — curriculum order (P28) when a curriculum:
+    # block is present, else the plain tasks x seeds cartesian product.
+    pairs = task_seed_pairs(cfg, task_entries, seeds)
+    if cfg.get("curriculum"):
+        stages = load_curriculum(cfg)
+        plan = " -> ".join(f"{s.name}({len(s.tasks)}x{len(s.seeds)})" for s in stages)
+        print(f"curriculum ({len(stages)} stages): {plan}")
     concurrency = int(env_cfg.get("concurrency", env_cfg.get("max_concurrent_envs", 8)))
     max_steps = int(env_cfg.get("max_steps", 4))
     rollout_cfg = cfg.get("rollout", {})
@@ -488,7 +549,7 @@ def main() -> int:
 
     try:
         if args.dry_run:
-            return dry_run(base_url, task_entries, seeds, concurrency, max_steps)
+            return dry_run(base_url, pairs, concurrency, max_steps)
 
         # Heavy training imports live here so --dry-run needs no torch/trl.
         from datasets import Dataset
@@ -504,7 +565,7 @@ def main() -> int:
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
 
-        rows = build_rows(base_url, task_entries, seeds)
+        rows = build_rows(base_url, pairs)
         render_prompts(rows, tokenizer, enable_thinking)
         dataset = Dataset.from_list([{k: r[k] for k in ("prompt", "seed", "task_json", "task_id", "family")} for r in rows])
         print(f"dataset: {len(dataset)} task-instance prompts")
@@ -547,12 +608,21 @@ def main() -> int:
             base_url, concurrency=concurrency, max_steps=max_steps, record=wandb_enabled
         )
         reward_cfg = cfg.get("reward", {})
+        success_weight = float(reward_cfg.get("success_weight", 1.0))
+        probe_shaping_weight = float(reward_cfg.get("probe_shaping_weight", 0.0))
+        # Bounded, training-only probe shaping (P28) — multi-turn only. Fail closed if
+        # the weight could rival a real success (SPEC §9); shaping must never *be*
+        # success. shaping_on gates whether the extra reward func is attached at all, so
+        # it provably vanishes from any config that doesn't ask for it (e.g. eval).
+        shaping_on = multi_turn and probe_shaping_weight > 0.0
+        if shaping_on:
+            validate_shaping_weight(success_weight, probe_shaping_weight)
         if multi_turn:
-            # One trusted reward func for the whole trajectory (no format shaping — the
-            # rollout already enforces well-formed turns by construction).
-            reward_weights = [float(reward_cfg.get("success_weight", 1.0))]
+            # The trusted trajectory reward (no format shaping — the rollout enforces
+            # well-formed turns by construction), plus the bounded probe bonus if on.
+            reward_weights = [success_weight] + ([probe_shaping_weight] if shaping_on else [])
         else:
-            reward_weights = [float(reward_cfg.get("success_weight", 1.0)), float(reward_cfg.get("format_weight", 0.1))]
+            reward_weights = [success_weight, float(reward_cfg.get("format_weight", 0.1))]
 
         # Only forward keys GRPOConfig actually defines, so a newer/older TRL
         # doesn't reject the file (fail loud on genuinely unknown keys instead).
@@ -591,7 +661,7 @@ def main() -> int:
                 r["prompt"]: (int(r["seed"]), json.loads(r["task_json"]) if r["task_json"] else None)
                 for r in rows
             }
-            rollout_func, reward_trusted = make_multiturn_rollout_func(
+            rollout_func, reward_trusted, reward_probe_shaping = make_multiturn_rollout_func(
                 base_url,
                 tokenizer,
                 model,
@@ -600,10 +670,18 @@ def main() -> int:
                 max_new_tokens=int(grpo_cfg.get("max_completion_length", 256)),
                 enable_thinking=enable_thinking,
                 temperature=float(grpo_cfg.get("temperature", 1.0)),
+                emit_probe_shaping=shaping_on,
             )
-            print(f"multi-turn GRPO rollout enabled (max_turns={max_turns})")
+            # Reward funcs must line up positionally with reward_weights above: trusted
+            # success first, the bounded probe bonus second iff shaping is on.
+            reward_funcs = [reward_trusted] + ([reward_probe_shaping] if shaping_on else [])
+            print(
+                f"multi-turn GRPO rollout enabled (max_turns={max_turns}"
+                + (f", probe_shaping_weight={probe_shaping_weight}" if shaping_on else "")
+                + ")"
+            )
             trainer = GRPOTrainer(
-                reward_funcs=[reward_trusted],
+                reward_funcs=reward_funcs,
                 rollout_func=rollout_func,
                 **trainer_kwargs,
             )
