@@ -308,8 +308,15 @@ def check_non_leakage() -> None:
         surfaces = [obs.metadata, obs.feedback]
         surfaces.append(env.step(Phase2Action(tool="dram.info", args={})).metadata)
         hammer = env.step(Phase2Action(tool="dram.issue", args={"commands": [{"op": "RD", "addr": {"kind": "logical", "addr": 0}}]}))
-        if hammer.feedback.get("trace_tail") not in (None, []):
-            raise SystemExit(f"{family}: summarized feedback leaked a coordinate trace")
+        # The disclosed trace must never carry a physical coordinate, whatever the
+        # feedback level: ``hidden_target`` (summarized_counts) echoes no trace at
+        # all, while ``unknown_adjacency`` (full_trace, since P22 — so the policy can
+        # probe the bank-conflict timing channel) echoes op/clk/type_id/row_hit with
+        # every COORD_KEY stripped by ``Disclosure.project_trace``.
+        for event in hammer.feedback.get("trace_tail") or []:
+            leaked = [k for k in COORD_KEYS if k in event]
+            if leaked:
+                raise SystemExit(f"{family}: feedback trace leaked coordinate keys {leaked}")
         surfaces.append(hammer.feedback)
         rejected = env.step(Phase2Action(tool="dram.read", args={
             "addr": {"kind": "physical", "channel": 0, "rank": 0, "bankgroup": 0, "bank": 0, "row": secret_row, "column": 0},
