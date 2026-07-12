@@ -215,12 +215,30 @@ class HFCompletionGenerator:
     host without them.
     """
 
-    def __init__(self, model, tokenizer, *, max_new_tokens: int, enable_thinking: bool, temperature: float) -> None:
+    def __init__(
+        self,
+        model,
+        tokenizer,
+        *,
+        max_new_tokens: int,
+        enable_thinking: bool,
+        temperature: float,
+        top_p: float = 0.8,
+        top_k: int = 20,
+    ) -> None:
         self.model = model
         self.tokenizer = tokenizer
-        self.max_new_tokens = int(max_new_tokens)
+        # Per-TURN cap. One tool call is short; a whole 256-token turn means the model
+        # never stopped. Cap per-turn tokens modestly so a rambling turn is bounded and
+        # the multi-turn budget isn't spent in one turn.
+        self.max_new_tokens = min(int(max_new_tokens), 160)
         self.enable_thinking = bool(enable_thinking)
         self.temperature = float(temperature)
+        # Nucleus + top-k sampling (Qwen non-thinking defaults). Without these, raw
+        # temperature=1.0 sampling produces high-entropy garbage that never emits a stop
+        # token — the 256-token clipped ramble seen on the first instance runs.
+        self.top_p = float(top_p)
+        self.top_k = int(top_k)
 
     def __call__(self, messages, observation, transcript):
         del observation, transcript
@@ -233,14 +251,33 @@ class HFCompletionGenerator:
         except TypeError:
             prompt = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
-        with torch.no_grad():
-            out = self.model.generate(
-                **inputs,
-                max_new_tokens=self.max_new_tokens,
-                do_sample=True,
-                temperature=self.temperature,
-                pad_token_id=self.tokenizer.pad_token_id,
-            )
+        # Generating from a model that is mid-training is the trap: gradient
+        # checkpointing forces use_cache=False and .train() leaves dropout on, and that
+        # no-KV-cache path yields corrupt (garbage/degenerate) tokens. Switch to eval +
+        # KV cache + GC off *only* for the generate, then restore training state exactly.
+        was_training = self.model.training
+        gc_enabled = bool(getattr(self.model, "is_gradient_checkpointing", False))
+        self.model.eval()
+        if gc_enabled and hasattr(self.model, "gradient_checkpointing_disable"):
+            self.model.gradient_checkpointing_disable()
+        try:
+            with torch.no_grad():
+                out = self.model.generate(
+                    **inputs,
+                    max_new_tokens=self.max_new_tokens,
+                    do_sample=True,
+                    temperature=self.temperature,
+                    top_p=self.top_p,
+                    top_k=self.top_k,
+                    use_cache=True,
+                    eos_token_id=self.tokenizer.eos_token_id,
+                    pad_token_id=self.tokenizer.pad_token_id,
+                )
+        finally:
+            if gc_enabled and hasattr(self.model, "gradient_checkpointing_enable"):
+                self.model.gradient_checkpointing_enable()
+            if was_training:
+                self.model.train()
         gen = out[0][inputs["input_ids"].shape[1] :]
         return self.tokenizer.decode(gen, skip_special_tokens=True)
 
@@ -262,8 +299,10 @@ def make_multiturn_rollout_func(
     rows; every generation of a given prompt shares its seed/task). The returned dict
     uses TRL's keys ``prompt_ids``/``completion_ids``/``logprobs`` plus a token-level
     ``completion_mask`` (assistant spans only) and a ``trusted_reward`` extra column the
-    reward function reads. A prompt missing from the lookup fails **loudly** (never a
-    silent wrong-episode reward).
+    reward function reads. The assistant-span mask is returned under TRL's ``env_mask``
+    key (1 = model tokens, 0 = external/tool tokens); a ``completion_mask`` key would be
+    ignored. A prompt missing from the lookup fails **loudly** (never a silent
+    wrong-episode reward).
     """
 
     def _logprobs(prompt_ids: list[int], completion_ids: list[int]) -> list[float]:
@@ -275,8 +314,14 @@ def make_multiturn_rollout_func(
         import torch
 
         ids = torch.tensor([prompt_ids + completion_ids], device=model.device)
-        with torch.no_grad():
-            logits = model(ids).logits[0]
+        was_training = model.training
+        model.eval()  # match the eval-mode sampling distribution (no dropout)
+        try:
+            with torch.no_grad():
+                logits = model(ids).logits[0]
+        finally:
+            if was_training:
+                model.train()
         logp = torch.log_softmax(logits.float(), dim=-1)
         start = len(prompt_ids)
         return [float(logp[start + t - 1, tok]) for t, tok in enumerate(completion_ids)]
@@ -285,7 +330,7 @@ def make_multiturn_rollout_func(
         del trainer  # the model/tokenizer are captured; the trainer handle is unused
         prompt_ids_b: list[list[int]] = []
         completion_ids_b: list[list[int]] = []
-        completion_mask_b: list[list[int]] = []
+        env_mask_b: list[list[int]] = []
         logprobs_b: list[list[float]] = []
         trusted_reward_b: list[float] = []
         for prompt in prompts:
@@ -302,15 +347,25 @@ def make_multiturn_rollout_func(
             config = RolloutConfig(base_url=base_url, seed=seed, task=task, episode_id=f"grpo_mt_{seed}")
             rollout = asyncio.run(run_training_episode(config, generator, max_turns=max_turns))
             example = to_grpo_example(rollout, tokenizer)
+            mask = example["completion_mask"]  # 1 = assistant/model token, 0 = tool/env
+            logprobs = _logprobs(example["prompt_ids"], example["completion_ids"])
+            # Zero logprobs on env/tool tokens, matching TRL's own tool-loop convention
+            # ([0.0] * tool_length); they're excluded from the loss by env_mask anyway.
+            logprobs = [lp if m == 1 else 0.0 for lp, m in zip(logprobs, mask)]
             prompt_ids_b.append(example["prompt_ids"])
             completion_ids_b.append(example["completion_ids"])
-            completion_mask_b.append(example["completion_mask"])
-            logprobs_b.append(_logprobs(example["prompt_ids"], example["completion_ids"]))
+            env_mask_b.append(mask)
+            logprobs_b.append(logprobs)
             trusted_reward_b.append(example["reward"])
         return {
             "prompt_ids": prompt_ids_b,
             "completion_ids": completion_ids_b,
-            "completion_mask": completion_mask_b,
+            # TRL 1.8 consumes env_mask (extra_fields.pop("env_mask")): 1 = model tokens,
+            # 0 = external/tool tokens — exactly our assistant-span mask. A returned
+            # "completion_mask" would be IGNORED (TRL defaults it to all-ones), so the
+            # tool-result/observation tokens must be masked via env_mask or they enter
+            # the loss.
+            "env_mask": env_mask_b,
             "logprobs": logprobs_b,
             "trusted_reward": trusted_reward_b,
         }
