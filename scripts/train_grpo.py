@@ -60,9 +60,11 @@ from rowhammer_env.llm.grpo_env import (  # noqa: E402
     summarize_actions,
 )
 from rowhammer_env.llm.multiturn_rollout import (  # noqa: E402  (torch-free)
+    render_tool_call,
     run_training_episode,
     to_grpo_example,
 )
+from rowhammer_env.llm.policies import ToolCall  # noqa: E402  (torch-free)
 from rowhammer_env.llm.rollout import RolloutConfig  # noqa: E402
 from rowhammer_env.llm.shaping import (  # noqa: E402  (torch-free)
     probe_shaping_reward,
@@ -236,6 +238,10 @@ class HFCompletionGenerator:
     host without them.
     """
 
+    # A graceful, parseable end-of-episode turn. Emitted (instead of generating) when the
+    # running transcript has no context room left for another turn — see __call__.
+    _FINISH_TURN = render_tool_call(ToolCall("episode.finish", {}))
+
     def __init__(
         self,
         model,
@@ -244,22 +250,44 @@ class HFCompletionGenerator:
         max_new_tokens: int,
         enable_thinking: bool,
         temperature: float,
-        top_p: float = 0.8,
+        top_p: float | None = None,
         top_k: int = 20,
+        max_turn_tokens: int | None = None,
+        max_prompt_tokens: int | None = None,
+        response_margin: int = 32,
     ) -> None:
         self.model = model
         self.tokenizer = tokenizer
-        # Per-TURN cap. One tool call is short; a whole 256-token turn means the model
-        # never stopped. Cap per-turn tokens modestly so a rambling turn is bounded and
-        # the multi-turn budget isn't spent in one turn.
-        self.max_new_tokens = min(int(max_new_tokens), 160)
         self.enable_thinking = bool(enable_thinking)
+        # Per-TURN generation cap. A non-thinking turn is one short tool call (~80 tokens),
+        # so 160 bounds a rambling turn without spending the whole multi-turn budget at
+        # once. A THINKING turn must fit the entire <think>...</think> reasoning *plus* the
+        # tool call, so a 160-token cap would truncate the reasoning mid-thought and the
+        # turn would never emit a parseable call. Honour an explicit max_turn_tokens; else
+        # default by mode (generous when thinking).
+        if max_turn_tokens is not None:
+            self.max_new_tokens = int(max_turn_tokens)
+        elif self.enable_thinking:
+            self.max_new_tokens = max(int(max_new_tokens), 1024)
+        else:
+            self.max_new_tokens = min(int(max_new_tokens), 160)
         self.temperature = float(temperature)
-        # Nucleus + top-k sampling (Qwen non-thinking defaults). Without these, raw
-        # temperature=1.0 sampling produces high-entropy garbage that never emits a stop
-        # token — the 256-token clipped ramble seen on the first instance runs.
-        self.top_p = float(top_p)
+        # Nucleus + top-k sampling. Qwen's own guidance differs by mode: thinking wants a
+        # wider nucleus (~0.95) — greedy/tight sampling makes reasoning degenerate into
+        # repetition — while non-thinking uses ~0.8. Default per mode; overridable.
+        self.top_p = float(top_p) if top_p is not None else (0.95 if self.enable_thinking else 0.8)
         self.top_k = int(top_k)
+        # Hard context budget. An untrained policy that never emits episode.finish grows
+        # the transcript every turn until the rendered prompt reaches the model's
+        # positional limit (Qwen3-8B: max_position_embeddings=40960); generate() then runs
+        # past the window, warns ("exceeded the model's predefined maximum length"), and
+        # returns corrupt tokens (and the downstream logprob/loss forwards blow up too).
+        # Cap the running prompt: leave room for this turn's tokens, and stop the episode
+        # rather than overflow. Default to the model's own positional limit; a training run
+        # will usually set rollout.max_prompt_tokens lower to bound step memory.
+        cfg_ctx = getattr(getattr(model, "config", None), "max_position_embeddings", None)
+        self.max_prompt_tokens = int(max_prompt_tokens or cfg_ctx or 32768)
+        self.response_margin = int(response_margin)
 
     def __call__(self, messages, observation, transcript):
         del observation, transcript
@@ -272,6 +300,15 @@ class HFCompletionGenerator:
         except TypeError:
             prompt = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
+        # Context-budget guard: never generate past the positional window. If there is no
+        # room for a meaningful turn, end the episode gracefully with a parseable
+        # episode.finish (the trajectory keeps whatever reward it has accrued) instead of
+        # overflowing the model. Otherwise clamp this turn to the room that remains.
+        prompt_len = int(inputs["input_ids"].shape[1])
+        room = self.max_prompt_tokens - prompt_len - self.response_margin
+        if room <= 0:
+            return self._FINISH_TURN
+        turn_new_tokens = min(self.max_new_tokens, room)
         # Generating from a model that is mid-training is the trap: gradient
         # checkpointing forces use_cache=False and .train() leaves dropout on, and that
         # no-KV-cache path yields corrupt (garbage/degenerate) tokens. Switch to eval +
@@ -285,7 +322,7 @@ class HFCompletionGenerator:
             with torch.no_grad():
                 out = self.model.generate(
                     **inputs,
-                    max_new_tokens=self.max_new_tokens,
+                    max_new_tokens=turn_new_tokens,
                     do_sample=True,
                     temperature=self.temperature,
                     top_p=self.top_p,
@@ -313,6 +350,8 @@ def make_multiturn_rollout_func(
     max_new_tokens,
     enable_thinking,
     temperature,
+    max_turn_tokens=None,
+    max_prompt_tokens=None,
     emit_probe_shaping=False,
 ):
     """A TRL GRPO ``rollout_func`` that runs a real multi-turn episode per prompt.
@@ -378,7 +417,13 @@ def make_multiturn_rollout_func(
                 )
             seed, task = prompt_to_meta[prompt]
             generator = HFCompletionGenerator(
-                model, tokenizer, max_new_tokens=max_new_tokens, enable_thinking=enable_thinking, temperature=temperature
+                model,
+                tokenizer,
+                max_new_tokens=max_new_tokens,
+                enable_thinking=enable_thinking,
+                temperature=temperature,
+                max_turn_tokens=max_turn_tokens,
+                max_prompt_tokens=max_prompt_tokens,
             )
             config = RolloutConfig(base_url=base_url, seed=seed, task=task, episode_id=f"grpo_mt_{seed}")
             rollout = asyncio.run(run_training_episode(config, generator, max_turns=max_turns))
@@ -530,6 +575,15 @@ def main() -> int:
     rollout_cfg = cfg.get("rollout", {})
     multi_turn = bool(rollout_cfg.get("multi_turn", False))
     max_turns = int(rollout_cfg.get("max_turns", 64))
+    # Context budget for the running multi-turn transcript. None → the generator falls
+    # back to the model's own max_position_embeddings (never overflow). Set this lower in
+    # the config to bound per-step memory (the whole prompt+completion enters the loss).
+    max_prompt_tokens = rollout_cfg.get("max_prompt_tokens")
+    max_prompt_tokens = int(max_prompt_tokens) if max_prompt_tokens else None
+    # Per-turn generation cap. None → the generator defaults by mode (generous for
+    # reasoning, tight for tool-only). Set rollout.max_turn_tokens to size a thinking turn.
+    max_turn_tokens = rollout_cfg.get("max_turn_tokens")
+    max_turn_tokens = int(max_turn_tokens) if max_turn_tokens else None
 
     # ---- server: connect to an existing one or launch our own ---------------
     server = None
@@ -670,6 +724,8 @@ def main() -> int:
                 max_new_tokens=int(grpo_cfg.get("max_completion_length", 256)),
                 enable_thinking=enable_thinking,
                 temperature=float(grpo_cfg.get("temperature", 1.0)),
+                max_turn_tokens=max_turn_tokens,
+                max_prompt_tokens=max_prompt_tokens,
                 emit_probe_shaping=shaping_on,
             )
             # Reward funcs must line up positionally with reward_weights above: trusted

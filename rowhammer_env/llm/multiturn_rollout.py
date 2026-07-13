@@ -52,6 +52,13 @@ from .policies import ToolCall, ToolPolicy
 # is an instance-side template concern, not a masking-logic one.
 TOOL_ROLE = "tool"
 
+# The full-trace disclosure emits a per-activation ``trace_tail`` — often 50+ near-identical
+# RD rows (~1-2k tokens) that repeat in EVERY tool turn, bloating each subsequent turn's
+# prompt (slower prefill, more memory, the 2k-token budget spent in a turn or two) while
+# adding no signal the digest doesn't already carry (``acts_delta`` / ``per_addr_hits`` are
+# the discriminators). Cap how many rows are fed back to the model. 0 drops it entirely.
+_MAX_TRACE_TAIL = 4
+
 
 # --------------------------------------------------------------------------- #
 # Generator interface: turn context -> one assistant completion (text)
@@ -83,12 +90,41 @@ def render_tool_call(call: ToolCall) -> str:
     return "```json\n" + body + "\n```"
 
 
+def _trim_trace_tail(feedback: Any, limit: int = _MAX_TRACE_TAIL) -> Any:
+    """Return a copy of ``feedback`` with any ``trace_tail`` list capped to ``limit`` rows.
+
+    Caps a ``trace_tail`` at the feedback top level and inside ``timing_digest`` (the two
+    places the full-trace disclosure emits it), keeping only the *last* ``limit`` rows and
+    recording the original length as ``trace_tail_len`` so the count isn't lost. Copies the
+    dicts it edits — never mutates the observation's own feedback, so the trajectory keeps
+    the full trace and only the text fed back to the model is trimmed.
+    """
+    if not isinstance(feedback, dict):
+        return feedback
+
+    def _cap(container: dict) -> dict:
+        tail = container.get("trace_tail")
+        if not isinstance(tail, list) or len(tail) <= limit:
+            return container
+        out = dict(container)
+        out["trace_tail_len"] = len(tail)
+        out["trace_tail"] = tail[-limit:] if limit > 0 else []
+        return out
+
+    trimmed = _cap(dict(feedback))
+    digest = trimmed.get("timing_digest")
+    if isinstance(digest, dict):
+        trimmed["timing_digest"] = _cap(digest)
+    return trimmed
+
+
 def render_tool_result(observation: Any) -> str:
     """Render the disclosed step observation as the ``tool``-turn text fed back.
 
     Only policy-visible fields — the leakage guard has already stripped hidden
     coordinates from ``feedback``/``last_action`` on the ``step()`` path, so this
-    carries nothing the observation itself doesn't.
+    carries nothing the observation itself doesn't. The verbose ``trace_tail`` is capped
+    (:func:`_trim_trace_tail`) so it doesn't bloat every subsequent turn's prompt.
     """
     payload = {
         "cycle": int(getattr(observation, "cycle", 0) or 0),
@@ -97,7 +133,7 @@ def render_tool_result(observation: Any) -> str:
         "error": getattr(observation, "error", None),
         "last_action": getattr(observation, "last_action", {}) or {},
         "public_counters": getattr(observation, "public_counters", {}) or {},
-        "feedback": getattr(observation, "feedback", {}) or {},
+        "feedback": _trim_trace_tail(getattr(observation, "feedback", {}) or {}),
     }
     return json.dumps(payload, sort_keys=True)
 
@@ -339,13 +375,29 @@ def _as_token_ids(out: Any, tokenizer: Any) -> list[int]:
     """
     if isinstance(out, str):
         out = tokenizer.encode(out, add_special_tokens=False)
-    elif isinstance(out, dict):
-        out = out.get("input_ids", [])
+    else:
+        # BatchEncoding is NOT a dict subclass — iterating it yields its *keys*
+        # ("input_ids", ...), so isinstance(out, dict) misses it. Pull input_ids via the
+        # attribute (BatchEncoding exposes it) or the mapping key (plain dict).
+        ids = getattr(out, "input_ids", None)
+        if ids is None and hasattr(out, "keys") and "input_ids" in out:
+            ids = out["input_ids"]
+        if ids is not None:
+            out = ids
     if hasattr(out, "tolist"):  # torch/np tensor
         out = out.tolist()
     if out and isinstance(out[0], (list, tuple)):  # unwrap a batch dim [[...]] -> [...]
         out = out[0]
     return [int(t) for t in out]
+
+
+def _common_prefix_len(a: list[int], b: list[int]) -> int:
+    """Length of the longest shared leading run of two id sequences."""
+    n = min(len(a), len(b))
+    i = 0
+    while i < n and a[i] == b[i]:
+        i += 1
+    return i
 
 
 def build_masked_completion(
@@ -359,28 +411,55 @@ def build_masked_completion(
 
     Returns ``(prompt_ids, completion_ids, completion_mask)`` where ``completion_mask``
     is ``1`` on tokens authored by an ``assistant`` turn (its content plus the turn-end
-    the model emits) and ``0`` on the interleaved tool-result turns and every piece of
-    chat-template scaffolding (role headers, generation prompts). This is the standard
-    multi-turn-SFT / tool-RL masking so GRPO's loss only covers model-authored tokens.
+    the model emits) and ``0`` on the interleaved tool-result turns and role scaffolding.
+    This is the standard multi-turn-SFT / tool-RL masking so GRPO's loss only covers
+    model-authored tokens.
 
-    Method: render the transcript incrementally with the tokenizer's own
-    ``apply_chat_template`` and diff cumulative token lengths at each message boundary,
-    attributing each new span to the message that produced it. Assistant-header tokens
-    fold into the *preceding* (masked) prompt/tool span via ``add_generation_prompt``,
-    exactly as generation sees them. Depends only on ``apply_chat_template`` — no
-    ``torch`` — so it unit-tests on the host with a fake tokenizer.
+    Method (robust against real chat templates, incl. Qwen3):
 
-    Fails closed (``ValueError``) if the template is not prefix-consistent across turns
-    (a growing transcript that is not a token-prefix of the next): a silently wrong mask
-    would train on the wrong tokens, so it must never be guessed.
+    * The training sequence is the canonical whole-conversation render
+      (``add_generation_prompt=False``) — ``full_ids``.
+    * ``prompt_ids`` is rendered with ``add_generation_prompt=True`` — identical to how
+      ``render_prompts`` bakes the dataset prompt TRL matched on, *including* any
+      generation-only scaffolding a template injects there (e.g. Qwen3's empty
+      ``<think></think>`` under ``enable_thinking=False``). ``completion_ids`` begins where
+      the prompt and ``full_ids`` diverge (their longest common prefix), so the turn-0
+      assistant *header* lives in the prompt (not duplicated) and its generated *content*
+      opens the completion.
+    * Each assistant turn's trainable span is attributed **directly**, not by an
+      append-only diff of the stored transcript. For turn ``i``,
+      ``context = render(messages[:i], add_generation_prompt=True)`` is the exact context
+      the model was conditioned on, and
+      ``with_turn = render(messages[:i+1], add_generation_prompt=False)`` is the stored
+      render through that turn. The authored tokens are ``with_turn`` past its longest
+      common prefix with ``context`` (the shared assistant header + any think
+      scaffolding), and their position in ``full_ids`` is the longest common prefix of
+      ``context`` and ``full_ids``. A verify step confirms the authored tokens appear
+      verbatim at that position in ``full_ids`` before anything is masked.
+
+    This never assumes the stored transcript is prefix-consistent turn to turn — which
+    Qwen3 is **not**: under ``enable_thinking=False`` it attaches an empty
+    ``<think></think>`` to the *last* assistant turn of a render but strips it from
+    earlier ones, so appending a later turn rewrites an earlier turn's tokens. The old
+    incremental diff fails closed on exactly that; anchoring per turn on the generation
+    prompt sidesteps it because the message *before* an assistant turn is always a
+    tool/user result (never a rewritten assistant), keeping the context a clean anchor.
+    Using the common prefix (not a strict one) also covers the dual case — scaffolding
+    the generation prompt injects that the *stored* turn drops.
+
+    Depends only on ``apply_chat_template`` — no ``torch`` — so it unit-tests on the host
+    with a fake tokenizer. Still fails closed (``ValueError``) on a genuinely pathological
+    template whose authored tokens do not appear verbatim at the anchored position in
+    ``full_ids`` (e.g. one that rewrites earlier tokens as the transcript grows), since a
+    silently wrong mask would train the wrong tokens.
     """
     if not 0 <= n_prompt_messages <= len(messages):
         raise ValueError(f"n_prompt_messages {n_prompt_messages} out of range for {len(messages)} messages")
 
     def render(upto: int, add_generation_prompt: bool) -> list[int]:
-        # Pass enable_thinking so the prompt/mask render matches how the dataset prompt
-        # was baked (render_prompts); a template that doesn't accept the kwarg (the host
-        # fake, older templates) falls back to rendering without it.
+        # Pass enable_thinking so the prompt render matches how the dataset prompt was
+        # baked (render_prompts); a template that doesn't accept the kwarg (the host fake,
+        # older templates) falls back to rendering without it.
         try:
             out = tokenizer.apply_chat_template(
                 messages[:upto],
@@ -396,28 +475,31 @@ def build_masked_completion(
             )
         return _as_token_ids(out, tokenizer)
 
-    prompt_ids = render(n_prompt_messages, add_generation_prompt=True)
-    completion_ids: list[int] = []
-    completion_mask: list[int] = []
-    prev = prompt_ids
+    full_ids = render(len(messages), add_generation_prompt=False)
+    full_mask: list[int] = [0] * len(full_ids)
     for i in range(n_prompt_messages, len(messages)):
-        role = messages[i].get("role")
-        # End the render ready for the *next* assistant turn's header when one follows,
-        # so that (masked) header attaches to this non-assistant span, not the next
-        # assistant span — matching how the model is prompted to generate.
-        next_is_assistant = (i + 1 < len(messages)) and messages[i + 1].get("role") == "assistant"
-        cur = render(i + 1, add_generation_prompt=next_is_assistant)
-        if cur[: len(prev)] != prev:
+        if messages[i].get("role") != "assistant":
+            continue
+        context = render(i, add_generation_prompt=True)
+        with_turn = render(i + 1, add_generation_prompt=False)
+        # Authored tokens = the stored render past the header/scaffolding it shares with
+        # the generation prompt; their anchor = where that context diverges from full_ids.
+        authored = with_turn[_common_prefix_len(context, with_turn) :]
+        start = _common_prefix_len(context, full_ids)
+        end = start + len(authored)
+        if full_ids[start:end] != authored:
             raise ValueError(
-                "chat template is not prefix-consistent across turns; cannot build a "
-                "reliable token-level completion mask"
+                "assistant turn does not align to the whole-conversation render; cannot "
+                "build a reliable token-level completion mask"
             )
-        span = cur[len(prev) :]
-        trainable = 1 if role == "assistant" else 0
-        completion_ids.extend(span)
-        completion_mask.extend([trainable] * len(span))
-        prev = cur
-    return prompt_ids, completion_ids, completion_mask
+        for t in range(start, end):
+            full_mask[t] = 1
+
+    # Prompt = the model's turn-0 context (matches the baked dataset prompt); split the
+    # completion at where the prompt and the full render first diverge.
+    prompt_ids = render(n_prompt_messages, add_generation_prompt=True)
+    split = _common_prefix_len(prompt_ids, full_ids)
+    return prompt_ids, full_ids[split:], full_mask[split:]
 
 
 def to_grpo_example(

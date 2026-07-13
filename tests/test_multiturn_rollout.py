@@ -202,6 +202,29 @@ class _FakeChatTokenizer:
         return {v: k for k, v in self._vocab.items()}[token_id]
 
 
+class _ThinkInjectingTokenizer(_FakeChatTokenizer):
+    """Reproduces Qwen3 under ``enable_thinking=False``: the generation prompt injects an
+    empty ``<think></think>`` block that stored assistant messages do NOT carry.
+
+    This is exactly what tripped the naive incremental diff — ``render(prompt,
+    add_generation_prompt=True)`` is not a token-prefix of the fuller stored transcript.
+    """
+
+    def apply_chat_template(self, messages, tokenize=True, add_generation_prompt=False, enable_thinking=True):
+        toks: list[str] = []
+        for m in messages:
+            toks.append(f"<|{m['role']}|>")
+            toks.extend(str(m["content"]).split())
+            toks.append("<|end|>")
+        if add_generation_prompt:
+            toks.append("<|assistant|>")
+            if not enable_thinking:  # ephemeral empty think block, generation-prompt only
+                toks += ["<think>", "</think>"]
+        if not tokenize:
+            return " ".join(toks)
+        return [self._id(t) for t in toks]
+
+
 class _NonPrefixTokenizer(_FakeChatTokenizer):
     """A template that rewrites earlier tokens as the transcript grows (pathological)."""
 
@@ -272,6 +295,30 @@ class CompletionMaskTests(unittest.TestCase):
         messages = self._fixed_transcript()
         with self.assertRaises(ValueError):
             build_masked_completion(messages, _NonPrefixTokenizer(), n_prompt_messages=2)
+
+    def test_generation_prompt_think_injection_does_not_break_mask(self) -> None:
+        # Regression: Qwen3 enable_thinking=False injects an empty <think></think> into
+        # the generation prompt only. The mask builder must not fail-closed on that, must
+        # keep the think tokens in the PROMPT (not the completion), and must still mask
+        # only assistant content as trainable.
+        messages = self._fixed_transcript()
+        tok = _ThinkInjectingTokenizer()
+        prompt_ids, completion_ids, mask = build_masked_completion(
+            messages, tok, n_prompt_messages=2, enable_thinking=False
+        )
+        words = [tok.decode_id(t) for t in completion_ids]
+        # The injected think scaffolding is part of the prompt the model saw, not the
+        # completion it authored.
+        self.assertIn("<think>", [tok.decode_id(t) for t in prompt_ids])
+        self.assertNotIn("<think>", words)
+        # Assistant content trainable; prompt/tool content masked; boundaries intact.
+        for word, m in zip(words, mask):
+            if word.startswith("A_"):
+                self.assertEqual(m, 1, word)
+            if word.startswith(("P_", "T_")):
+                self.assertEqual(m, 0, word)
+        trainable = {w for w, m in zip(words, mask) if m == 1 and w.startswith(("A_", "P_", "T_"))}
+        self.assertEqual(trainable, {"A_probe0", "A_probe1", "A_hammer0", "A_finish0"})
 
 
 # --------------------------------------------------------------------------- #
