@@ -50,6 +50,44 @@ class CurriculumStage:
     reference_min_success: float
 
 
+def _parse_seeds(name: str, entry: dict) -> tuple[int, ...]:
+    """Resolve a stage's training seeds from ``seeds:`` or the ``seed_range:`` shorthand.
+
+    * ``seeds: [1, 2, 3, ...]`` — an explicit list, or
+    * ``seed_range: [start, stop]`` — every integer from ``start`` to ``stop`` **inclusive**
+      (so ``[1, 256]`` is 256 seeds), the practical way to ask for hundreds of instances
+      without hand-listing them.
+
+    Exactly one of the two must be present. Returns the seeds in the order given (explicit
+    list) or ascending (range).
+    """
+    has_list = "seeds" in entry and entry.get("seeds") is not None
+    has_range = "seed_range" in entry and entry.get("seed_range") is not None
+    if has_list and has_range:
+        raise ValueError(f"curriculum stage {name!r}: give either 'seeds' or 'seed_range', not both")
+    if has_range:
+        rng = entry.get("seed_range")
+        if not isinstance(rng, (list, tuple)) or len(rng) != 2:
+            raise ValueError(
+                f"curriculum stage {name!r}: 'seed_range' must be a [start, stop] pair, got {rng!r}"
+            )
+        try:
+            start, stop = int(rng[0]), int(rng[1])
+        except (TypeError, ValueError):
+            raise ValueError(f"curriculum stage {name!r}: 'seed_range' bounds must be integers, got {rng!r}")
+        if stop < start:
+            raise ValueError(
+                f"curriculum stage {name!r}: 'seed_range' start ({start}) must be <= stop ({stop})"
+            )
+        return tuple(range(start, stop + 1))  # inclusive of both ends
+    seeds_raw = entry.get("seeds") or []
+    if not isinstance(seeds_raw, list) or not seeds_raw:
+        raise ValueError(
+            f"curriculum stage {name!r}: needs a non-empty 'seeds' list or a 'seed_range: [start, stop]'"
+        )
+    return tuple(int(s) for s in seeds_raw)
+
+
 def _stage_from_entry(index: int, entry: dict) -> CurriculumStage:
     if not isinstance(entry, dict):
         raise ValueError(f"curriculum stage #{index} must be a mapping, got {type(entry).__name__}")
@@ -64,10 +102,7 @@ def _stage_from_entry(index: int, entry: dict) -> CurriculumStage:
     if not isinstance(tasks_raw, list) or not tasks_raw:
         raise ValueError(f"curriculum stage {name!r}: 'tasks' must be a non-empty list of config paths")
     tasks = tuple(str(t) for t in tasks_raw)
-    seeds_raw = entry.get("seeds") or []
-    if not isinstance(seeds_raw, list) or not seeds_raw:
-        raise ValueError(f"curriculum stage {name!r}: 'seeds' must be a non-empty list")
-    seeds = tuple(int(s) for s in seeds_raw)
+    seeds = _parse_seeds(name, entry)
     ref = entry.get("reference_min_success")
     if ref is None:
         raise ValueError(f"curriculum stage {name!r}: 'reference_min_success' is required (the P26 gate)")

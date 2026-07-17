@@ -287,9 +287,42 @@ SYSTEM_PROMPT = (
 )
 
 
-def build_messages(metadata: dict[str, Any]) -> list[dict[str, str]]:
-    """Build the chat messages for one task instance from its disclosed reset obs."""
+# How much of the derived reference hint the task prompt discloses. "full" gives the
+# exact aggressor rows + suggested hammer count — a copyable answer that collapses
+# within-group diversity (zero GRPO advantage) and is wrong on discovery families.
+# "geometry" keeps only physics constants (row stride, threshold); "none" omits
+# reference_hints entirely. Set once via :func:`set_hint_level` so the dataset-build
+# and rollout prompts stay identical (the trainer's prompt->task lookup depends on it).
+HINT_LEVELS = ("full", "geometry", "none")
+_HINT_LEVEL = "full"
+
+
+def set_hint_level(level: str) -> None:
+    """Set the module-wide prompt hint level (see :data:`HINT_LEVELS`)."""
+    global _HINT_LEVEL
+    if level not in HINT_LEVELS:
+        raise ValueError(f"hint_level must be one of {HINT_LEVELS}, got {level!r}")
+    _HINT_LEVEL = level
+
+
+def _reference_hints_view(metadata: dict[str, Any], level: str) -> dict[str, Any] | None:
+    if level == "none":
+        return None
     hints = public_hints(metadata)
+    if level == "geometry":
+        # Physics constants only — no aggressor addresses / suggested count to copy.
+        return {"row_bytes": hints["row_bytes"], "known_threshold": hints["known_threshold"]}
+    return hints  # "full"
+
+
+def build_messages(metadata: dict[str, Any], hint_level: str | None = None) -> list[dict[str, str]]:
+    """Build the chat messages for one task instance from its disclosed reset obs.
+
+    ``hint_level`` overrides the module default (:func:`set_hint_level`) for callers that
+    want an explicit level; both paths that build a prompt for the SAME run must use the
+    same level (the trainer matches rollout prompts against the baked dataset prompts).
+    """
+    level = hint_level if hint_level is not None else _HINT_LEVEL
     task_view = {
         "objective": metadata.get("objective"),
         "task_family": metadata.get("task_family"),
@@ -300,8 +333,10 @@ def build_messages(metadata: dict[str, Any]) -> list[dict[str, str]]:
         "address_forms": metadata.get("address_forms"),
         "allowed_tools": metadata.get("allowed_tools"),
         "budgets": metadata.get("budget_remaining"),
-        "reference_hints": hints,
     }
+    reference_hints = _reference_hints_view(metadata, level)
+    if reference_hints is not None:
+        task_view["reference_hints"] = reference_hints
     user = (
         "Task instance (only disclosed fields are shown):\n"
         + json.dumps(task_view, sort_keys=True, indent=2)
@@ -485,12 +520,14 @@ def launch_server(
 
 
 __all__ = [
+    "HINT_LEVELS",
     "RolloutItem",
     "ScriptedPolicy",
     "ServerHandle",
     "SYSTEM_PROMPT",
     "build_messages",
     "completion_text",
+    "set_hint_level",
     "disclose_metadata",
     "evaluate_item",
     "evaluate_rewards",

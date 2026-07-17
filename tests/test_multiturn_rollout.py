@@ -1,27 +1,18 @@
 """Multi-turn training rollout + completion mask (P27).
 
-Two host-runnable checks, matching P27's two host-side "Done when" bullets:
+Two host-runnable checks:
 
-* **Trace-equivalence.** The P26 ``ReferenceProbePolicy`` driven through the new
-  training loop (``run_training_episode_local`` + ``ToolPolicyGenerator``) produces the
-  *exact same* trajectory + reward as driving it through the established eval loop
-  (``run_episode_local``). The training loop serializes each tool call to a fenced-JSON
-  completion and re-parses it through the single-shot trainer's parse path, so proving
-  equivalence proves that render/parse round-trip is lossless and the loop steps the
-  env identically. Checked against a fake timing/flip env (no worker) and, when the
-  worker is built, against the real ``RowHammerTaskEnv`` discovery configs.
+* **Trace-equivalence**: the P26 ``ReferenceProbePolicy`` driven through the training
+  loop (``run_training_episode_local`` + ``ToolPolicyGenerator``) produces the same
+  trajectory + reward as driving it through the eval loop (``run_episode_local``).
+  Checked against a fake timing/flip env, and against the real ``RowHammerTaskEnv``
+  discovery configs when the worker is built.
+* **Completion mask**: ``build_masked_completion`` marks ``1`` on assistant-authored
+  spans and ``0`` on tool-result turns + template scaffolding, using a fake
+  ``apply_chat_template`` tokenizer (no ``transformers``).
 
-  (P27 says "manually via ``RowHammerClient``"; the host has no websocket server, so —
-  as with the P26 reference checks — the in-process ``run_episode_local`` is the host
-  analog, and the async HTTP twin shares the same loop body.)
-
-* **Completion mask.** ``build_masked_completion`` marks ``1`` exactly on
-  assistant-authored spans and ``0`` on tool-result turns + template scaffolding, on a
-  fixed transcript, with a fake ``apply_chat_template`` tokenizer (no ``transformers``).
-
-The third "Done when" bullet — a tiny end-to-end GRPO run showing a non-trivial
-gradient/advantage signal — needs ``trl``/``torch``/GPU and is **instance-only**; it is
-not exercised here.
+A full GRPO run showing a non-trivial gradient signal needs ``trl``/``torch``/GPU and
+is instance-only; not exercised here.
 """
 
 from __future__ import annotations
@@ -33,10 +24,12 @@ import yaml
 
 from rowhammer_env import RowHammerTaskEnv
 from rowhammer_env.llm import (
+    BatchToolPolicyGenerator,
     ReferenceProbePolicy,
     ToolPolicyGenerator,
     build_masked_completion,
     render_tool_call,
+    run_batched_training_episodes_local,
     run_episode_local,
     run_training_episode_local,
     to_grpo_example,
@@ -124,6 +117,38 @@ class TraceEquivalenceUnitTests(unittest.TestCase):
         )
         self.assertEqual(train_roll.reward, eval_res.reward)
 
+    def test_batched_driver_matches_sequential_per_episode(self) -> None:
+        # The batched driver (many episodes, one generation per tick) must produce, for
+        # each episode, the SAME trajectory + reward as running that episode through the
+        # single-episode loop. Two episodes with distinct windows so batching genuinely
+        # interleaves two different rollouts (not one duplicated).
+        windows = [_window(), (
+            {"kind": "logical", "addr": 2000},
+            [{"kind": "logical", "addr": a} for a in (11, 21, 31, 41)],
+            {11: 0, 21: 1, 31: 0, 41: 0},
+            {11, 41},
+        )]
+
+        seq_rolls = []
+        for victim, cands, banks, aggressors in windows:
+            env = _FakeDiscoveryEnv(victim, cands, banks, aggressors)
+            seq_rolls.append(run_training_episode_local(env, ToolPolicyGenerator(ReferenceProbePolicy()), seed=0, max_turns=64))
+
+        envs = [_FakeDiscoveryEnv(*w) for w in windows]
+        episodes = [(envs[i], 0, None, f"batch_ep_{i}") for i in range(len(windows))]
+        batch_rolls = run_batched_training_episodes_local(
+            episodes, BatchToolPolicyGenerator(lambda: ReferenceProbePolicy()), max_turns=64
+        )
+
+        self.assertEqual(len(batch_rolls), len(seq_rolls))
+        for seq, bat in zip(seq_rolls, batch_rolls):
+            self.assertEqual(
+                [_traj_tuple(s) for s in bat.trajectory],
+                [_traj_tuple(s) for s in seq.trajectory],
+            )
+            self.assertEqual(bat.reward, seq.reward)
+            self.assertEqual(bat.messages, seq.messages)
+
     def test_transcript_is_prompt_plus_alternating_turns(self) -> None:
         _, train_roll, _, _ = self._run_both(use_timing=True)
         # Prompt is the fixed system+task prefix; the completion is alternating
@@ -175,9 +200,8 @@ class TraceEquivalenceIntegrationTests(unittest.TestCase):
 class _FakeChatTokenizer:
     """Deterministic ChatML-style tokenizer for host-side mask tests (no transformers).
 
-    Renders ``<|role|> tokens... <|end|>`` per message and a trailing ``<|assistant|>``
-    for ``add_generation_prompt`` — the prefix-consistent shape real ChatML templates
-    have. ``tokenize=True`` returns stable integer ids; ``decode_id`` reverses them.
+    Renders ``<|role|> tokens... <|end|>`` per message plus a trailing ``<|assistant|>``
+    for ``add_generation_prompt`` — prefix-consistent, unlike the Qwen3 fakes below.
     """
 
     def __init__(self) -> None:
@@ -205,9 +229,6 @@ class _FakeChatTokenizer:
 class _ThinkInjectingTokenizer(_FakeChatTokenizer):
     """Reproduces Qwen3 under ``enable_thinking=False``: the generation prompt injects an
     empty ``<think></think>`` block that stored assistant messages do NOT carry.
-
-    This is exactly what tripped the naive incremental diff — ``render(prompt,
-    add_generation_prompt=True)`` is not a token-prefix of the fuller stored transcript.
     """
 
     def apply_chat_template(self, messages, tokenize=True, add_generation_prompt=False, enable_thinking=True):
@@ -220,6 +241,54 @@ class _ThinkInjectingTokenizer(_FakeChatTokenizer):
             toks.append("<|assistant|>")
             if not enable_thinking:  # ephemeral empty think block, generation-prompt only
                 toks += ["<think>", "</think>"]
+        if not tokenize:
+            return " ".join(toks)
+        return [self._id(t) for t in toks]
+
+
+class _Qwen3StyleTokenizer(_FakeChatTokenizer):
+    """The real Qwen3 quirk: under ``enable_thinking=False`` the empty ``<think></think>``
+    is attached to the *last* assistant turn of a render (and the generation prompt) but
+    stripped from earlier ones, so the stored transcript is not prefix-consistent across
+    turns. Unlike ``_ThinkInjectingTokenizer`` (generation-prompt only), this also injects
+    into stored history.
+    """
+
+    def apply_chat_template(self, messages, tokenize=True, add_generation_prompt=False, enable_thinking=True):
+        toks: list[str] = []
+        n = len(messages)
+        for idx, m in enumerate(messages):
+            toks.append(f"<|{m['role']}|>")
+            # Only the LAST message, when an assistant turn, carries the empty think
+            # block in history; earlier assistant turns have it stripped.
+            if m["role"] == "assistant" and idx == n - 1:
+                toks += ["<think>", "</think>"]
+            toks.extend(str(m["content"]).split())
+            toks.append("<|end|>")
+        if add_generation_prompt:
+            toks.append("<|assistant|>")
+            if not enable_thinking:  # ephemeral empty think block, generation-prompt only
+                toks += ["<think>", "</think>"]
+        if not tokenize:
+            return " ".join(toks)
+        return [self._id(t) for t in toks]
+
+
+class _Qwen3ThinkingTokenizer(_FakeChatTokenizer):
+    """Qwen3 with ``enable_thinking=True``: the template preserves authored
+    ``<think>...</think>`` content on every turn (only stripped when empty) and injects
+    no empty think block into the generation prompt, so the whole authored span
+    (reasoning + tool call) is trainable.
+    """
+
+    def apply_chat_template(self, messages, tokenize=True, add_generation_prompt=False, enable_thinking=True):
+        toks: list[str] = []
+        for m in messages:
+            toks.append(f"<|{m['role']}|>")
+            toks.extend(str(m["content"]).split())  # content already carries <think>...</think>
+            toks.append("<|end|>")
+        if add_generation_prompt:
+            toks.append("<|assistant|>")  # enable_thinking=True => no empty think injected
         if not tokenize:
             return " ".join(toks)
         return [self._id(t) for t in toks]
@@ -297,10 +366,7 @@ class CompletionMaskTests(unittest.TestCase):
             build_masked_completion(messages, _NonPrefixTokenizer(), n_prompt_messages=2)
 
     def test_generation_prompt_think_injection_does_not_break_mask(self) -> None:
-        # Regression: Qwen3 enable_thinking=False injects an empty <think></think> into
-        # the generation prompt only. The mask builder must not fail-closed on that, must
-        # keep the think tokens in the PROMPT (not the completion), and must still mask
-        # only assistant content as trainable.
+        # The injected empty <think></think> must land in the prompt, not the completion.
         messages = self._fixed_transcript()
         tok = _ThinkInjectingTokenizer()
         prompt_ids, completion_ids, mask = build_masked_completion(
@@ -319,6 +385,55 @@ class CompletionMaskTests(unittest.TestCase):
                 self.assertEqual(m, 0, word)
         trainable = {w for w, m in zip(words, mask) if m == 1 and w.startswith(("A_", "P_", "T_"))}
         self.assertEqual(trainable, {"A_probe0", "A_probe1", "A_hammer0", "A_finish0"})
+
+    def test_qwen3_last_turn_think_injection_does_not_break_mask(self) -> None:
+        # The stored transcript is not prefix-consistent turn to turn (see
+        # _Qwen3StyleTokenizer); per-turn anchoring must still mask correctly.
+        messages = self._fixed_transcript()
+        tok = _Qwen3StyleTokenizer()
+        prompt_ids, completion_ids, mask = build_masked_completion(
+            messages, tok, n_prompt_messages=2, enable_thinking=False
+        )
+        words = [tok.decode_id(t) for t in completion_ids]
+        for word, m in zip(words, mask):
+            if word.startswith("A_"):
+                self.assertEqual(m, 1, word)
+            if word.startswith(("P_", "T_")):
+                self.assertEqual(m, 0, word)
+            # The empty think scaffolding on the last stored turn is never trainable —
+            # the model did not author it (it is generation-prompt template output).
+            if word in ("<think>", "</think>"):
+                self.assertEqual(m, 0, word)
+        trainable = {w for w, m in zip(words, mask) if m == 1 and w.startswith(("A_", "P_", "T_"))}
+        self.assertEqual(trainable, {"A_probe0", "A_probe1", "A_hammer0", "A_finish0"})
+        # Turn-0 think scaffolding rode into the prompt, matching the baked dataset prompt.
+        self.assertIn("<think>", [tok.decode_id(t) for t in prompt_ids])
+
+    def test_reasoning_mode_masks_think_and_content_as_trainable(self) -> None:
+        # enable_thinking=True: no empty-think scaffolding, so the whole authored span
+        # (reasoning + tool call) is trainable.
+        messages = [
+            {"role": "system", "content": "P_sys0"},
+            {"role": "user", "content": "P_task0"},
+            {"role": "assistant", "content": "<think> R_r0 R_r1 </think> A_probe0"},
+            {"role": "tool", "content": "T_res0"},
+            {"role": "assistant", "content": "<think> R_r2 </think> A_finish0"},
+        ]
+        tok = _Qwen3ThinkingTokenizer()
+        prompt_ids, completion_ids, mask = build_masked_completion(
+            messages, tok, n_prompt_messages=2, enable_thinking=True
+        )
+        words = [tok.decode_id(t) for t in completion_ids]
+        for word, m in zip(words, mask):
+            if word.startswith(("A_", "R_")) or word in ("<think>", "</think>"):
+                self.assertEqual(m, 1, word)  # model-authored reasoning + content
+            if word.startswith(("P_", "T_")):
+                self.assertEqual(m, 0, word)
+        trainable = {
+            w for w, m in zip(words, mask)
+            if m == 1 and (w.startswith(("A_", "R_", "P_", "T_")) or w in ("<think>", "</think>"))
+        }
+        self.assertEqual(trainable, {"<think>", "</think>", "R_r0", "R_r1", "R_r2", "A_probe0", "A_finish0"})
 
 
 # --------------------------------------------------------------------------- #

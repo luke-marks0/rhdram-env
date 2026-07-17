@@ -11,9 +11,6 @@ sparse episode reward — ``1.0`` only when the simulator + disturbance engine
 produce a real flip satisfying the objective, ``0.0`` otherwise. No mock reward,
 no reward from model-declared success (SPEC §2/§9).
 
-The reward-from-trusted-state rollout path is the same one the P19 gate
-verifies (``run_episode`` + the sparse trusted reward in ``RowHammerTaskEnv``).
-
 Usage
 -----
     # 1) (optional) let the trainer launch its own server, or start one yourself:
@@ -38,6 +35,7 @@ import json
 import os
 import pathlib
 import sys
+import uuid
 
 import yaml
 
@@ -49,6 +47,7 @@ from rowhammer_env.llm.curriculum import (  # noqa: E402  (torch-free)
     load_curriculum,
 )
 from rowhammer_env.llm.grpo_env import (  # noqa: E402
+    HINT_LEVELS,
     RolloutItem,
     build_messages,
     completion_text,
@@ -57,10 +56,12 @@ from rowhammer_env.llm.grpo_env import (  # noqa: E402
     hint_actions,
     launch_server,
     parse_actions,
+    set_hint_level,
     summarize_actions,
 )
 from rowhammer_env.llm.multiturn_rollout import (  # noqa: E402  (torch-free)
     render_tool_call,
+    run_batched_training_episodes,
     run_training_episode,
     to_grpo_example,
 )
@@ -83,10 +84,8 @@ def load_config(path: pathlib.Path) -> dict:
 
 
 def resolve_task(entry: dict) -> tuple[dict | None, str]:
-    """Resolve a task-list entry into a (task_config, label) pair.
-
-    An entry is either ``{config: path/to.yaml}`` (a full SPEC §10 task config)
-    or ``{family: <name>}`` (the shorthand the env also accepts).
+    """Resolve a task-list entry: ``{config: path}`` (a full SPEC §10 task config)
+    or ``{family: name}`` (shorthand the env also accepts).
     """
     if "config" in entry:
         task_path = (ROOT / entry["config"]).resolve()
@@ -105,15 +104,61 @@ def resolve_task(entry: dict) -> tuple[dict | None, str]:
 def task_seed_pairs(cfg: dict, task_entries: list[dict], seeds: list[int]) -> list[tuple[dict, int]]:
     """Ordered ``(task_entry, seed)`` pairs the dataset is built from.
 
-    When the config carries a ``curriculum:`` block (P28), the pairs follow the
-    curriculum's declared stage order (Tier 0 → 2a easy/med/hard → 2b easy/med/hard),
-    each stage with its own seeds — so the trainer meets the families easiest-first.
-    Otherwise it is the plain ``tasks × seeds`` cartesian product (the legacy path).
+    A ``curriculum:`` block orders pairs by stage (easiest first); otherwise it's the
+    plain ``tasks x seeds`` cartesian product.
     """
     if cfg.get("curriculum"):
         stages = load_curriculum(cfg)
         return [({"config": path}, seed) for path, seed in curriculum_task_seed_pairs(stages)]
     return [(entry, seed) for entry in task_entries for seed in seeds]
+
+
+def filter_curriculum_to_stage(cfg: dict, stage_name: str) -> dict:
+    """Return a copy of ``cfg`` whose curriculum is just the named stage."""
+    entries = cfg.get("curriculum") or []
+    match = [e for e in entries if str(e.get("name")) == stage_name]
+    if not match:
+        names = [str(e.get("name")) for e in entries]
+        raise SystemExit(f"--stage {stage_name!r} not in curriculum; have {names}")
+    cfg = dict(cfg)
+    cfg["curriculum"] = match
+    return cfg
+
+
+def _parse_seed_spec(spec: dict) -> list[int]:
+    """Seeds from an ``eval:`` block via ``seeds:`` or ``seed_range: [start, stop]``."""
+    rng = spec.get("seed_range")
+    if rng is not None:
+        if not isinstance(rng, (list, tuple)) or len(rng) != 2:
+            raise SystemExit(f"eval.seed_range must be [start, stop], got {rng!r}")
+        return list(range(int(rng[0]), int(rng[1]) + 1))
+    seeds = spec.get("seeds")
+    if seeds:
+        return [int(s) for s in seeds]
+    raise SystemExit("eval: needs 'seeds' or 'seed_range'")
+
+
+def eval_task_seed_pairs(cfg: dict, task_entries: list[dict]) -> list[tuple[dict, int]]:
+    """Held-out ``(task_entry, seed)`` pairs from the ``eval:`` block, empty if absent.
+
+    Evaluates the current config's tasks (curriculum stages or plain ``tasks``) over the
+    held-out eval seeds.
+    """
+    eval_cfg = cfg.get("eval")
+    if not eval_cfg:
+        return []
+    eval_seeds = _parse_seed_spec(eval_cfg)
+    if cfg.get("curriculum"):
+        seen: set[str] = set()
+        entries: list[dict] = []
+        for stage in load_curriculum(cfg):
+            for path in stage.tasks:
+                if path not in seen:
+                    seen.add(path)
+                    entries.append({"config": path})
+    else:
+        entries = task_entries
+    return [(entry, seed) for entry in entries for seed in eval_seeds]
 
 
 async def _build_rows(base_url: str, pairs: list[tuple[dict, int]]) -> list[dict]:
@@ -140,10 +185,8 @@ def build_rows(base_url: str, pairs: list[tuple[dict, int]]) -> list[dict]:
 def render_prompts(rows: list[dict], tokenizer, enable_thinking: bool) -> None:
     """Bake each row's chat messages into a text ``prompt`` for GRPO.
 
-    ``enable_thinking`` is passed straight to the chat template. For Qwen3 this
-    toggles the ``<think>`` reasoning block; other templates ignore the kwarg.
     Pre-rendering (rather than a conversational dataset) gives version-independent
-    control of the thinking toggle across TRL releases.
+    control of the ``enable_thinking`` toggle across TRL releases.
     """
     for row in rows:
         messages = row.pop("messages")
@@ -155,7 +198,6 @@ def render_prompts(rows: list[dict], tokenizer, enable_thinking: bool) -> None:
                 enable_thinking=enable_thinking,
             )
         except TypeError:
-            # Template doesn't accept enable_thinking; render without it.
             row["prompt"] = tokenizer.apply_chat_template(
                 messages,
                 tokenize=False,
@@ -223,23 +265,17 @@ def make_reward_functions(base_url: str, *, concurrency: int, max_steps: int, re
 # it. The discovery families (bounded_sweep / hidden_adjacency) need genuine
 # turn-by-turn interaction: probe, read the timing digest, narrow candidates, hammer.
 # ``rowhammer_env.llm.multiturn_rollout`` owns the torch-free loop + completion-mask
-# assembly (unit-tested on the host); this section is the thin trl/torch binding.
-#
-# Reward stays trusted and sparse: the whole trajectory earns the final episode reward
-# from ``_trusted_success()`` (``to_grpo_example``'s ``reward``), never anything derived
-# from model text. GRPO's group-relative advantage is per full rollout.
+# assembly; this section is the thin trl/torch binding.
 # --------------------------------------------------------------------------- #
 class HFCompletionGenerator:
-    """One assistant completion per turn from a HF causal LM (instance-only).
+    """One assistant completion per turn from a HF causal LM (instance-only, sequential).
 
-    Renders the running transcript with the model's chat template, samples a short
-    continuation, and returns its text. ``torch``/``transformers`` are imported lazily
-    inside ``__call__`` so this file still imports (and ``--dry-run`` still runs) on a
-    host without them.
+    ``torch``/``transformers`` are imported lazily inside ``__call__`` so this file
+    still imports (and ``--dry-run`` still runs) on a host without them.
     """
 
-    # A graceful, parseable end-of-episode turn. Emitted (instead of generating) when the
-    # running transcript has no context room left for another turn — see __call__.
+    # A graceful, parseable end-of-episode turn, emitted instead of generating when
+    # the running transcript has no context room left for another turn.
     _FINISH_TURN = render_tool_call(ToolCall("episode.finish", {}))
 
     def __init__(
@@ -259,12 +295,10 @@ class HFCompletionGenerator:
         self.model = model
         self.tokenizer = tokenizer
         self.enable_thinking = bool(enable_thinking)
-        # Per-TURN generation cap. A non-thinking turn is one short tool call (~80 tokens),
-        # so 160 bounds a rambling turn without spending the whole multi-turn budget at
-        # once. A THINKING turn must fit the entire <think>...</think> reasoning *plus* the
-        # tool call, so a 160-token cap would truncate the reasoning mid-thought and the
-        # turn would never emit a parseable call. Honour an explicit max_turn_tokens; else
-        # default by mode (generous when thinking).
+        # Per-turn cap: a non-thinking turn is one short tool call (~80 tokens), so 160
+        # bounds a rambling turn without spending the whole multi-turn budget at once. A
+        # thinking turn must fit the <think>...</think> reasoning plus the tool call, so
+        # it needs a generous default instead. Honour an explicit max_turn_tokens first.
         if max_turn_tokens is not None:
             self.max_new_tokens = int(max_turn_tokens)
         elif self.enable_thinking:
@@ -272,19 +306,15 @@ class HFCompletionGenerator:
         else:
             self.max_new_tokens = min(int(max_new_tokens), 160)
         self.temperature = float(temperature)
-        # Nucleus + top-k sampling. Qwen's own guidance differs by mode: thinking wants a
-        # wider nucleus (~0.95) — greedy/tight sampling makes reasoning degenerate into
-        # repetition — while non-thinking uses ~0.8. Default per mode; overridable.
+        # Qwen's own guidance differs by mode: thinking wants a wider nucleus (~0.95;
+        # tight sampling makes reasoning degenerate into repetition), non-thinking ~0.8.
         self.top_p = float(top_p) if top_p is not None else (0.95 if self.enable_thinking else 0.8)
         self.top_k = int(top_k)
-        # Hard context budget. An untrained policy that never emits episode.finish grows
-        # the transcript every turn until the rendered prompt reaches the model's
-        # positional limit (Qwen3-8B: max_position_embeddings=40960); generate() then runs
-        # past the window, warns ("exceeded the model's predefined maximum length"), and
-        # returns corrupt tokens (and the downstream logprob/loss forwards blow up too).
-        # Cap the running prompt: leave room for this turn's tokens, and stop the episode
-        # rather than overflow. Default to the model's own positional limit; a training run
-        # will usually set rollout.max_prompt_tokens lower to bound step memory.
+        # Hard context budget: an untrained policy that never emits episode.finish grows
+        # the transcript every turn until the rendered prompt overflows the model's
+        # positional window (generate() then returns corrupt tokens). Cap the running
+        # prompt and end the episode gracefully instead. Defaults to the model's own
+        # positional limit; a training run will usually set this lower.
         cfg_ctx = getattr(getattr(model, "config", None), "max_position_embeddings", None)
         self.max_prompt_tokens = int(max_prompt_tokens or cfg_ctx or 32768)
         self.response_margin = int(response_margin)
@@ -300,19 +330,15 @@ class HFCompletionGenerator:
         except TypeError:
             prompt = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
-        # Context-budget guard: never generate past the positional window. If there is no
-        # room for a meaningful turn, end the episode gracefully with a parseable
-        # episode.finish (the trajectory keeps whatever reward it has accrued) instead of
-        # overflowing the model. Otherwise clamp this turn to the room that remains.
         prompt_len = int(inputs["input_ids"].shape[1])
         room = self.max_prompt_tokens - prompt_len - self.response_margin
         if room <= 0:
             return self._FINISH_TURN
         turn_new_tokens = min(self.max_new_tokens, room)
-        # Generating from a model that is mid-training is the trap: gradient
-        # checkpointing forces use_cache=False and .train() leaves dropout on, and that
-        # no-KV-cache path yields corrupt (garbage/degenerate) tokens. Switch to eval +
-        # KV cache + GC off *only* for the generate, then restore training state exactly.
+        # Generating from a model mid-training is a trap: gradient checkpointing forces
+        # use_cache=False and .train() leaves dropout on, and that no-KV-cache path
+        # yields corrupt tokens. Switch to eval + KV cache + GC off only for generate,
+        # then restore training state exactly.
         was_training = self.model.training
         gc_enabled = bool(getattr(self.model, "is_gradient_checkpointing", False))
         self.model.eval()
@@ -340,6 +366,136 @@ class HFCompletionGenerator:
         return self.tokenizer.decode(gen, skip_special_tokens=True)
 
 
+# Shared graceful end-of-episode turn for the batched generators below.
+_FINISH_TURN = render_tool_call(ToolCall("episode.finish", {}))
+
+
+def _render_prompt(tokenizer, messages, enable_thinking):
+    try:
+        return tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True, enable_thinking=enable_thinking
+        )
+    except TypeError:
+        return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+
+
+def _turn_cap(max_turn_tokens, enable_thinking, max_new_tokens):
+    """Per-turn generation cap, matching HFCompletionGenerator's mode-aware default."""
+    if max_turn_tokens is not None:
+        return int(max_turn_tokens)
+    return max(int(max_new_tokens), 1024) if enable_thinking else min(int(max_new_tokens), 160)
+
+
+class VLLMBatchedGenerator:
+    """Batched multi-turn generator backed by a vLLM engine — one ``generate()`` over
+    the prompts of ALL active episodes per tick (vLLM's continuous batching). Reuses
+    the trainer's colocated engine; the caller syncs policy weights into it before
+    generation. Over-budget episodes get a graceful ``episode.finish`` instead.
+    """
+
+    def __init__(self, llm, tokenizer, *, max_turn_tokens, enable_thinking, temperature, top_p, top_k, max_prompt_tokens, response_margin=32):
+        self.llm = llm
+        self.tokenizer = tokenizer
+        self.enable_thinking = bool(enable_thinking)
+        self.max_turn_tokens = int(max_turn_tokens)
+        self.temperature = float(temperature)
+        self.top_p = float(top_p)
+        self.top_k = int(top_k)
+        self.max_prompt_tokens = int(max_prompt_tokens) if max_prompt_tokens else 32768
+        self.response_margin = int(response_margin)
+
+    def __call__(self, requests):
+        from vllm import SamplingParams
+
+        texts = [_FINISH_TURN] * len(requests)
+        prompts, params, slots = [], [], []
+        for i, req in enumerate(requests):
+            prompt = _render_prompt(self.tokenizer, req.messages, self.enable_thinking)
+            n_tok = len(self.tokenizer(prompt, add_special_tokens=False)["input_ids"])
+            room = self.max_prompt_tokens - n_tok - self.response_margin
+            if room <= 0:
+                continue  # leave as the graceful finish turn
+            prompts.append(prompt)
+            params.append(SamplingParams(
+                n=1, temperature=self.temperature, top_p=self.top_p,
+                top_k=self.top_k, max_tokens=min(self.max_turn_tokens, room),
+            ))
+            slots.append(i)
+        if prompts:
+            outputs = self.llm.generate(prompts, params, use_tqdm=False)
+            for slot, output in zip(slots, outputs):
+                texts[slot] = output.outputs[0].text
+        return texts
+
+
+class HFBatchedGenerator:
+    """Batched multi-turn generator using the training model's own ``generate()`` over
+    a left-padded batch of all active episodes' prompts (no vLLM, no weight sync) —
+    the fallback throughput path when the trainer has no reusable vLLM engine.
+    """
+
+    def __init__(self, model, tokenizer, *, max_turn_tokens, enable_thinking, temperature, top_p, top_k, max_prompt_tokens, response_margin=32):
+        self.model = model
+        self.tokenizer = tokenizer
+        self.enable_thinking = bool(enable_thinking)
+        self.max_turn_tokens = int(max_turn_tokens)
+        self.temperature = float(temperature)
+        self.top_p = float(top_p)
+        self.top_k = int(top_k)
+        self.max_prompt_tokens = int(max_prompt_tokens) if max_prompt_tokens else 32768
+        self.response_margin = int(response_margin)
+
+    def __call__(self, requests):
+        import torch
+
+        texts = [_FINISH_TURN] * len(requests)
+        prompts, slots = [], []
+        for i, req in enumerate(requests):
+            prompt = _render_prompt(self.tokenizer, req.messages, self.enable_thinking)
+            n_tok = len(self.tokenizer(prompt, add_special_tokens=False)["input_ids"])
+            if self.max_prompt_tokens - n_tok - self.response_margin <= 0:
+                continue
+            prompts.append(prompt)
+            slots.append(i)
+        if not prompts:
+            return texts
+
+        prev_side = self.tokenizer.padding_side
+        self.tokenizer.padding_side = "left"  # decoder-only batch generation needs left pad
+        try:
+            enc = self.tokenizer(prompts, return_tensors="pt", padding=True, add_special_tokens=False).to(self.model.device)
+        finally:
+            self.tokenizer.padding_side = prev_side
+
+        was_training = self.model.training
+        gc_enabled = bool(getattr(self.model, "is_gradient_checkpointing", False))
+        self.model.eval()
+        if gc_enabled and hasattr(self.model, "gradient_checkpointing_disable"):
+            self.model.gradient_checkpointing_disable()
+        try:
+            with torch.no_grad():
+                out = self.model.generate(
+                    **enc,
+                    max_new_tokens=self.max_turn_tokens,
+                    do_sample=True,
+                    temperature=self.temperature,
+                    top_p=self.top_p,
+                    top_k=self.top_k,
+                    use_cache=True,
+                    eos_token_id=self.tokenizer.eos_token_id,
+                    pad_token_id=self.tokenizer.pad_token_id,
+                )
+        finally:
+            if gc_enabled and hasattr(self.model, "gradient_checkpointing_enable"):
+                self.model.gradient_checkpointing_enable()
+            if was_training:
+                self.model.train()
+        gen = out[:, enc["input_ids"].shape[1]:]
+        for j, slot in enumerate(slots):
+            texts[slot] = self.tokenizer.decode(gen[j], skip_special_tokens=True)
+        return texts
+
+
 def make_multiturn_rollout_func(
     base_url,
     tokenizer,
@@ -352,39 +508,40 @@ def make_multiturn_rollout_func(
     temperature,
     max_turn_tokens=None,
     max_prompt_tokens=None,
+    concurrency=8,
     emit_probe_shaping=False,
 ):
-    """A TRL GRPO ``rollout_func`` that runs a real multi-turn episode per prompt.
+    """A TRL GRPO ``rollout_func`` that runs real multi-turn episodes, batched.
 
-    Replaces the trainer's single-shot generation: for each prompt it drives the live
-    OpenEnv server through ``run_training_episode`` with an :class:`HFCompletionGenerator`
-    (the training model), then returns the token-level masked completion + the trusted
-    episode reward via ``to_grpo_example``.
+    Replaces the trainer's single-shot generation: the batch of prompts runs as
+    concurrent multi-turn episodes (:func:`run_batched_training_episodes`, in waves
+    of ``concurrency`` live env sessions), with ONE batched model call per tick — a
+    :class:`VLLMBatchedGenerator` when the trainer exposes a reusable colocated vLLM
+    engine (weights synced each step via ``trainer._move_model_to_vllm``), else a
+    :class:`HFBatchedGenerator`. Each finished rollout becomes the token-level masked
+    completion + trusted episode reward via ``to_grpo_example``.
 
-    TRL's contract (verified against TRL 1.8.0): the trainer calls
-    ``rollout_func(prompts, trainer)`` *positionally* — the second argument is the
-    ``GRPOTrainer`` itself, **not** the dataset columns. So ``seed``/``task`` are
-    recovered per prompt from ``prompt_to_meta`` (built from the pre-rendered dataset
-    rows; every generation of a given prompt shares its seed/task). The returned dict
-    uses TRL's keys ``prompt_ids``/``completion_ids``/``logprobs`` plus a token-level
-    ``completion_mask`` (assistant spans only) and two extra columns the reward
-    functions read: ``trusted_reward`` (the sparse episode reward) and ``probe_shaping``
-    (the bounded P28 probe-decisiveness bonus, computed from the rollout's trusted
-    timing digests — see :mod:`rowhammer_env.llm.shaping`). The assistant-span mask is
-    returned under TRL's ``env_mask`` key (1 = model tokens, 0 = external/tool tokens);
-    a ``completion_mask`` key would be ignored. A prompt missing from the lookup fails
-    **loudly** (never a silent wrong-episode reward).
+    TRL calls ``rollout_func(prompts, trainer)`` positionally (verified against TRL
+    1.8.0) — the second argument is the ``GRPOTrainer`` itself, not dataset columns —
+    so ``seed``/``task`` are recovered per prompt from ``prompt_to_meta`` (built from
+    the pre-rendered dataset rows). The returned dict uses TRL's keys
+    ``prompt_ids``/``completion_ids``/``logprobs`` plus a token-level assistant-span
+    mask under TRL's ``env_mask`` key (1 = model tokens, 0 = external/tool tokens —
+    a ``completion_mask`` key would be silently ignored), and two extra columns the
+    reward functions read: ``trusted_reward`` (the sparse episode reward) and
+    ``probe_shaping`` (the bounded P28 probe-decisiveness bonus, computed from the
+    rollout's trusted timing digests — :mod:`rowhammer_env.llm.shaping`). A prompt
+    missing from the lookup fails loudly rather than risk a silent wrong-episode
+    reward.
 
     Returns ``(rollout_func, reward_trusted, reward_probe_shaping)``; the caller adds
-    ``reward_probe_shaping`` (with its own weight) only when shaping is enabled.
+    ``reward_probe_shaping`` only when shaping is enabled.
     """
 
     def _logprobs(prompt_ids: list[int], completion_ids: list[int]) -> list[float]:
-        # Teacher-forcing pass over prompt+completion → per-completion-token logprob
-        # under the current policy. Autoregressive equivalence: each assistant token was
-        # generated left-to-right by this same model given exactly this left context, so
-        # a single forward pass reproduces the sampling logprobs (temperature 1.0). Tool
-        # tokens' logprobs are computed too but are masked out of the loss.
+        # Teacher-forcing pass over prompt+completion -> per-completion-token logprob
+        # under the current policy (reproduces the sampling logprobs at temperature
+        # 1.0, since each token was generated left-to-right from this same context).
         import torch
 
         ids = torch.tensor([prompt_ids + completion_ids], device=model.device)
@@ -400,14 +557,49 @@ def make_multiturn_rollout_func(
         start = len(prompt_ids)
         return [float(logp[start + t - 1, tok]) for t, tok in enumerate(completion_ids)]
 
+    logged_backend: list[str] = []
+
+    def _pick_batch_generator(trainer):
+        """Reuse the trainer's colocated vLLM engine if usable, else batched HF.
+
+        vLLM is only used when the engine exists AND its weights can be synced
+        (``_move_model_to_vllm``) — stale weights would train on rollouts that don't
+        reflect the current policy.
+        """
+        llm = getattr(trainer, "llm", None)
+        sync = getattr(trainer, "_move_model_to_vllm", None)
+        top_p = 0.95 if enable_thinking else 0.8
+        cap = _turn_cap(max_turn_tokens, enable_thinking, max_new_tokens)
+        if llm is not None and not callable(sync) and not logged_backend:
+            print(
+                "warning: a vLLM engine is present but no _move_model_to_vllm() weight-sync "
+                "was found on this TRL — using batched HF generation instead. The colocated "
+                "vLLM engine is then reserving GPU memory for nothing; set grpo.use_vllm: "
+                "false to reclaim it."
+            )
+        if llm is not None and callable(sync):
+            sync()  # push current policy weights into the vLLM engine (once per step)
+            gen = VLLMBatchedGenerator(
+                llm, tokenizer, max_turn_tokens=cap, enable_thinking=enable_thinking,
+                temperature=temperature, top_p=top_p, top_k=20, max_prompt_tokens=max_prompt_tokens,
+            )
+            backend = "vllm-batched"
+        else:
+            gen = HFBatchedGenerator(
+                model, tokenizer, max_turn_tokens=cap, enable_thinking=enable_thinking,
+                temperature=temperature, top_p=top_p, top_k=20, max_prompt_tokens=max_prompt_tokens,
+            )
+            backend = "hf-batched"
+        if not logged_backend:
+            logged_backend.append(backend)
+            print(f"multi-turn rollout backend: {backend} (concurrency={concurrency}, max_turns={max_turns})")
+        return gen
+
     def rollout_func(prompts, trainer):
-        del trainer  # the model/tokenizer are captured; the trainer handle is unused
-        prompt_ids_b: list[list[int]] = []
-        completion_ids_b: list[list[int]] = []
-        env_mask_b: list[list[int]] = []
-        logprobs_b: list[list[float]] = []
-        trusted_reward_b: list[float] = []
-        probe_shaping_b: list[float] = []
+        batch_gen = _pick_batch_generator(trainer)
+        # A unique episode_id per rollout so concurrent same-seed generations get
+        # distinct live env sessions (same deterministic task, independent exploration).
+        specs: list[tuple[int, dict | None, str]] = []
         for prompt in prompts:
             if prompt not in prompt_to_meta:
                 raise RuntimeError(
@@ -416,22 +608,31 @@ def make_multiturn_rollout_func(
                     "Check render_prompts()/chat-template consistency."
                 )
             seed, task = prompt_to_meta[prompt]
-            generator = HFCompletionGenerator(
-                model,
-                tokenizer,
-                max_new_tokens=max_new_tokens,
-                enable_thinking=enable_thinking,
-                temperature=temperature,
-                max_turn_tokens=max_turn_tokens,
-                max_prompt_tokens=max_prompt_tokens,
+            specs.append((seed, task, f"grpo_mt_{uuid.uuid4().hex[:12]}"))
+
+        # Run in waves within the server's concurrent-session budget; each wave batches
+        # its generation across all its still-active episodes.
+        rollouts: list = [None] * len(specs)
+        for start in range(0, len(specs), max(1, concurrency)):
+            wave = specs[start : start + max(1, concurrency)]
+            wave_rollouts = asyncio.run(
+                run_batched_training_episodes(base_url, wave, batch_gen, max_turns=max_turns)
             )
-            config = RolloutConfig(base_url=base_url, seed=seed, task=task, episode_id=f"grpo_mt_{seed}")
-            rollout = asyncio.run(run_training_episode(config, generator, max_turns=max_turns))
+            for k, rollout in enumerate(wave_rollouts):
+                rollouts[start + k] = rollout
+
+        prompt_ids_b: list[list[int]] = []
+        completion_ids_b: list[list[int]] = []
+        env_mask_b: list[list[int]] = []
+        logprobs_b: list[list[float]] = []
+        trusted_reward_b: list[float] = []
+        probe_shaping_b: list[float] = []
+        for rollout in rollouts:
             example = to_grpo_example(rollout, tokenizer, enable_thinking=enable_thinking)
             mask = example["completion_mask"]  # 1 = assistant/model token, 0 = tool/env
             logprobs = _logprobs(example["prompt_ids"], example["completion_ids"])
-            # Zero logprobs on env/tool tokens, matching TRL's own tool-loop convention
-            # ([0.0] * tool_length); they're excluded from the loss by env_mask anyway.
+            # Zero logprobs on env/tool tokens, matching TRL's own tool-loop convention;
+            # they're excluded from the loss by env_mask anyway.
             logprobs = [lp if m == 1 else 0.0 for lp, m in zip(logprobs, mask)]
             prompt_ids_b.append(example["prompt_ids"])
             completion_ids_b.append(example["completion_ids"])
@@ -445,17 +646,11 @@ def make_multiturn_rollout_func(
         out = {
             "prompt_ids": prompt_ids_b,
             "completion_ids": completion_ids_b,
-            # TRL 1.8 consumes env_mask (extra_fields.pop("env_mask")): 1 = model tokens,
-            # 0 = external/tool tokens — exactly our assistant-span mask. A returned
-            # "completion_mask" would be IGNORED (TRL defaults it to all-ones), so the
-            # tool-result/observation tokens must be masked via env_mask or they enter
-            # the loss.
             "env_mask": env_mask_b,
             "logprobs": logprobs_b,
             "trusted_reward": trusted_reward_b,
         }
-        # Only surface the shaping column when it's actually used, so the off-path
-        # returns exactly the P27 dict shape (no unused extra rollout columns).
+        # Only surface the shaping column when it's actually used.
         if emit_probe_shaping:
             out["probe_shaping"] = probe_shaping_b
         return out
@@ -468,9 +663,6 @@ def make_multiturn_rollout_func(
         return [float(r) for r in trusted_reward]
 
     def reward_probe_shaping(completions, probe_shaping=None, **_):
-        # The bounded P28 probe-decisiveness bonus, carried from the rollout (already
-        # computed from the trusted timing digest). Read verbatim; the trainer scales it
-        # by probe_shaping_weight (kept strictly below success_weight, SPEC §9).
         if probe_shaping is None:
             return [0.0] * len(completions)
         return [float(r) for r in probe_shaping]
@@ -486,15 +678,9 @@ def make_multiturn_rollout_func(
 def setup_wandb(cfg: dict, grpo_cfg: dict) -> tuple[list, bool]:
     """Configure wandb logging from the ``wandb:`` config section.
 
-    Returns ``(callbacks, enabled)``. When enabled, this:
-      * points the run at the configured project/entity/run name/mode,
-      * flips on TRL's own prompt/completion table (``log_completions``), and
-      * returns a callback that logs the per-rollout table + custom metrics.
-
-    It mutates ``grpo_cfg`` in place (``report_to`` + completion-logging keys);
-    unknown keys are dropped later by the GRPOConfig filter, so this stays
-    portable across TRL versions. Fails soft: a missing wandb install just
-    disables logging with a warning instead of aborting the run.
+    Returns ``(callbacks, enabled)``. Mutates ``grpo_cfg`` in place (``report_to`` +
+    completion-logging keys). Fails soft: a missing wandb install just disables
+    logging with a warning instead of aborting the run.
     """
     wandb_cfg = cfg.get("wandb", {})
     if not wandb_cfg.get("enabled", False):
@@ -557,33 +743,44 @@ def main() -> int:
     parser.add_argument("--config", required=True, type=pathlib.Path)
     parser.add_argument("--base-url", default=None, help="override env.base_url (skip launching a server)")
     parser.add_argument("--dry-run", action="store_true", help="build data + score the reference hammer, no training")
+    parser.add_argument("--stage", default=None, help="train only this curriculum stage by name")
+    parser.add_argument("--resume-adapter", default=None, help="load a LoRA adapter as init weights (stage chaining)")
+    parser.add_argument("--output-dir", default=None, help="override grpo.output_dir")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
+    if args.stage:
+        cfg = filter_curriculum_to_stage(cfg, args.stage)
     env_cfg = cfg.get("env", {})
     task_entries = cfg.get("tasks") or [{"family": "known_target_anybit"}]
     seeds = [int(s) for s in cfg.get("seeds", list(range(1, 9)))]
-    # Ordered dataset (task, seed) pairs — curriculum order (P28) when a curriculum:
-    # block is present, else the plain tasks x seeds cartesian product.
     pairs = task_seed_pairs(cfg, task_entries, seeds)
+    eval_pairs = eval_task_seed_pairs(cfg, task_entries)
     if cfg.get("curriculum"):
         stages = load_curriculum(cfg)
         plan = " -> ".join(f"{s.name}({len(s.tasks)}x{len(s.seeds)})" for s in stages)
         print(f"curriculum ({len(stages)} stages): {plan}")
+    if eval_pairs:
+        print(f"held-out eval: {len(eval_pairs)} task-instance prompts")
     concurrency = int(env_cfg.get("concurrency", env_cfg.get("max_concurrent_envs", 8)))
     max_steps = int(env_cfg.get("max_steps", 4))
     rollout_cfg = cfg.get("rollout", {})
     multi_turn = bool(rollout_cfg.get("multi_turn", False))
     max_turns = int(rollout_cfg.get("max_turns", 64))
-    # Context budget for the running multi-turn transcript. None → the generator falls
-    # back to the model's own max_position_embeddings (never overflow). Set this lower in
-    # the config to bound per-step memory (the whole prompt+completion enters the loss).
+    # None -> the generator falls back to the model's own max_position_embeddings.
+    # Set lower in the config to bound per-step memory.
     max_prompt_tokens = rollout_cfg.get("max_prompt_tokens")
     max_prompt_tokens = int(max_prompt_tokens) if max_prompt_tokens else None
-    # Per-turn generation cap. None → the generator defaults by mode (generous for
-    # reasoning, tight for tool-only). Set rollout.max_turn_tokens to size a thinking turn.
+    # None -> the generator defaults by mode (generous for reasoning, tight otherwise).
     max_turn_tokens = rollout_cfg.get("max_turn_tokens")
     max_turn_tokens = int(max_turn_tokens) if max_turn_tokens else None
+
+    # Module-wide so the baked dataset prompt and the rollout prompt match. "full"
+    # discloses a copyable answer (zero within-group reward variance -> zero GRPO
+    # advantage); "geometry"/"none" force the model to actually search.
+    hint_level = str(cfg.get("prompt", {}).get("hint_level", "full"))
+    set_hint_level(hint_level)
+    print(f"prompt hint_level={hint_level} (of {HINT_LEVELS})")
 
     # ---- server: connect to an existing one or launch our own ---------------
     server = None
@@ -619,10 +816,19 @@ def main() -> int:
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
 
+        _cols = ("prompt", "seed", "task_json", "task_id", "family")
         rows = build_rows(base_url, pairs)
         render_prompts(rows, tokenizer, enable_thinking)
-        dataset = Dataset.from_list([{k: r[k] for k in ("prompt", "seed", "task_json", "task_id", "family")} for r in rows])
+        dataset = Dataset.from_list([{k: r[k] for k in _cols} for r in rows])
         print(f"dataset: {len(dataset)} task-instance prompts")
+
+        eval_rows: list[dict] = []
+        eval_dataset = None
+        if eval_pairs:
+            eval_rows = build_rows(base_url, eval_pairs)
+            render_prompts(eval_rows, tokenizer, enable_thinking)
+            eval_dataset = Dataset.from_list([{k: r[k] for k in _cols} for r in eval_rows])
+            print(f"eval dataset: {len(eval_dataset)} held-out prompts")
 
         import torch
 
@@ -633,10 +839,14 @@ def main() -> int:
             model_kwargs["attn_implementation"] = str(model_cfg["attn_implementation"])
         model = AutoModelForCausalLM.from_pretrained(model_name, **model_kwargs)
 
-        # Optional LoRA (the practical default for a 4B model on one GPU).
         peft_config = None
         peft_cfg = cfg.get("peft", {})
-        if peft_cfg.get("enabled", True):
+        if args.resume_adapter:
+            from peft import PeftModel
+
+            model = PeftModel.from_pretrained(model, args.resume_adapter, is_trainable=True)
+            print(f"resumed adapter from {args.resume_adapter}")
+        elif peft_cfg.get("enabled", True):
             from peft import LoraConfig
 
             peft_config = LoraConfig(
@@ -653,9 +863,10 @@ def main() -> int:
 
         grpo_cfg = dict(cfg.get("grpo", {}))
         grpo_cfg.setdefault("output_dir", "runs/grpo_rowhammer")
+        if args.output_dir:
+            grpo_cfg["output_dir"] = args.output_dir
 
-        # Monitoring: autorun wandb rollout/metric logging when wandb.enabled.
-        # Must run before make_reward_functions so the reward fn records rollouts.
+        # Monitoring: must run before make_reward_functions so the reward fn records rollouts.
         wandb_callbacks, wandb_enabled = setup_wandb(cfg, grpo_cfg)
 
         reward_env, reward_format = make_reward_functions(
@@ -664,25 +875,28 @@ def main() -> int:
         reward_cfg = cfg.get("reward", {})
         success_weight = float(reward_cfg.get("success_weight", 1.0))
         probe_shaping_weight = float(reward_cfg.get("probe_shaping_weight", 0.0))
-        # Bounded, training-only probe shaping (P28) — multi-turn only. Fail closed if
-        # the weight could rival a real success (SPEC §9); shaping must never *be*
-        # success. shaping_on gates whether the extra reward func is attached at all, so
-        # it provably vanishes from any config that doesn't ask for it (e.g. eval).
+        # Bounded, training-only probe shaping (P28) — multi-turn only. shaping_on gates
+        # whether the extra reward func is attached at all, so it provably vanishes from
+        # any config that doesn't ask for it (e.g. eval).
         shaping_on = multi_turn and probe_shaping_weight > 0.0
         if shaping_on:
             validate_shaping_weight(success_weight, probe_shaping_weight)
         if multi_turn:
-            # The trusted trajectory reward (no format shaping — the rollout enforces
-            # well-formed turns by construction), plus the bounded probe bonus if on.
+            # Trusted trajectory reward only (the rollout enforces well-formed turns by
+            # construction, so no format shaping), plus the bounded probe bonus if on.
             reward_weights = [success_weight] + ([probe_shaping_weight] if shaping_on else [])
         else:
             reward_weights = [success_weight, float(reward_cfg.get("format_weight", 0.1))]
 
-        # Only forward keys GRPOConfig actually defines, so a newer/older TRL
-        # doesn't reject the file (fail loud on genuinely unknown keys instead).
         valid = {f.name for f in dataclasses.fields(GRPOConfig)}
-        # reward_weights is derived from the reward: section, not the grpo: section.
-        grpo_cfg.pop("reward_weights", None)
+        if eval_dataset is not None:
+            grpo_cfg.setdefault("per_device_eval_batch_size", grpo_cfg.get("per_device_train_batch_size", 8))
+            grpo_cfg.setdefault("eval_steps", grpo_cfg.get("save_steps", 50))
+            strategy_key = "eval_strategy" if "eval_strategy" in valid else "evaluation_strategy"
+            grpo_cfg.setdefault(strategy_key, "steps")
+        # Only forward keys GRPOConfig actually defines, so a newer/older TRL doesn't
+        # reject the file (fail loud on genuinely unknown keys instead).
+        grpo_cfg.pop("reward_weights", None)  # derived from reward: above, not grpo:
         unknown = set(grpo_cfg) - valid
         if unknown:
             print(f"warning: dropping GRPO keys unsupported by installed TRL: {sorted(unknown)}")
@@ -699,21 +913,23 @@ def main() -> int:
             peft_config=peft_config,
             callbacks=wandb_callbacks or None,
         )
+        if eval_dataset is not None:
+            trainer_kwargs["eval_dataset"] = eval_dataset
         if multi_turn:
-            # Genuine turn-by-turn trajectories via a TRL custom rollout. Fail closed if
-            # the installed TRL has no rollout_func hook — never silently fall back to
-            # single-shot (that would train on a different, easier problem; SPEC §2).
+            # Fail closed if the installed TRL has no rollout_func hook — never silently
+            # fall back to single-shot (that would train on a different, easier problem).
             if "rollout_func" not in inspect.signature(GRPOTrainer.__init__).parameters:
                 raise SystemExit(
                     "rollout.multi_turn requires a TRL build exposing GRPOTrainer(rollout_func=...); "
                     f"installed trl {getattr(__import__('trl'), '__version__', '?')} does not. "
                     "Upgrade TRL (see IMPLEMENTATION_PLAN_V3 §2 open decision #1) or unset rollout.multi_turn."
                 )
-            # TRL calls rollout_func(prompts, trainer) with only the prompt strings, so
-            # map each pre-rendered prompt back to its (seed, task) for the episode.
+            # TRL calls rollout_func(prompts, trainer) with only prompt strings, so map
+            # each pre-rendered prompt back to its (seed, task). Includes eval prompts so
+            # eval rollouts resolve their episode too.
             prompt_to_meta = {
                 r["prompt"]: (int(r["seed"]), json.loads(r["task_json"]) if r["task_json"] else None)
-                for r in rows
+                for r in (rows + eval_rows)
             }
             rollout_func, reward_trusted, reward_probe_shaping = make_multiturn_rollout_func(
                 base_url,
@@ -726,9 +942,10 @@ def main() -> int:
                 temperature=float(grpo_cfg.get("temperature", 1.0)),
                 max_turn_tokens=max_turn_tokens,
                 max_prompt_tokens=max_prompt_tokens,
+                concurrency=concurrency,
                 emit_probe_shaping=shaping_on,
             )
-            # Reward funcs must line up positionally with reward_weights above: trusted
+            # Reward funcs line up positionally with reward_weights above: trusted
             # success first, the bounded probe bonus second iff shaping is on.
             reward_funcs = [reward_trusted] + ([reward_probe_shaping] if shaping_on else [])
             print(

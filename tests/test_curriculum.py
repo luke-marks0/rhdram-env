@@ -106,6 +106,28 @@ class CurriculumStructureTests(unittest.TestCase):
             [("a.yaml", 1), ("a.yaml", 2), ("b.yaml", 7)],
         )
 
+    def test_seed_range_shorthand_is_inclusive(self) -> None:
+        # [1, 4] expands to seeds 1,2,3,4 (both ends inclusive); an explicit list is
+        # honored verbatim.
+        base = {"name": "x", "tier": "tier0", "band": "", "tasks": ["a.yaml"], "reference_min_success": 1.0}
+        (ranged,) = load_curriculum({"curriculum": [{**base, "seed_range": [1, 4]}]})
+        self.assertEqual(ranged.seeds, (1, 2, 3, 4))
+        (single,) = load_curriculum({"curriculum": [{**base, "seed_range": [10, 10]}]})
+        self.assertEqual(single.seeds, (10,))
+        (listed,) = load_curriculum({"curriculum": [{**base, "seeds": [3, 1, 2]}]})
+        self.assertEqual(listed.seeds, (3, 1, 2))
+
+    def test_seed_range_rejects_bad_forms(self) -> None:
+        base = {"name": "x", "tier": "tier0", "band": "", "tasks": ["a.yaml"], "reference_min_success": 1.0}
+        with self.assertRaises(ValueError):  # start > stop
+            load_curriculum({"curriculum": [{**base, "seed_range": [9, 1]}]})
+        with self.assertRaises(ValueError):  # not a [start, stop] pair
+            load_curriculum({"curriculum": [{**base, "seed_range": [1, 2, 3]}]})
+        with self.assertRaises(ValueError):  # both forms at once
+            load_curriculum({"curriculum": [{**base, "seeds": [1], "seed_range": [1, 4]}]})
+        with self.assertRaises(ValueError):  # neither form
+            load_curriculum({"curriculum": [{**base}]})
+
 
 @unittest.skipUnless(WORKER.is_file(), "Phase 2 worker not built")
 class CurriculumReferenceGateTests(unittest.TestCase):
