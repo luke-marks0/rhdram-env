@@ -128,6 +128,7 @@ class Worker {
     if (t[0] == "READ") return read(id, t);
     if (t[0] == "WRITE") return write(id, t, false);
     if (t[0] == "ISSUE") return issue(id, t);
+    if (t[0] == "DECODE") return decode(id, t);
     return error_json(id, "BAD_SCHEMA", "unknown request type");
   }
 
@@ -156,6 +157,31 @@ class Worker {
         << ",\"level_names\":" << str_array(geometry_.level_names)
         << ",\"level_sizes\":" << int_array(geometry_.level_sizes)
         << "}}";
+    return out.str();
+  }
+
+  // DECODE id linear -> the true decoded coordinates of a linear address under
+  // the active mapper (P24). Side-effect-free: it does not tick the simulator,
+  // drain events, or touch counters — it reuses the recorder-published decoder
+  // over the controller's own mapper. Server-internal only (never exposed to the
+  // policy), used by the compiler to build candidate sets against the true (and,
+  // for discovery families, per-episode-secret) mapping.
+  std::string decode(const std::string& id, const std::vector<std::string>& t) {
+    if (t.size() != 3) return error_json(id, "BAD_SCHEMA", "DECODE id linear");
+    Ramulator::Addr_t linear = 0;
+    if (!parse_u64(t[2], linear)) return error_json(id, "BAD_SCHEMA", "invalid linear address");
+    auto& sink = rhdram::IssuedEventSink::instance();
+    if (!sink.has_decoder()) return error_json(id, "UNAVAILABLE_CAPABILITY", "address decoder not published");
+    std::vector<int> vec = sink.decode(linear);
+    std::ostringstream out;
+    out << "{\"ok\":true,\"id\":\"" << escape(id) << "\",\"cycle\":" << cycle_ << ",\"addr_vec\":{";
+    bool first = true;
+    for (size_t k = 0; k < vec.size() && k < geometry_.level_names.size(); ++k) {
+      if (!first) out << ',';
+      first = false;
+      out << '"' << lower(geometry_.level_names[k]) << "\":" << vec[k];
+    }
+    out << "}}";
     return out.str();
   }
 

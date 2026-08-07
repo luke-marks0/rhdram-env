@@ -156,6 +156,24 @@ class AddressResolverTests(unittest.TestCase):
             r.to_linear({"addr": 0})
         self.assertEqual(ctx.exception.code, "BAD_SCHEMA")
 
+    def test_bare_int_is_logical_shorthand(self) -> None:
+        # The compact HAMMER `rows` list (SPEC §8) is a plain address list, so a
+        # bare int must resolve exactly like {"kind":"logical","addr":N}.
+        r = self.resolver(Disclosure(mapping="physical", victim="exact"))
+        self.assertEqual(r.to_linear(4096), r.to_linear({"kind": "logical", "addr": 4096}))
+
+    def test_bare_int_shorthand_still_fails_closed_when_undisclosed(self) -> None:
+        r = self.resolver(Disclosure(mapping="opaque_handles", victim="row_handle"))
+        with self.assertRaises(AddressError) as ctx:
+            r.to_linear(4096)
+        self.assertEqual(ctx.exception.code, "ADDRESS_NOT_DISCLOSED")
+
+    def test_bool_is_not_treated_as_int_shorthand(self) -> None:
+        r = self.resolver(Disclosure(mapping="physical", victim="exact"))
+        with self.assertRaises(AddressError) as ctx:
+            r.to_linear(True)
+        self.assertEqual(ctx.exception.code, "BAD_SCHEMA")
+
 
 @unittest.skipUnless(WORKER.is_file(), "Phase 2 worker not built")
 class WorkerDifferentialTests(unittest.TestCase):

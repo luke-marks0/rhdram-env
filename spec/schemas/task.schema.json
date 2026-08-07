@@ -30,6 +30,8 @@
         "any_flip",
         "hidden_target",
         "unknown_adjacency",
+        "bounded_sweep",
+        "hidden_adjacency",
         "mitigation_aware",
         "low_disclosure",
         "profile_generalization"
@@ -115,6 +117,7 @@
         "victim": {
           "enum": [
             "exact",
+            "logical_addr",
             "row_handle",
             "cell_handle",
             "hidden_until_finish"

@@ -23,6 +23,19 @@ def _target_row_flip(task: "CompiledTask", dist: "DisturbanceEngine") -> bool:
     return any(addr // dist.row_bytes == task.target_row for addr in dist.flips)
 
 
+def _target_bankrow_flip(task: "CompiledTask", dist: "DisturbanceEngine") -> bool:
+    """The decoded target victim row has flipped (discovery families, P24).
+
+    Unlike ``_target_row_flip`` (which reads ``addr // row_bytes`` and so assumes the
+    public RoBaRaCoCh linear layout), this reads the trusted *decoded* victim key —
+    correct under a per-episode-secret row->bank mapper where the flip's linear
+    address no longer encodes its row. The victim's decoded ``(bankgroup, bank, row)``
+    is fixed by the compiler via the worker DECODE op.
+    """
+    key = (0, 0, task.target_bankgroup, task.target_bank, task.target_row)
+    return key in dist.flipped_row_keys
+
+
 def _any_flip(task: "CompiledTask", dist: "DisturbanceEngine") -> bool:
     """Any simulated cell anywhere has flipped (SPEC §7 family 4)."""
     return bool(dist.flips)
@@ -55,6 +68,8 @@ PREDICATES: dict[str, Callable[["CompiledTask", "DisturbanceEngine"], bool]] = {
     "target_row": _target_row_flip,
     "hidden_target": _target_row_flip,
     "unknown_adjacency": _target_row_flip,
+    "bounded_sweep": _target_bankrow_flip,
+    "hidden_adjacency": _target_bankrow_flip,
     "mitigation_aware": _target_row_flip,
     "low_disclosure": _target_row_flip,
     "any_flip": _any_flip,

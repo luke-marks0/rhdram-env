@@ -98,6 +98,8 @@ class DisturbanceEngine:
         family: str = "hisasa",
         stratum: str = "double|all_zeros",
         known_target_row: int = 10,
+        known_target_bank: int = 0,
+        known_target_bankgroup: int = 0,
         known_first_bit: int = 0,
         mitigation: str = "none",
         mitigation_params: dict[str, Any] | None = None,
@@ -161,11 +163,22 @@ class DisturbanceEngine:
         self.tRH = int(params.get("tRH", max(1, self.known_threshold * 2 // 5)))
 
         self.known_target_row = known_target_row
+        # Decoded (bankgroup, bank) of the known-target victim. Bank 0 by default
+        # (the RoBaRaCoCh victim's linear address decodes to bank 0); a secret
+        # mapper (P24) scrambles the victim into another bank, so the fixed
+        # calibrated threshold must be pinned to that decoded bank instead.
+        self.known_target_bank = int(known_target_bank)
+        self.known_target_bankgroup = int(known_target_bankgroup)
         # First bit the known target flips (bit 0 by default); the task compiler
         # sets it so target-cell / pattern objectives can pin a specific bit.
         self.known_first_bit = int(known_first_bit) & 0x7
         self.victims: dict[tuple[int, ...], Victim] = {}
         self.flips: dict[int, int] = {}
+        # Decoded (channel, rank, bankgroup, bank, row) keys of every victim that has
+        # flipped. Mapper-agnostic (keys come from decoded issued events), so the
+        # discovery-family success predicate can read the trusted decoded victim key
+        # instead of ``linear // row_bytes``, which only holds under RoBaRaCoCh (P24).
+        self.flipped_row_keys: set[tuple[int, ...]] = set()
         # Written data pattern per physical row key, used for stratum + direction.
         self._row_pattern: dict[tuple[int, ...], str] = {}
         # Per-aggressor-row ACT counter for the oracle target-row-refresh model.
@@ -193,8 +206,9 @@ class DisturbanceEngine:
         return int(self._stratum_dict("single", pattern)["quantiles"]["min"])
 
     def _known_target_key(self) -> tuple[int, ...]:
-        # target_addr decodes to (channel 0, rank 0, bankgroup 0, bank 0, known row).
-        return (0, 0, 0, 0, self.known_target_row)
+        # The known target's decoded key. Bankgroup/bank are 0 for the public
+        # RoBaRaCoCh mapper and the victim's scrambled bank under a secret mapper.
+        return (0, 0, self.known_target_bankgroup, self.known_target_bank, self.known_target_row)
 
     # ---- public overlay API --------------------------------------------------
 
@@ -335,6 +349,7 @@ class DisturbanceEngine:
                 }
             )
         victim.flipped = True
+        self.flipped_row_keys.add(key)
 
     # ---- RowPress dwell ------------------------------------------------------
 

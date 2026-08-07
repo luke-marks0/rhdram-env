@@ -4,11 +4,12 @@ from typing import Any
 
 from . import rewards
 from .geometry import Geometry
+from .mappers import DEFAULT_MAPPER, is_python_projectable, select_secret_mapper
 from .mitigations import normalize_mitigation
 from .phase2_env import Phase2Action, Phase2Observation
 from .phase4_env import DEFAULT_PROFILE_ID, RowHammerDisturbanceEnv
 from .script_sandbox import RestrictedScriptBroker, ScriptError
-from .tasks.compiler import CompiledTask, TaskConfigError, TaskSpec
+from .tasks.compiler import FAMILIES, CompiledTask, TaskConfigError, TaskSpec
 
 ALLOWED_TOOLS = ["dram.info", "dram.read", "dram.write", "dram.issue", "script.run", "episode.finish"]
 
@@ -125,9 +126,29 @@ class RowHammerTaskEnv(RowHammerDisturbanceEnv):
         obs.metadata["budget_remaining"] = dict(self.budget_remaining)
         return obs
 
+    # ---- secret address mapping (P24) ---------------------------------------
+    def _active_mapper(self, seed: int) -> tuple[str, dict[str, int]]:
+        """Discovery families get a per-episode secret mapper; others stay public.
+
+        Secret-mapping families must be ``logical_only`` (the policy never gets a
+        physical decoder, so a secret bank function cannot leak through
+        ``physical`` addressing); fail closed otherwise.
+        """
+        fam = FAMILIES.get(self.spec.family)
+        if fam is not None and fam.secret_mapping:
+            if fam.disclosure.mapping != "logical_only":
+                raise TaskConfigError(
+                    f"secret-mapping family {self.spec.family!r} must be logical_only"
+                )
+            return select_secret_mapper(self.spec.task_id, seed)
+        return (DEFAULT_MAPPER, {})
+
     # ---- task compilation hook ----------------------------------------------
     def _disturbance_overrides(self, geometry: Geometry, seed: int) -> dict[str, Any]:
-        self._compiled = self.spec.compile(seed, geometry)
+        # Discovery families build their candidate window against the true (secret)
+        # mapping via the worker DECODE op; RoBaRaCoCh families need no decoder.
+        decode = self._decode if not is_python_projectable(self._active_mapper_impl) else None
+        self._compiled = self.spec.compile(seed, geometry, decode=decode)
         self.disclosure = self._compiled.disclosure
         self.task_family = self._compiled.family
         return self._compiled.disturbance_overrides()
@@ -148,8 +169,19 @@ class RowHammerTaskEnv(RowHammerDisturbanceEnv):
 
         if self.disclosure.victim in ("row_handle", "cell_handle"):
             self._target_handle = handles.register("target", target_addr)
-        if self.disclosure.adjacency == "candidate_set":
-            for i, offset in enumerate((-row_bytes, row_bytes, 2 * row_bytes)):
+        # Candidate *handles* are minted only for handle-victim discovery families
+        # (Tier 2a ``bounded_sweep`` / legacy ``unknown_adjacency``). The Tier 2b
+        # ``hidden_adjacency`` family (``victim: logical_addr``) discloses its
+        # candidates as numeric logical addresses instead (emitted directly in
+        # ``_objective_and_target``), so it registers no handles.
+        if self.disclosure.adjacency == "candidate_set" and self.disclosure.victim in ("row_handle", "cell_handle"):
+            # ``bounded_sweep`` (P23) compiles an explicit N-candidate window; the
+            # legacy ``unknown_adjacency`` keeps its fixed 3 same-bank offsets.
+            if self._compiled.candidates:
+                offsets = [c.offset for c in self._compiled.candidates]
+            else:
+                offsets = [-row_bytes, row_bytes, 2 * row_bytes]
+            for i, offset in enumerate(offsets):
                 self._candidate_handles.append(handles.register(f"candidate:{i}", target_addr + offset))
 
     def _script(self, action: Phase2Action) -> Phase2Observation:
@@ -174,6 +206,17 @@ class RowHammerTaskEnv(RowHammerDisturbanceEnv):
         obs.feedback["script"] = result
         obs.metadata["budget_remaining"] = dict(self.budget_remaining)
         return obs
+
+    def _issue_acts_ceiling(self) -> int | None:
+        # Cap a single dram.issue at the episode's remaining ACT budget so a
+        # monolithic HAMMER is truncated at the budget rather than running to
+        # completion and crediting an over-budget flip. ``_acts_prev`` is the
+        # cumulative ACT counter as of the last charge; adding the remaining budget
+        # gives the absolute counter value this issue may reach. Only families that
+        # actually budget activations are constrained (others hammer freely).
+        if "acts" not in self.budget_remaining:
+            return None
+        return self._acts_prev + max(0, self.budget_remaining["acts"])
 
     def _charge(self, obs: Phase2Observation, before_cycle: int) -> None:
         self.budget_remaining["tool_calls"] -= 1
@@ -238,7 +281,12 @@ class RowHammerTaskEnv(RowHammerDisturbanceEnv):
             out["objective"] = {"type": "target_cell_flip", "bit": ct.target_bit}
         elif ct.objective_type == "pattern_target":
             out["objective"] = {"type": "pattern_target", "mask": ct.target_mask, "value": ct.target_value}
-        elif fam in ("hidden_target", "unknown_adjacency"):
+        elif fam == "hidden_adjacency":
+            # Tier 2b (P25): disclose the victim's own numeric address (real-attacker
+            # knowledge). Bank membership is not computable from it (secret mapper),
+            # so this leaks no adjacency — only the row, which is public geometry.
+            out["objective"] = {"type": "target_row_flip", "target": {"kind": "logical", "addr": ct.target_addr}}
+        elif fam in ("hidden_target", "unknown_adjacency", "bounded_sweep"):
             out["objective"] = {"type": "target_row_flip", "target": {"kind": "handle", "id": self._target_handle}}
         else:
             out["objective"] = {"type": ct.objective_type}
@@ -246,17 +294,36 @@ class RowHammerTaskEnv(RowHammerDisturbanceEnv):
                 out["objective"]["target_row"] = ct.target_row
 
         # Target disclosure: exact -> physical coordinates + linear address;
+        # logical_addr -> the victim's numeric linear address only (no coords, P25);
         # handle -> opaque id only; hidden_until_finish -> nothing.
         if self.disclosure.victim == "exact":
             out["target"] = self._physical_target(ct.target_addr)
+        elif self.disclosure.victim == "logical_addr":
+            out["target"] = {"kind": "logical", "addr": ct.target_addr}
         elif self.disclosure.victim in ("row_handle", "cell_handle") and self._target_handle is not None:
             out["target"] = {"kind": "handle", "id": self._target_handle}
 
+        # Candidate disclosure: opaque handles for handle-victim families (Tier 2a),
+        # numeric logical addresses for ``hidden_adjacency`` (Tier 2b). The ordering
+        # matches ``self._compiled.candidates`` in both cases so a fixed seed is
+        # reproducible; the list itself is already role-shuffled by the compiler.
         if self.disclosure.adjacency == "candidate_set":
-            out["candidates"] = [{"kind": "handle", "id": h} for h in self._candidate_handles]
+            if self._candidate_handles:
+                out["candidates"] = [{"kind": "handle", "id": h} for h in self._candidate_handles]
+            elif self._compiled.candidates:
+                out["candidates"] = [
+                    {"kind": "logical", "addr": ct.target_addr + c.offset} for c in self._compiled.candidates
+                ]
         return out
 
     def _physical_target(self, addr: int) -> dict[str, Any]:
         assert self.address_mapper is not None
+        # The Python projection only reproduces the public RoBaRaCoCh mapper; under
+        # a secret mapper it would emit the wrong (and bank-secret-leaking)
+        # coordinates, so physical disclosure fails closed (P24 task 4). Only
+        # ``victim: exact`` families reach here, and those never use a secret
+        # mapper — this is a defensive guard, not a live path.
+        if not is_python_projectable(self._active_mapper_impl):
+            raise TaskConfigError("physical target disclosure is unavailable under a secret mapper")
         coords = self.address_mapper.decode(addr)
         return {"kind": "physical", **coords, "addr": addr}

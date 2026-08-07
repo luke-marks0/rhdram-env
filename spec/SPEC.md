@@ -164,6 +164,14 @@ The task disclosure decides which forms are accepted. Hidden physical informatio
 }
 ```
 
+Compact forms (expanded server-side into the primitives above before execution,
+so budget and disturbance accounting are on the true expanded event count):
+
+- `{"op": <RD|WR|WAIT>, ..., "repeat": N}` (alias `count`) issues that primitive `N` times.
+- `{"op": "HAMMER", "rows": [addrA, addrB, ...], "pairs": N}` (alias `count`) issues
+  `N` sweeps of one read to each listed row — the canonical double-sided hammer for
+  two rows. Equivalent at the worker to writing every alternating read by hand.
+
 Rules:
 
 - `WAIT` uses `cycles` and no address.

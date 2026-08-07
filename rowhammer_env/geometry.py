@@ -56,3 +56,22 @@ class Geometry:
         for name in self.level_names[1:row_index]:
             below_row += _log2_exact(self.level_sizes[name])
         return 1 << (tx_offset + below_row)
+
+    def public_block(self) -> dict[str, Any]:
+        """Architecture-level DRAM geometry disclosed unconditionally (P21).
+
+        Standard-level public information — the row stride and the row/bank/
+        bankgroup *counts* plus the standard name — identical across every episode
+        of a profile, so it leaks nothing about the hidden target. Derived purely
+        from the worker-reported level sizes (not the active address mapper), so it
+        is byte-identical whatever mapping function an episode secretly uses; the
+        bank-select *bit function* itself (P24's per-episode secret) is deliberately
+        never exposed here — only sizes and the stride.
+        """
+        return {
+            "row_bytes": self.row_stride,
+            "row_count": self.level_sizes["row"],
+            "bank_count": self.level_sizes["bank"],
+            "bankgroup_count": self.level_sizes.get("bankgroup", 1),
+            "standard": self.standard,
+        }

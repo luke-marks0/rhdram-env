@@ -40,6 +40,27 @@ Ramulator and OpenEnv are admitted for the Phase 1 bootstrap; the `ddr4_vts25`
 source and the `ddr4_vts25_v1` profile are admitted. HBM2 remains non-admitted
 until its license, hashes, and validation package are resolved.
 
+## Quickstart
+
+One command bootstraps a fresh machine: check the toolchain, install the Python
+deps, fetch the pinned upstream sources, build the native Ramulator worker,
+rebuild the signed DDR4 profile, and run a verification gate. Every stage is
+idempotent and safe to re-run.
+
+```sh
+./setup.sh                 # full setup + fast verify (P0/P1/P2/P3 gates)
+./setup.sh --train         # also install the GRPO training extras
+./setup.sh --venv          # install deps into a local ./.venv
+./setup.sh --clean         # force a clean native rebuild (after a source re-pin)
+./setup.sh --full-verify   # run the complete release re-qualification gate
+./setup.sh --help          # all options
+```
+
+Host prerequisites: `python3` (3.10+), `git`, `cmake`, a C++20 `g++`, and
+optionally `ninja` for faster native builds. The remaining sections document the
+individual phase gates that `setup.sh` orchestrates; run them directly when
+working on a single phase.
+
 Run the phase 0 gate:
 
 ```sh
@@ -139,3 +160,37 @@ Phase 20 runs the release re-qualification gate:
 python3 -B scripts/verify_release.py
 python3 -B scripts/verify_phase20.py
 ```
+
+## GRPO training (TRL)
+
+`scripts/train_grpo.py` trains a small (default `Qwen/Qwen3-4B`) model against the
+served environment with TRL's `GRPOTrainer`. Each dataset row is one task instance
+(task config + seed); the environment discloses its objective/target at reset,
+which is baked into the prompt. GRPO samples several completions per prompt, each
+is parsed into a tool-call sequence and **replayed through the real OpenEnv
+server**, and the reward is the trusted sparse episode reward (`1.0` only on a real
+flip). Hyperparameters — including the `enable_thinking` toggle that disables the
+Qwen3 `<think>` block — live in `configs/training/grpo_qwen8b.yaml`.
+
+```sh
+python3 -m pip install -r requirements.txt -r requirements-train.txt
+
+# Validate the data + reward pipeline first (no GPU/model load; needs a built
+# Phase-2 worker and the P17 HTTP deps):
+python3 -B scripts/train_grpo.py --config configs/training/grpo_qwen8b.yaml --dry-run
+
+# Train (launches its own server unless env.base_url is set):
+python3 -B scripts/train_grpo.py --config configs/training/grpo_qwen8b.yaml
+```
+
+### Monitoring (Weights & Biases)
+
+Set `wandb.enabled: true` in the config (on by default) and training autologs to
+wandb: the TRL scalar metrics, TRL's own prompt/completion table
+(`log_completions`), and a custom per-rollout table + metrics from
+`rowhammer_env.llm.wandb_logging` — the parsed tool calls, the trusted env reward,
+and the emitted command-list size (`rollout/n_commands_mean|max`, `rollout/n_pairs_mean`).
+The command-list size is the key signal: a real flip needs on the order of the
+disclosed `known_threshold` activations, so it makes plain whether completions are
+anywhere near the threshold or just truncated at `max_completion_length`. Needs
+`pip install wandb` and a `wandb login` (or set `wandb.mode: offline`).

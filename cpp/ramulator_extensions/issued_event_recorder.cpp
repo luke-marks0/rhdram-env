@@ -56,6 +56,22 @@ class IssuedEventRecorder : public IControllerPlugin, public Implementation {
     g.level_sizes = spec.organization.level_sizes;
     g.command_names = spec.command_names;
     rhdram::IssuedEventSink::instance().set_geometry(g);
+
+    // Publish a side-effect-free decoder over the controller's *active* mapper so
+    // the worker's DECODE op (P24) reports true coordinates for any mapper without
+    // re-deriving the bit function in Python. The admitted config is single-channel
+    // (CacheLineInterleave collapses to channel 0), so the intra-channel address is
+    // the linear address itself; the mapper fills addr_vec[1..N] from it.
+    ControllerBase* ctrl = m_ctrl;
+    rhdram::IssuedEventSink::instance().set_decoder([ctrl](uint64_t linear) {
+      Request req;
+      req.addr = static_cast<Addr_t>(linear);
+      req.intra_channel_addr = static_cast<Addr_t>(linear);
+      ctrl->m_addr_mapper->apply(req);
+      std::vector<int> vec(req.addr_vec.begin(), req.addr_vec.end());
+      if (!vec.empty()) vec[0] = 0;  // single-channel: channel is always 0
+      return vec;
+    });
   }
 
   void on_issue(const Request& req) override {

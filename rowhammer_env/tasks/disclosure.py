@@ -63,6 +63,18 @@ class Disclosure:
         """Exact target coordinates are disclosed only at ``victim: exact``."""
         return self.victim == "exact"
 
+    def expose_victim_address(self) -> bool:
+        """Whether the victim's own *linear* address is disclosed to the policy.
+
+        ``exact`` hands physical coordinates (and the linear address); the Tier 2b
+        ``logical_addr`` level (P25) hands the victim's numeric logical address
+        *without* physical coordinates — the real-attacker-knowledge model, where
+        the attacker knows its own allocation's address but the address->bank
+        mapping is a per-episode secret (P24), so bank membership is not computable
+        from that number and must be reverse-engineered by timing (DRAMA).
+        """
+        return self.victim in ("exact", "logical_addr")
+
     def as_public(self) -> dict[str, str]:
         return {
             "mapping": self.mapping,
@@ -142,6 +154,13 @@ class AddressResolver:
         self.handles = handles
 
     def to_linear(self, form: Any) -> int:
+        # A bare (non-bool) int is shorthand for {"kind":"logical","addr":N} — the
+        # compact HAMMER `rows`/`addrs` list (SPEC §8) is documented as a plain
+        # address list, so this is the one place that needs to accept it; it still
+        # goes through the normal `logical`-form disclosure/allowed_forms check
+        # below, so a task that hides logical addressing still fails closed.
+        if isinstance(form, int) and not isinstance(form, bool):
+            form = {"kind": "logical", "addr": form}
         if not isinstance(form, dict):
             raise AddressError("BAD_SCHEMA", "address must be an object")
         kind = form.get("kind")
