@@ -16,10 +16,10 @@ Usage
     # 1) (optional) let the trainer launch its own server, or start one yourself:
     #    python3 -m rowhammer_env.server.app
     # 2) run training:
-    python3 -B scripts/train_grpo.py --config configs/training/grpo_qwen8b.yaml
+    python3 -B scripts/train_grpo.py --config configs/training/grpo_curriculum.yaml
 
     # dry run: build the dataset + score the reference hammer, no model load:
-    python3 -B scripts/train_grpo.py --config configs/training/grpo_qwen8b.yaml --dry-run
+    python3 -B scripts/train_grpo.py --config configs/training/grpo_curriculum.yaml --dry-run
 
 Requires the training extras (``requirements-train.txt``) and the P17 HTTP
 runtime (``requirements.txt``), plus a built Phase-2 worker (``build/phase2``).
