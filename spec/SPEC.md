@@ -175,7 +175,7 @@ so budget and disturbance accounting are on the true expanded event count):
 Rules:
 
 - `WAIT` uses `cycles` and no address.
-- `WR` requires data; `RD` may return data only if the task permits command-read feedback.
+- `WR` requires data. `RD` (via `dram.read`, or an `RD` in `dram.issue`) returns the simulated bytes of a disclosed address, with any committed disturbance flips applied. The `feedback` disclosure axis gates the *issued-event trace / timing digest*, not the returned bytes: at `summarized_counts`/`reward_only` the trace and `timing_digest` are withheld while the read bytes and public counters still return.
 - Illegal timing or address requests are rejected with stable errors and do not update disturbance state.
 - Disturbance accounting uses actual issued events after controller scheduling, not command list order alone.
 - Each action has a budget cost: tool call, simulated cycles, ACT count, bytes read/written, script CPU time, and trace volume.
@@ -259,7 +259,6 @@ budgets:
   tool_calls: 200
   acts: 100000
   cycles: 5000000
-  script_ms: 0
 reward: sparse_success
 ```
 

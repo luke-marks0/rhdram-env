@@ -47,7 +47,7 @@ DISCOVERY_TASK = {
         "feedback": "full_trace",
     },
     "objective": {"type": "target_row_flip", "target": "row_handle"},
-    "budgets": {"tool_calls": 500, "acts": 400_000, "cycles": 60_000_000, "script_ms": 0},
+    "budgets": {"tool_calls": 500, "acts": 400_000, "cycles": 60_000_000},
     "reward": "sparse_success",
 }
 

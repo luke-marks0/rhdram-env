@@ -180,10 +180,6 @@
         "cycles": {
           "type": "integer",
           "minimum": 1
-        },
-        "script_ms": {
-          "type": "integer",
-          "minimum": 0
         }
       }
     },

@@ -13,7 +13,9 @@ disturbance engine have produced the task condition.
 - `dram.write`: write base64 bytes to a disclosed address.
 - `dram.issue`: issue `RD`, `WR`, or `WAIT` commands through the Ramulator worker.
 - `script.run`: run `python-rh-sdk` code in the P18 OS sandbox; `rh` calls are
-  brokered back to the same tools.
+  brokered back to the same tools. Bounded by the per-call `timeout_ms` arg (a
+  wall-clock safety deadline) and the same episode budgets as its brokered inner
+  calls — there is no separate `script_ms` budget.
 - `episode.finish`: terminate the episode and receive reward from trusted state.
 
 `rowhammer_env.llm.TOOL_SCHEMAS` exposes this surface as function/tool schemas
@@ -55,7 +57,6 @@ each observation's `budget_remaining`:
   real-chip profile; ≈5000 activations double-sided here) is *itself* an activation
   count.
 - `cycles` — simulated DRAM-controller cycles (a wall-clock proxy).
-- `script_ms` — CPU budget for `script.run` (0 disables the script path).
 
 **Why an episode has a budget.** It models a real attacker's finite effort.
 Read-disturbance is not free: an aggressor row must be activated `hcfirst` times

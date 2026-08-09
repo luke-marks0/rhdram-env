@@ -37,6 +37,5 @@ budgets:
   tool_calls: 200
   acts: 90000
   cycles: 240000000
-  script_ms: 0
 reward: sparse_success
 difficulty: hard
