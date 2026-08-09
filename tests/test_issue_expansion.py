@@ -55,6 +55,14 @@ class ExpandCommandsTest(unittest.TestCase):
         out = expand_commands([{"op": "HAMMER", "rows": [A, B], "pairs": 25000}])
         self.assertEqual(len(out), 50000)
 
+    def test_controller_generated_ops_are_illegal_command(self):
+        # @spec:tool-dram-issue — ACT/PRE/REF/RFM are controller-generated, so they
+        # are not policy-issuable ops.
+        for op in ("ACT", "PRE", "REF", "RFM"):
+            with self.subTest(op=op), self.assertRaises(IssueExpansionError) as ctx:
+                expand_commands([{"op": op, "addr": A}])
+            self.assertEqual(ctx.exception.code, "ILLEGAL_COMMAND")
+
     def test_unknown_op_is_illegal_command(self):
         with self.assertRaises(IssueExpansionError) as ctx:
             expand_commands([{"op": "NOPE"}])

@@ -182,7 +182,8 @@ the true expanded event count:
   equivalent at the worker to writing every alternating RD by hand.
 Expansion beyond `MAX_ISSUE_ACTIVATIONS` (2,000,000) fails `ILLEGAL_COMMAND`.
 `ACT`/`PRE`/`REF`/`RFM` are **controller-generated, not policy-issuable** — the
-worker rejects them with `ILLEGAL_COMMAND` (see [Drift](#drift)).
+worker rejects them with `ILLEGAL_COMMAND`. They appear only in the issued-event
+stream, where they drive disturbance accounting.
 Defined in: `rowhammer_env/phase2_env.py` (`expand_commands`, `_issue`),
 `cpp/simulator_service/ramulator_worker.cpp` (`issue`).
 
@@ -673,17 +674,7 @@ Deliberately **not** tagged as contracts — in flux, aspirational, or advisory:
 Places where code and the design bundle / docs / comments currently disagree.
 Flagged, not resolved — a human decides which side is authoritative.
 
-1. **Policy-issuable command op set.** `spec/SPEC.md §8` and
-   `spec/schemas/action.schema.json` list `ACT | PRE | RD | WR | REF | RFM | WAIT`
-   (+`HAMMER`) as command ops. The implementation only admits `RD`/`WR`/`WAIT`
-   (+ compact `HAMMER`/`repeat`); `ACT`/`PRE`/`REF`/`RFM` are rejected with
-   `ILLEGAL_COMMAND` (they are controller-generated). The schema/§8 command form is
-   broader than what the worker accepts.
-   Files: `spec/schemas/action.schema.json` (command `op` enum),
-   `spec/SPEC.md` §8 command form vs `cpp/simulator_service/ramulator_worker.cpp`
-   (`issue`), `rowhammer_env/phase2_env.py` (`expand_commands`).
-
-2. **Doc phase naming lag.** `docs/api.md` and inline comments reference "the Tier 2b
+1. **Doc phase naming lag.** `docs/api.md` and inline comments reference "the Tier 2b
    numeric-address family" generically; the concrete family name is
    `hidden_adjacency`. Not a behavior bug, but doc phrasing trails the code names.
    Files: `docs/api.md` vs `rowhammer_env/tasks/compiler.py` (`FAMILIES`).

@@ -19,7 +19,7 @@ The suite should be thorough but organized around release gates. Prefer semantic
 | R1 | Build pinned Ramulator 2.1 from source. | Reproducible build; version and commit recorded. |
 | R2 | External/frontend read/write completion path. | Requests complete through real Ramulator. |
 | R3 | Direct command legality. | Illegal timings/addresses rejected without disturbance updates. |
-| R4 | ACT/PRE/RD/WR/WAIT sequence. | Issued event trace matches Ramulator state and cycles. |
+| R4 | RD/WR/WAIT sequence. | Issued event trace (incl. the controller's ACT/PRE) matches Ramulator state and cycles. |
 | R5 | Refresh events. | Refresh timing and decoded coverage visible to extension. |
 | R6 | Queue full/backpressure. | Stable `QUEUE_FULL`; no hidden info leak. |
 | R7 | Replay determinism. | Same manifest+seed yields identical public trace and reward. |

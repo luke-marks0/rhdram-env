@@ -82,16 +82,12 @@
         "op"
       ],
       "additionalProperties": false,
-      "description": "A primitive DRAM command, or a compact form the environment expands server-side into primitives before execution. `repeat`/`count` repeat a primitive; `HAMMER` expands to `pairs` alternating-read sweeps over `rows` (the canonical double-sided hammer). Expansion produces real issued events, so budget/disturbance accounting is on the expanded count.",
+      "description": "A policy-issuable DRAM command (`RD`, `WR`, `WAIT`), or a compact form the environment expands server-side into those primitives before execution. `repeat`/`count` repeat a primitive; `HAMMER` expands to `pairs` alternating-read sweeps over `rows` (the canonical double-sided hammer). Expansion produces real issued events, so budget/disturbance accounting is on the expanded count. ACT/PRE/REF/RFM are controller-generated and are not policy-issuable; they appear only in the issued-event stream.",
       "properties": {
         "op": {
           "enum": [
-            "ACT",
-            "PRE",
             "RD",
             "WR",
-            "REF",
-            "RFM",
             "WAIT",
             "HAMMER"
           ]
