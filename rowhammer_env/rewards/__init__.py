@@ -1,3 +1,3 @@
-from .predicates import PREDICATES, success_for
+from .predicates import PREDICATES, TrustedByteReader, success_for
 
-__all__ = ["PREDICATES", "success_for"]
+__all__ = ["PREDICATES", "TrustedByteReader", "success_for"]
