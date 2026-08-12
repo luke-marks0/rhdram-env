@@ -327,14 +327,24 @@ class TaskSpec:
     ) -> "CompiledTask":
         """Compile the episode target + candidate window against the real geometry.
 
-        ``decode`` (the worker ``DECODE`` op, P24) is provided by the env for
-        discovery families running under a per-episode *secret* address mapper: the
-        candidate window is built against the true mapping, and the victim's decoded
-        ``(bankgroup, bank)`` is recorded so the success predicate reads the trusted
-        decoded key instead of assuming the public RoBaRaCoCh linear layout. For
-        RoBaRaCoCh families ``decode`` is ``None`` and the victim sits in bank 0.
+        ``decode`` is the worker ``DECODE`` op (P24). Whether it is *required* is a
+        property of the family, not of the caller's intent: a ``secret_mapping``
+        family is exactly the family the env runs under a per-episode secret mapper
+        (``phase5_env._active_mapper``), and under that mapper neither the victim's
+        bank nor the candidate window is computable in Python — so compiling one
+        without a decoder fails closed here rather than yielding a bank-0 victim key
+        no flip can ever match and an empty candidate window. Every other family runs
+        under the public ``RoBaRaCoCh`` mapper, whose decode the Python projection
+        reproduces exactly, so ``decode`` is optional for them. Either way
+        :meth:`_decode_victim` resolves the victim's full decoded key, so no
+        coordinate of it is assumed.
         """
         fam = FAMILIES[self.family]
+        if fam.secret_mapping and decode is None:
+            raise TaskConfigError(
+                f"task family {self.family!r} runs under a per-episode secret address "
+                "mapper; compiling it requires the worker DECODE op"
+            )
         row_count = int(geometry.level_sizes.get("row", 1 << 16))
         row_bytes = geometry.row_stride
         rng = self._rng(seed, "target")
@@ -363,13 +373,17 @@ class TaskSpec:
         disturbance_family = self._resolve_disturbance_family(seed)
 
         target_addr = target_row * row_bytes
-        target_bankgroup = 0
-        target_bank = 0
+        victim = self._decode_victim(geometry, target_addr, decode)
+        target_channel = int(victim.get("channel", 0))
+        target_rank = int(victim.get("rank", 0))
+        target_bankgroup = int(victim.get("bankgroup", 0))
+        target_bank = int(victim.get("bank", 0))
         candidates: tuple[Candidate, ...] = ()
-        if decode is not None:
-            dv = decode(target_addr)
-            target_bankgroup = int(dv.get("bankgroup", 0))
-            target_bank = int(dv.get("bank", 0))
+        if fam.secret_mapping:
+            # A candidate window exists because the family is a discovery family —
+            # not because a decoder happened to be supplied. The guard at the top of
+            # ``compile`` has already established that ``decode`` is the worker's, so
+            # the window is built against the true secret mapping.
             if self.family == "bounded_sweep":
                 candidates = self._build_candidates(
                     seed, geometry, target_row, row_count, (target_bankgroup, target_bank), decode
@@ -395,6 +409,8 @@ class TaskSpec:
             target_value=int(value) & 0xFF,
             target_mask=int(mask) & 0xFF,
             target_addr=target_addr,
+            target_channel=target_channel,
+            target_rank=target_rank,
             target_bank=target_bank,
             target_bankgroup=target_bankgroup,
             engine_known_row=engine_known_row,
@@ -403,6 +419,33 @@ class TaskSpec:
             row_bytes=row_bytes,
             candidates=candidates,
         )
+
+    # @spec:task-compiler
+    @staticmethod
+    def _decode_victim(
+        geometry: Geometry,
+        target_addr: int,
+        decode: "Callable[[int], dict[str, int]] | None",
+    ) -> dict[str, int]:
+        """Trusted decoded coordinates of the victim's linear address.
+
+        Every level the success predicate's row key needs — channel and rank as
+        well as bankgroup and bank — comes from a decode of the victim address, so
+        none of them is assumed. Under a per-episode secret mapper the worker
+        ``DECODE`` op is the only authority (and :meth:`compile` refuses to compile
+        such a family without it); under the public ``RoBaRaCoCh`` mapper
+        the Python projection in ``tools.addressing`` reproduces the worker's decode
+        exactly (``mappers.is_python_projectable``), so it answers the same question
+        without a worker round trip. A geometry that projection cannot represent
+        (multi-channel, per ``@spec:sim-not-modeled``) fails closed here rather than
+        producing a key that silently never matches a flip.
+        """
+        if decode is not None:
+            return decode(target_addr)
+        try:
+            return AddressMapper(geometry).decode(target_addr)
+        except ValueError as exc:
+            raise TaskConfigError(f"cannot decode the victim address for this geometry: {exc}") from exc
 
     @staticmethod
     def _bank_slot_addrs(
@@ -449,8 +492,8 @@ class TaskSpec:
         Tier 2a candidates are opaque **handles** whose linear offset is hidden, so
         decoy placement need only control the bank/adjacency *mix*: two same-bank
         neighbours (aggressors), same-bank-far decoys, and different-bank decoys. The
-        list is shuffled per episode so position leaks no role. (Tier 2b —
-        :meth:`_build_numeric_candidates` — additionally hides proximity, because
+        list is shuffled per episode so position leaks no role. (``hidden_adjacency``
+        — :meth:`_build_numeric_candidates` — additionally hides proximity, because
         there the address itself is disclosed.)
         """
         mapper = AddressMapper(geometry)  # public raw RoBaRaCoCh field positions
@@ -628,14 +671,34 @@ class CompiledTask:
     disturbance_family: str | None
     seed: int
     row_bytes: int
-    # Decoded victim (bankgroup, bank). 0/0 under the public RoBaRaCoCh mapper (the
-    # victim's linear address sits in bank 0); under a secret mapper (P24) these are
-    # the true decoded coordinates, so the fixed known threshold and the success
-    # predicate land on the real victim key rather than an assumed bank 0.
+    # The victim's *decoded* physical coordinates, from the worker DECODE op under a
+    # secret mapper (P24) and from the equivalent public projection otherwise — never
+    # assumed. All zero under the public RoBaRaCoCh mapper, whose row-aligned victim
+    # address has every sub-row field at 0; a secret mapper scrambles the bank, and a
+    # multi-rank part can place the victim off rank 0. The fixed known threshold and
+    # the success predicate both key on these, so they must be the real ones.
+    target_channel: int = 0
+    target_rank: int = 0
     target_bank: int = 0
     target_bankgroup: int = 0
     # Tier 2a candidate window (P23); empty for every non-``bounded_sweep`` family.
     candidates: tuple[Candidate, ...] = ()
+
+    @property
+    def target_row_key(self) -> tuple[int, ...]:
+        """The victim's decoded ``(channel, rank, bankgroup, bank, row)`` key.
+
+        Same shape and origin as the keys ``DisturbanceEngine.flipped_row_keys``
+        holds (both decode the same address space), so the target-row success
+        predicates compare the two directly.
+        """
+        return (
+            self.target_channel,
+            self.target_rank,
+            self.target_bankgroup,
+            self.target_bank,
+            self.target_row,
+        )
 
     def disturbance_overrides(self) -> dict[str, Any]:
         """Engine constructor overrides implied by this compiled task."""
@@ -644,9 +707,11 @@ class CompiledTask:
             # The known target's first flipped bit is the (sampled or explicit)
             # target bit, so target-cell / pattern objectives land on it.
             overrides["known_first_bit"] = self.target_bit
-            # Pin the known threshold to the victim's *decoded* bank. Defaults to
-            # bank 0 (RoBaRaCoCh victim), so non-secret families are unchanged;
-            # under a secret mapper the victim's scrambled bank is used instead.
+            # Pin the known threshold to the victim's *decoded* coordinates, so the
+            # fixed calibrated threshold lands on the same key the success predicate
+            # reads rather than on an assumed channel 0 / rank 0 / bank 0.
+            overrides["known_target_channel"] = self.target_channel
+            overrides["known_target_rank"] = self.target_rank
             overrides["known_target_bank"] = self.target_bank
             overrides["known_target_bankgroup"] = self.target_bankgroup
         if self.disturbance_family:

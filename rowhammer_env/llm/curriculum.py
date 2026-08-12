@@ -8,7 +8,8 @@ training config into ordered :class:`CurriculumStage` objects.
 
 The ordering (IMPLEMENTATION_PLAN_V3 P28.1):
 
-    Tier 0 known-target  →  Tier 2a easy → medium → hard  →  Tier 2b easy → medium → hard
+    Tier 0 known-target  →  ``bounded_sweep`` (Tier 2a) easy → medium → hard
+                         →  ``hidden_adjacency`` (Tier 2b) easy → medium → hard
 
 **The gate is the reference policy, not this module.** Each stage carries a
 ``reference_min_success`` — the fraction of episodes the deterministic P26
