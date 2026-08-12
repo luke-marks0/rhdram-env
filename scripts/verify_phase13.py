@@ -38,7 +38,7 @@ from rowhammer_env import Phase2Action, RowHammerDisturbanceEnv, RowHammerTaskEn
 from rowhammer_env.disturbance import DisturbanceEngine  # noqa: E402
 from rowhammer_env.geometry import Geometry  # noqa: E402
 from rowhammer_env.tasks.compiler import BAND_ACTS, BAND_WINDOW, FAMILIES, TaskSpec  # noqa: E402
-from rowhammer_env.tools.addressing import COORD_KEYS  # noqa: E402
+from rowhammer_env.tools.addressing import COORD_KEYS, AddressMapper  # noqa: E402
 
 TASK_DIR = ROOT / "configs" / "tasks"
 SCHEMA = json.loads((ROOT / "spec" / "schemas" / "task.schema.json").read_text())
@@ -196,7 +196,7 @@ def _engine_any_flip_success(geo: Geometry, task_id: str, seed: int, acts_budget
     Fast (no worker), and P11 already gates worker/engine ACT-equivalence.
     """
     ct = TaskSpec.from_config({"id": task_id, "family": "any_flip"}).compile(seed, geo)
-    eng = DisturbanceEngine(geometry=geo, seed=seed)
+    eng = DisturbanceEngine(geometry=geo, row_encoder=AddressMapper(geo).encode, seed=seed)
     v = ct.target_row
     key = (0, 0, 0, 0, v)
     la, ra = v * eng.row_bytes - eng.row_bytes, v * eng.row_bytes + eng.row_bytes

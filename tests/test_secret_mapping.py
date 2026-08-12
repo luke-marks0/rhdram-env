@@ -126,6 +126,76 @@ class DecodeAndScatterTests(unittest.TestCase):
 
 
 @unittest.skipUnless(WORKER.is_file(), "Phase 2 worker not built")
+class EncodeOpTests(unittest.TestCase):
+    """The worker ``ENCODE`` op — the inverse of ``DECODE`` (SPEC Drift #5a).
+
+    The disturbance overlay anchors each victim's flips at that row's own column-0
+    address. Under a secret row->bank mapping that address is not the aggressor's
+    address plus a multiple of the row stride, so it can only come from the
+    controller's own mapper — inverted here, and checked against a forward decode.
+    """
+
+    LEVELS = ("channel", "rank", "bankgroup", "bank", "row", "column")
+
+    def _client(self, impl: str, params: dict) -> WorkerClient:
+        return WorkerClient(WORKER, worker_config_for_mapper(BASE_CONFIG, impl, params))
+
+    def _decode(self, cli: WorkerClient, linear: int) -> dict:
+        resp = cli.call(WorkerRequest("DECODE", "d", (str(linear),)))
+        self.assertTrue(resp.get("ok"), resp)
+        return resp["addr_vec"]
+
+    def _encode(self, cli: WorkerClient, coords: dict) -> dict:
+        return cli.call(WorkerRequest("ENCODE", "e", tuple(str(coords[k]) for k in self.LEVELS)))
+
+    def test_encode_inverts_decode_under_every_admitted_mapper(self) -> None:
+        for impl, params in ((DEFAULT_MAPPER, {}), *SECRET_MAPPERS):
+            cli = self._client(impl, params)
+            try:
+                for i in range(200):
+                    linear = ((i * 5779 + 3) * 64) % (1 << 27)  # transaction-aligned, spread
+                    resp = self._encode(cli, self._decode(cli, linear))
+                    self.assertTrue(resp.get("ok"), (impl, params, resp))
+                    self.assertEqual(resp["linear"], linear, (impl, params, linear))
+            finally:
+                cli.close()
+
+    def test_same_bank_neighbour_is_not_the_arithmetic_address_under_a_secret_mapper(self) -> None:
+        # Exactly the defect the op exists to fix: the row at +1 *in the same bank*
+        # is `addr + row_stride` under the public mapper and something else under
+        # every secret one, so an overlay anchored arithmetically files its flips at
+        # an address that decodes to a different bank.
+        for impl, params in ((DEFAULT_MAPPER, {}), *SECRET_MAPPERS):
+            cli = self._client(impl, params)
+            try:
+                base = 4096 * ROW_BYTES
+                coords = dict(self._decode(cli, base), column=0)
+                neighbour = self._encode(cli, dict(coords, row=coords["row"] + 1))
+                self.assertTrue(neighbour.get("ok"), neighbour)
+                if impl == DEFAULT_MAPPER:
+                    self.assertEqual(neighbour["linear"], base + ROW_BYTES)
+                else:
+                    self.assertNotEqual(neighbour["linear"], base + ROW_BYTES)
+                # Whatever the mapper, the encoded address really is that row/bank.
+                self.assertEqual(self._decode(cli, neighbour["linear"]),
+                                 dict(coords, row=coords["row"] + 1))
+            finally:
+                cli.close()
+
+    def test_malformed_or_out_of_range_coordinates_fail_closed(self) -> None:
+        cli = self._client(DEFAULT_MAPPER, {})
+        try:
+            for args in (("0", "0"), ("0",) * 7):
+                resp = cli.call(WorkerRequest("ENCODE", "e", args))
+                self.assertEqual(resp["error"]["code"], "BAD_SCHEMA", args)
+            for bad in ({"row": 1 << 20}, {"bank": 4}, {"column": 1 << 12}, {"row": -1}):
+                coords = dict.fromkeys(self.LEVELS, 0) | bad
+                self.assertEqual(self._encode(cli, coords)["error"]["code"], "BAD_SCHEMA", bad)
+        finally:
+            cli.close()
+
+
+@unittest.skipUnless(WORKER.is_file(), "Phase 2 worker not built")
 class SecretMappingEnvTests(unittest.TestCase):
     def _bounded_sweep(self, seed: int = 7, band: str = "easy", **kw) -> RowHammerTaskEnv:
         budgets = kw.pop("budgets", {"tool_calls": 60, "acts": 80_000, "cycles": 160_000_000})
@@ -152,14 +222,15 @@ class SecretMappingEnvTests(unittest.TestCase):
         finally:
             env.close()
 
-    def test_decode_is_not_a_policy_tool(self) -> None:
+    def test_address_ops_are_not_policy_tools(self) -> None:
         env = self._bounded_sweep()
         try:
-            self.assertNotIn("DECODE", ALLOWED_TOOLS)
-            self.assertNotIn("dram.decode", ALLOWED_TOOLS)
-            # A policy DECODE attempt is an unsupported tool, not a decode.
-            step = env.step(Phase2Action(tool="DECODE", args={"addr": 0}))
-            self.assertEqual(step.error["code"], "UNSUPPORTED_TOOL")
+            for tool in ("DECODE", "dram.decode", "ENCODE", "dram.encode"):
+                self.assertNotIn(tool, ALLOWED_TOOLS)
+            # A policy attempt at either address op is an unsupported tool.
+            for tool in ("DECODE", "ENCODE"):
+                step = env.step(Phase2Action(tool=tool, args={"addr": 0}))
+                self.assertEqual(step.error["code"], "UNSUPPORTED_TOOL", tool)
         finally:
             env.close()
 

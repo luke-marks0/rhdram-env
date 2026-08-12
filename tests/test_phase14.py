@@ -13,8 +13,14 @@ import math
 import statistics
 import unittest
 
-from rowhammer_env.disturbance import DisturbanceEngine
+from rowhammer_env.disturbance import (
+    ROWPRESS_DWELL_SATURATION,
+    DisturbanceEngine,
+    classify_command,
+    unclassified_commands,
+)
 from rowhammer_env.geometry import Geometry
+from rowhammer_env.tools.addressing import AddressMapper
 
 
 # A DDR4_8Gb_x8 INFO payload as the worker reports it (see IssuedEventRecorder).
@@ -25,11 +31,29 @@ DDR4_INFO = {
     "channel_width": 64,
     "level_names": ["Channel", "Rank", "BankGroup", "Bank", "Row", "Column"],
     "level_sizes": [1, 1, 4, 4, 65536, 1024],
+    "command_names": ["ACT", "PREpb", "PREab", "RD", "WR", "RDA", "WRA", "REFab"],
 }
 
 
 def engine(**kwargs) -> DisturbanceEngine:
-    return DisturbanceEngine(geometry=Geometry(DDR4_INFO), seed=14, **kwargs)
+    return DisturbanceEngine(
+        geometry=Geometry(DDR4_INFO), row_encoder=robaracoch_encoder(DDR4_INFO), seed=14, **kwargs
+    )
+
+
+def robaracoch_encoder(info: dict):
+    """Row->address resolution for a worker-free engine (public mapper only)."""
+    return AddressMapper(Geometry(info)).encode
+
+
+def row_key(addr: int) -> tuple[int, ...]:
+    """The (channel, rank, bankgroup, bank, row) key a linear address decodes to.
+
+    An independent decode of the same public mapper the engine's encoder uses, so
+    an anchor check here is a real round-trip and not the encoder restating itself.
+    """
+    coords = AddressMapper(Geometry(DDR4_INFO)).decode(addr)
+    return tuple(coords[level] for level in ("channel", "rank", "bankgroup", "bank", "row"))
 
 
 def act(row: int, *, bank: int = 0, bankgroup: int = 0, clk: int = 0) -> dict:
@@ -46,7 +70,27 @@ def act(row: int, *, bank: int = 0, bankgroup: int = 0, clk: int = 0) -> dict:
 
 
 def pre(*, bank: int = 0, bankgroup: int = 0, clk: int = 0) -> dict:
-    return {"op": "PRE", "channel": 0, "rank": 0, "bankgroup": bankgroup, "bank": bank, "clk": clk}
+    """A per-bank precharge, as DDR4 names it."""
+    return {"op": "PREpb", "channel": 0, "rank": 0, "bankgroup": bankgroup, "bank": bank, "clk": clk}
+
+
+def preab(*, clk: int = 0) -> dict:
+    """The rank-scoped all-bank precharge Ramulator issues ahead of a refresh."""
+    return {"op": "PREab", "channel": 0, "rank": 0, "bankgroup": -1, "bank": -1, "row": -1, "clk": clk}
+
+
+def auto_precharge(op: str, row: int, *, bank: int = 0, bankgroup: int = 0, clk: int = 0) -> dict:
+    """An RDA/WRA access: it closes its own bank, emitting no PRE."""
+    return {
+        "op": op,
+        "channel": 0,
+        "rank": 0,
+        "bankgroup": bankgroup,
+        "bank": bank,
+        "row": row,
+        "row_hit": True,
+        "clk": clk,
+    }
 
 
 def refab() -> dict:
@@ -55,6 +99,14 @@ def refab() -> dict:
 
 def rd(addr: int) -> dict:
     return {"op": "RD", "addr": addr, "size": 64}
+
+
+def column0_addr(eng: DisturbanceEngine, row: int, bank: int) -> int:
+    """Linear address of column 0 of ``(bank, row)`` under RoBaRaCoCh, bankgroup 0."""
+    sizes = eng.geometry.level_sizes
+    columns_per_row = int(sizes["column"]) // eng.geometry.prefetch
+    bank_stride = eng.tx_bytes * columns_per_row * int(sizes.get("rank", 1)) * int(sizes.get("bankgroup", 1))
+    return row * eng.row_bytes + bank * bank_stride
 
 
 def hammer_double(eng: DisturbanceEngine, pairs: int) -> None:
@@ -72,7 +124,9 @@ class KnownFlipControlTests(unittest.TestCase):
 
     def test_d5_known_flip_fixture(self) -> None:
         for seed in (1, 7, 14, 99):
-            eng = DisturbanceEngine(geometry=Geometry(DDR4_INFO), seed=seed)
+            eng = DisturbanceEngine(
+                geometry=Geometry(DDR4_INFO), row_encoder=robaracoch_encoder(DDR4_INFO), seed=seed
+            )
             hammer_double(eng, eng.known_threshold // 2)
             victim = eng.victims[(0, 0, 0, 0, eng.known_target_row)]
             self.assertTrue(victim.flipped, f"seed {seed} did not flip at threshold")
@@ -82,7 +136,9 @@ class KnownFlipControlTests(unittest.TestCase):
 
     def test_d4_below_threshold_no_flip(self) -> None:
         for seed in (1, 7, 14, 99):
-            eng = DisturbanceEngine(geometry=Geometry(DDR4_INFO), seed=seed)
+            eng = DisturbanceEngine(
+                geometry=Geometry(DDR4_INFO), row_encoder=robaracoch_encoder(DDR4_INFO), seed=seed
+            )
             hammer_double(eng, eng.known_threshold // 2 - 1)
             self.assertEqual(eng.flips, {})
             self.assertFalse(eng.victims[(0, 0, 0, 0, eng.known_target_row)].flipped)
@@ -128,7 +184,7 @@ class DirectionAndMultiplicityTests(unittest.TestCase):
         eng2 = engine()
         row = 4000
         victim_addr = row * eng2.row_bytes
-        eng2.note_write(victim_addr, b"\xff" * 64)
+        eng2.note_write(row_key(victim_addr), b"\xff" * 64)
         agg_left = victim_addr - eng2.row_bytes
         agg_right = victim_addr + eng2.row_bytes
         # Drive both neighbours until it flips.
@@ -156,6 +212,8 @@ class DirectionAndMultiplicityTests(unittest.TestCase):
 class RowPressTests(unittest.TestCase):
     """D7 — open-row dwell reduces hcfirst, and only for RowPress profiles."""
 
+    # @spec:sim-rowpress
+
     def _pairs_to_flip(self, eng: DisturbanceEngine, dwell: int) -> int:
         left = eng.target_addr - eng.row_bytes
         right = eng.target_addr + eng.row_bytes
@@ -178,6 +236,44 @@ class RowPressTests(unittest.TestCase):
         long = self._pairs_to_flip(engine(), dwell=200000)
         # RowPress makes each long-open activation worth many hammers.
         self.assertLess(long * 3, short)
+
+    def test_all_bank_precharge_settles_every_open_bank(self) -> None:
+        eng = engine()
+        aggressor = eng.known_target_row - 1
+        addrs = {bank: column0_addr(eng, aggressor, bank) for bank in (0, 1)}
+        for bank, addr in addrs.items():
+            self.assertEqual(row_key(addr), (0, 0, 0, bank, aggressor))
+            eng.consume([act(aggressor, bank=bank, clk=0)], rd(addr))
+        self.assertEqual(len(eng._open), 2)
+
+        eng.consume([preab(clk=ROWPRESS_DWELL_SATURATION)], rd(addrs[0]))
+
+        self.assertEqual(eng._open, {})
+        for bank in (0, 1):
+            victim = eng.victims[(0, 0, 0, bank, eng.known_target_row)]
+            self.assertGreater(victim.bonus, 0.0)
+
+    def test_open_row_dwell_is_bounded_by_the_precharge_that_closes_it(self) -> None:
+        """An ACT closed by a short-dwell PREab accrues no bonus, however late the next ACT."""
+        eng = engine()
+        aggressor = eng.known_target_row - 1
+        addr = column0_addr(eng, aggressor, bank=0)
+        eng.consume([act(aggressor, clk=0)], rd(addr))
+        eng.consume([preab(clk=100)], rd(addr))
+        eng.consume([act(aggressor, clk=10 * ROWPRESS_DWELL_SATURATION)], rd(addr))
+        self.assertEqual(eng.victims[(0, 0, 0, 0, eng.known_target_row)].bonus, 0.0)
+
+    def test_auto_precharge_access_settles_the_row_it_closes(self) -> None:
+        """RDA/WRA precharge their own bank, so they end the dwell with no PRE event."""
+        for op in ("RDA", "WRA"):
+            eng = engine()
+            aggressor = eng.known_target_row - 1
+            addr = column0_addr(eng, aggressor, bank=0)
+            eng.consume([act(aggressor, clk=0)], rd(addr))
+            eng.consume([auto_precharge(op, aggressor, clk=100)], rd(addr))
+            self.assertEqual(eng._open, {}, op)
+            eng.consume([act(aggressor, clk=10 * ROWPRESS_DWELL_SATURATION)], rd(addr))
+            self.assertEqual(eng.victims[(0, 0, 0, 0, eng.known_target_row)].bonus, 0.0, op)
 
     def test_rowpress_ignored_when_profile_unsupported(self) -> None:
         eng = engine()
@@ -303,7 +399,7 @@ class StratumSelectionTests(unittest.TestCase):
         ones = engine()
         row = 5000
         victim_addr = row * zeros.row_bytes
-        ones.note_write(victim_addr, b"\xff" * 64)
+        ones.note_write(row_key(victim_addr), b"\xff" * 64)
         for eng in (zeros, ones):
             eng.consume([act(row - 1)], rd(victim_addr - eng.row_bytes))
         vz = zeros.victims[(0, 0, 0, 0, row)]
@@ -324,7 +420,13 @@ class HierarchicalSamplingTests(unittest.TestCase):
         within_sigmas: list[float] = []
         all_logs: list[float] = []
         for m in range(60):
-            eng = DisturbanceEngine(geometry=Geometry(DDR4_INFO), seed=5000 + m, family=family, stratum=stratum)
+            eng = DisturbanceEngine(
+                geometry=Geometry(DDR4_INFO),
+                row_encoder=robaracoch_encoder(DDR4_INFO),
+                seed=5000 + m,
+                family=family,
+                stratum=stratum,
+            )
             logs = [math.log(eng._sample_threshold((0, 0, 0, 0, r), "double", "all_zeros")) for r in range(3, 400)]
             module_means.append(statistics.mean(logs))
             within_sigmas.append(statistics.pstdev(logs))
@@ -348,6 +450,115 @@ class HierarchicalSamplingTests(unittest.TestCase):
             {k: (v.threshold, v.single_threshold) for k, v in a.victims.items()},
             {k: (v.threshold, v.single_threshold) for k, v in b.victims.items()},
         )
+
+
+class VictimAnchorTests(unittest.TestCase):
+    """A victim's cell 0 is its own row's column 0, not the aggressor's offset.
+
+    # @spec:sim-exposure-flip
+    """
+
+    def test_offset_aggressor_access_anchors_victim_at_column_0(self) -> None:
+        eng = engine()
+        column_offset = 704  # an intra-row offset the aggressor access happens to carry
+        tr = eng.known_target_row
+        left = eng.target_addr - eng.row_bytes + column_offset
+        right = eng.target_addr + eng.row_bytes + column_offset
+        for _ in range(eng.known_threshold // 2):
+            eng.consume([act(tr - 1)], rd(left))
+            eng.consume([act(tr + 1)], rd(right))
+
+        victim = eng.victims[(0, 0, 0, 0, tr)]
+        self.assertTrue(victim.flipped)
+        self.assertEqual(victim.addr, column0_addr(eng, tr, 0))
+        self.assertEqual(eng.flips.get(eng.target_addr), eng.known_first_bit)
+
+    def test_every_victim_anchor_decodes_back_to_its_own_key(self) -> None:
+        eng = engine()
+        tr = eng.known_target_row
+        for _ in range(eng.known_threshold * 4):
+            eng.consume([act(tr - 1)], rd(eng.target_addr - eng.row_bytes + 37))
+            eng.consume([act(tr + 1)], rd(eng.target_addr + eng.row_bytes + 37))
+
+        # The anchor is column 0 *of the victim's own row*, which is the strongest
+        # form of the contract: decoding it must return the key it is filed under.
+        for key, victim in eng.victims.items():
+            self.assertEqual(victim.addr % eng.row_span, 0)
+            self.assertEqual(row_key(victim.addr), key)
+        flipped_rows = {key[-1] for key in eng.flipped_row_keys}
+        self.assertTrue(all(addr // eng.row_bytes in flipped_rows for addr in eng.flips))
+
+    def test_a_non_bank_0_aggressor_anchors_its_victim_in_that_same_bank(self) -> None:
+        # Regression: an anchor derived from the aggressor's address rather than from
+        # the victim's decoded key can drop the bank, aliasing every bank's row `r`
+        # onto one overlay address — dram.read then shows a phantom flip in bank 0
+        # while the true victim reads clean, and the target-cell predicates credit a
+        # flip earned in the wrong bank.
+        eng = engine()
+        tr = eng.known_target_row
+        anchors = {}
+        for bank in (0, 1, 2, 3):
+            aggressor = column0_addr(eng, tr - 1, bank=bank) + 37 * eng.tx_bytes
+            eng.consume([act(tr - 1, bank=bank, clk=bank)], rd(aggressor))
+            victim = eng.victims[(0, 0, 0, bank, tr)]
+            self.assertEqual(victim.addr, column0_addr(eng, tr, bank=bank))
+            anchors[bank] = victim.addr
+        # Distinct banks are distinct memory: no two of them may share an anchor.
+        self.assertEqual(len(set(anchors.values())), len(anchors))
+
+    def test_multiplicity_cells_stay_inside_the_victim_row(self) -> None:
+        # A row is ``row_span`` bytes, not ``row_bytes`` (the stride, which spans
+        # every bank at this row index), so an offset drawn against the stride would
+        # scatter the extra cells across other banks' rows.
+        eng = engine()
+        tr = eng.known_target_row
+        for _ in range(eng.known_threshold * 4):
+            eng.consume([act(tr - 1)], rd(eng.target_addr - eng.row_bytes))
+            eng.consume([act(tr + 1)], rd(eng.target_addr + eng.row_bytes))
+
+        victim = eng.victims[(0, 0, 0, 0, tr)]
+        self.assertGreater(victim.flipped_bits, 1)  # multiplicity actually grew
+        for addr in eng.flips:
+            self.assertEqual(row_key(addr), (0, 0, 0, 0, tr))
+            self.assertLess(addr - victim.addr, eng.row_span)
+
+
+class CommandVocabularyTests(unittest.TestCase):
+    """The event classification covers the standard's whole command vocabulary.
+
+    The disturbance model dispatches on command *names*, so its correctness rests on
+    that name set being closed and fully accounted for. The worker publishes the real
+    ``DRAMSpec`` vocabulary; these checks pin the classification against it.
+    """
+
+    # @spec:sim-disturbance-engine
+
+    def test_every_ramulator_command_name_is_classified(self) -> None:
+        # The union of every command vocabulary in the vendored Ramulator DRAM
+        # implementations (third_party/ramulator2/src/ramulator/dram/impl/*.cpp).
+        vocabulary = [
+            "ACT", "PREpb", "PREab", "RD", "WR", "RDA", "WRA",
+            "REFab", "REFpb", "RFMab", "RFMpb", "VRR",
+        ]
+        self.assertEqual(unclassified_commands(vocabulary), [])
+
+    def test_classification_matches_the_physical_effect(self) -> None:
+        self.assertEqual(classify_command("ACT"), "hammer")
+        for op in ("PREpb", "PREab", "RDA", "WRA"):
+            self.assertEqual(classify_command(op), "close", op)
+        for op in ("REFab", "REFpb", "RFMab", "RFMpb"):
+            self.assertEqual(classify_command(op), "refresh", op)
+        # VRR is a targeted victim-row refresh, modelled from the ACT counter, not a
+        # JEDEC auto-refresh: folding it into the refresh window would be wrong.
+        for op in ("RD", "WR", "VRR"):
+            self.assertEqual(classify_command(op), "inert", op)
+
+    def test_unknown_command_is_rejected_at_construction(self) -> None:
+        info = dict(DDR4_INFO, command_names=[*DDR4_INFO["command_names"], "ZQCS"])
+        self.assertEqual(unclassified_commands(info["command_names"]), ["ZQCS"])
+        with self.assertRaises(ValueError) as caught:
+            DisturbanceEngine(geometry=Geometry(info), row_encoder=robaracoch_encoder(info), seed=14)
+        self.assertIn("ZQCS", str(caught.exception))
 
 
 if __name__ == "__main__":

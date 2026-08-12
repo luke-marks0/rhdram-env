@@ -86,6 +86,14 @@ authored mapper is source-cited here and covered by differential tests
    `std::function` over the controller's own `addr_mapper`, so no mapper logic is
    duplicated in Python. `DECODE` is **never** in `ALLOWED_TOOLS` and is
    unreachable from `step` — it is used only by the compiler.
+   Its inverse, `ENCODE <id> <c0> … <cN>`, returns the linear address of a set of
+   coordinates, and is what lets the disturbance model anchor a victim's flips at
+   that row's *own* column-0 address (see Consequences). The recorder recovers the
+   inverse by probing the active mapper on each address bit — every mapper in scope
+   builds `addr_vec` from bit slices and XORs, i.e. affinely over GF(2) — and then
+   **verifies** its answer by decoding it again, so a mapper this cannot invert
+   fails closed instead of returning a plausible wrong address. `ENCODE` is
+   server-internal on the same terms as `DECODE`.
 3. **Candidate construction (`tasks/compiler.py`).** The candidate window is built
    against the true mapping via `DECODE`: the *raw* RoBaRaCoCh field positions are
    public geometry, so enumerating the raw bank slots at a fixed row and decoding
@@ -95,10 +103,11 @@ authored mapper is source-cited here and covered by differential tests
 4. **Decode-correct reward (`rewards/predicates.py`, `disturbance.py`).**
    `bounded_sweep` uses `_target_bankrow_flip`, which reads the trusted **decoded**
    victim key from `DisturbanceEngine.flipped_row_keys` — correct under any mapper
-   — instead of `_target_row_flip`'s `addr // row_bytes`, which assumes the public
-   linear layout. The engine's fixed known-target threshold is pinned to the
-   victim's decoded `(bankgroup, bank)` so a found aggressor flips reliably even
-   though the victim sits in a scrambled bank.
+   — instead of an `addr // row_bytes` row-index comparison, which assumes the
+   public linear layout. (Every target-row family reads the decoded key now, not
+   just the discovery ones.) The engine's fixed known-target threshold is pinned to
+   the victim's full decoded key so a found aggressor flips reliably even though the
+   victim sits in a scrambled bank.
 5. **Guards (P24 tasks 4/5).** Discovery families are `logical_only`, so the policy
    never receives a physical decoder; `_physical_target` and physical addressing
    fail closed (`ADDRESS_NOT_DISCLOSED` / `TaskConfigError`) under a non-projectable
@@ -115,11 +124,13 @@ authored mapper is source-cited here and covered by differential tests
   decision, for realism), so its candidate construction and success predicate are
   decode-based rather than RoBaRaCoCh-arithmetic. Its P23 tests were rewritten to
   verify the split via `DECODE` (`tests/test_discovery_families.py`).
-- Under a secret mapper, the disturbance stores each flip at an arithmetic linear
-  address that no longer decodes to the victim row, so byte-accurate *read-back* of
-  a disturbed victim byte is unsupported for discovery episodes. This is
-  acceptable: discovery families disclose the victim as an opaque handle and score
-  on `target_row_flip` via the trusted decoded key, never on a policy read.
+- Byte-accurate *read-back* of a disturbed victim byte works under a secret mapper:
+  the disturbance resolves each victim's own column-0 address through `ENCODE`
+  rather than deriving it as `aggressor ± d * row_stride`, so `dram.read` at the
+  disclosed address returns the flipped byte and no phantom flip exists at the
+  arithmetic address. (This replaces the original decision to leave read-back
+  unsupported for discovery episodes; scoring is unchanged — success still comes
+  from the trusted decoded key, never from a policy read.)
 - Non-discovery families and the public `RoBaRaCoCh` path are unchanged and green.
 
 ## Alternatives considered

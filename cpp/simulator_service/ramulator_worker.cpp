@@ -1,5 +1,7 @@
 #include <algorithm>
 #include <cctype>
+#include <climits>
+#include <cstdint>
 #include <cstdlib>
 #include <exception>
 #include <iomanip>
@@ -70,6 +72,9 @@ std::vector<std::string> split(const std::string& line) {
 }
 
 bool parse_u64(const std::string& text, Ramulator::Addr_t& value) {
+  // strtoull silently wraps a leading '-' into a huge unsigned value, so negative
+  // input is rejected here rather than becoming an in-range address.
+  if (text.empty() || text[0] == '-') return false;
   char* end = nullptr;
   value = std::strtoull(text.c_str(), &end, 0);
   return end && *end == '\0';
@@ -129,6 +134,7 @@ class Worker {
     if (t[0] == "WRITE") return write(id, t, false);
     if (t[0] == "ISSUE") return issue(id, t);
     if (t[0] == "DECODE") return decode(id, t);
+    if (t[0] == "ENCODE") return encode(id, t);
     return error_json(id, "BAD_SCHEMA", "unknown request type");
   }
 
@@ -156,6 +162,11 @@ class Worker {
         << ",\"channel_width\":" << geometry_.channel_width
         << ",\"level_names\":" << str_array(geometry_.level_names)
         << ",\"level_sizes\":" << int_array(geometry_.level_sizes)
+        // The standard's full DRAMSpec command vocabulary. Every op name that can
+        // appear in the issued-event stream is in here, so the disturbance model's
+        // event classification can be checked against a closed set instead of
+        // assuming which command names a standard happens to use.
+        << ",\"command_names\":" << str_array(geometry_.command_names)
         << "}}";
     return out.str();
   }
@@ -185,12 +196,69 @@ class Worker {
     return out.str();
   }
 
+  // ENCODE id c0 c1 ... cN -> the linear address that decodes to those coordinates
+  // under the active mapper: the exact inverse of DECODE, one coordinate per
+  // DRAMSpec level in the order INFO reports them (channel first, column last).
+  // Side-effect-free in the same way DECODE is. Server-internal only (never
+  // exposed to the policy): the disturbance model uses it to resolve a victim
+  // row's own column-0 address, which under a secret row->bank mapper is *not*
+  // the aggressor's address plus a multiple of the row stride.
+  std::string encode(const std::string& id, const std::vector<std::string>& t) {
+    if (!geometry_.valid) {
+      return error_json(id, "UNAVAILABLE_CAPABILITY", "issued-event geometry not published");
+    }
+    if (t.size() != geometry_.level_names.size() + 2) {
+      return error_json(id, "BAD_SCHEMA", "ENCODE id needs one coordinate per DRAMSpec level");
+    }
+    std::vector<int> coords;
+    for (size_t k = 2; k < t.size(); ++k) {
+      Ramulator::Addr_t value = 0;
+      if (!parse_u64(t[k], value) || value > static_cast<Ramulator::Addr_t>(INT_MAX)) {
+        return error_json(id, "BAD_SCHEMA", "invalid coordinate " + t[k]);
+      }
+      coords.push_back(static_cast<int>(value));
+    }
+    auto& sink = rhdram::IssuedEventSink::instance();
+    if (!sink.has_encoder()) return error_json(id, "UNAVAILABLE_CAPABILITY", "address encoder not published");
+    uint64_t linear = 0;
+    switch (sink.encode(coords, linear)) {
+      case rhdram::EncodeStatus::Ok:
+        break;
+      case rhdram::EncodeStatus::OutOfRange:
+        return error_json(id, "BAD_SCHEMA", "coordinate outside the device geometry");
+      case rhdram::EncodeStatus::NotInvertible:
+        return error_json(id, "UNAVAILABLE_CAPABILITY",
+                          "the active address mapper has no linear address for these coordinates");
+    }
+    std::ostringstream out;
+    out << "{\"ok\":true,\"id\":\"" << escape(id) << "\",\"cycle\":" << cycle_ << ",\"linear\":" << linear << "}";
+    return out.str();
+  }
+
   std::string read(const std::string& id, const std::vector<std::string>& t) {
-    if (t.size() != 4) return error_json(id, "BAD_SCHEMA", "READ id addr length");
+    // @spec:rl-reward @spec:env-worker-protocol
+    // The server-internal STORED form exposes the authoritative functional-memory
+    // bytes to trusted reward evaluation. It deliberately does not submit a DRAM
+    // request, tick Ramulator, drain issued events, or touch public counters: a
+    // success check must not create free activations. The task env applies its
+    // disturbance overlay to this raw stored byte before evaluating a predicate.
+    const bool stored_only = t.size() == 5 && t[4] == "STORED";
+    if (t.size() != 4 && !stored_only) {
+      return error_json(id, "BAD_SCHEMA", "READ id addr length [STORED]");
+    }
     Ramulator::Addr_t addr = 0;
     Ramulator::Addr_t len = 0;
     if (!parse_u64(t[2], addr) || !parse_u64(t[3], len) || len == 0 || len > static_cast<unsigned>(tx_bytes_)) {
       return error_json(id, "BAD_SCHEMA", "invalid read address or length");
+    }
+    if (stored_only) {
+      if (len != 1) return error_json(id, "BAD_SCHEMA", "READ STORED requires length 1");
+      std::vector<unsigned char> out;
+      for (Ramulator::Addr_t i = 0; i < len; ++i) out.push_back(bytes_[addr + i]);
+      std::ostringstream response;
+      response << "{\"ok\":true,\"id\":\"" << escape(id) << "\",\"cycle\":" << cycle_
+               << ",\"data_hex\":\"" << to_hex(out) << "\"}";
+      return response.str();
     }
     long before = cycle_;
     auto result = complete_request(Ramulator::Request::Type::Read, addr, static_cast<int>(len));

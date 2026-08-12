@@ -14,6 +14,7 @@ sys.path.insert(0, str(ROOT))
 from rowhammer_env import Phase2Action, RowHammerTaskEnv  # noqa: E402
 from rowhammer_env.disturbance import DisturbanceEngine  # noqa: E402
 from rowhammer_env.geometry import Geometry  # noqa: E402
+from rowhammer_env.tools.addressing import AddressMapper  # noqa: E402
 from rowhammer_env.mitigations import public_mitigation_capabilities  # noqa: E402
 
 
@@ -48,7 +49,10 @@ def check_registry() -> None:
 
 
 def check_oracle_engine_conformance() -> None:
-    eng = DisturbanceEngine(geometry=Geometry(DDR4_INFO), seed=16, mitigation="oracle")
+    geo = Geometry(DDR4_INFO)
+    eng = DisturbanceEngine(
+        geometry=geo, row_encoder=AddressMapper(geo).encode, seed=16, mitigation="oracle"
+    )
     target = eng.known_target_row
     left = eng.target_addr - eng.row_bytes
     right = eng.target_addr + eng.row_bytes

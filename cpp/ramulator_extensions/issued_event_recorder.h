@@ -26,6 +26,13 @@
 
 namespace rhdram {
 
+// Outcome of an ENCODE (decoded coordinates -> linear address).
+enum class EncodeStatus {
+  Ok,
+  OutOfRange,      // a coordinate does not fit its level's field width
+  NotInvertible,   // the active mapper has no linear preimage for these coordinates
+};
+
 // One post-schedule DRAM command with its decoded coordinates.
 struct IssuedEvent {
   int64_t clk = 0;              // controller clock when the command was issued
@@ -78,6 +85,22 @@ class IssuedEventSink {
     return m_decoder ? m_decoder(linear) : std::vector<int>{};
   }
 
+  // The exact inverse of the decoder: decoded coordinates (in DRAMSpec level
+  // order, one per level) -> the linear address that decodes back to them.
+  // Published by the recorder plugin at setup alongside the decoder, and used by
+  // the worker's ENCODE op so the disturbance model can resolve a victim row's
+  // own column-0 address under *any* mapper instead of assuming the RoBaRaCoCh
+  // arithmetic (`aggressor ± d * row_stride`), which lands in the wrong bank
+  // under a row->bank scrambling mapper. First controller to publish wins,
+  // mirroring the geometry rule.
+  void set_encoder(std::function<EncodeStatus(const std::vector<int>&, uint64_t&)> encoder) {
+    if (!m_encoder) m_encoder = std::move(encoder);
+  }
+  bool has_encoder() const { return static_cast<bool>(m_encoder); }
+  EncodeStatus encode(const std::vector<int>& coords, uint64_t& linear) const {
+    return m_encoder ? m_encoder(coords, linear) : EncodeStatus::NotInvertible;
+  }
+
   void push(IssuedEvent&& ev) { m_events.push_back(std::move(ev)); }
 
   // Return everything captured since the last drain and reset the buffer.
@@ -94,6 +117,7 @@ class IssuedEventSink {
   Geometry m_geometry;
   std::vector<IssuedEvent> m_events;
   std::function<std::vector<int>(uint64_t)> m_decoder;
+  std::function<EncodeStatus(const std::vector<int>&, uint64_t&)> m_encoder;
 };
 
 }  // namespace rhdram
