@@ -208,6 +208,45 @@ class DirectionAndMultiplicityTests(unittest.TestCase):
         hammer_double(far_past, far_past.known_threshold // 2 * 4)
         self.assertGreater(far_past.victims[(0, 0, 0, 0, far_past.known_target_row)].flipped_bits, 1)
 
+    def test_restore_retracts_exact_cells_and_allows_them_to_flip_again(self) -> None:
+        # @spec:tool-dram-write @spec:sim-exposure-flip
+        eng = engine()
+        hammer_double(eng, eng.known_threshold // 2 * 4)
+        key = (0, 0, 0, 0, eng.known_target_row)
+        victim = eng.victims[key]
+        before = victim.flipped_bits
+        self.assertGreater(before, 1)
+        self.assertIn(eng.target_addr, eng.flips)
+        self.assertIn(key, eng.flipped_row_keys)
+
+        clean_addr = next(
+            victim.addr + offset
+            for offset in range(eng.row_span)
+            if victim.addr + offset not in eng.flips
+        )
+        eng.restore(clean_addr, 1)
+        self.assertEqual(victim.flipped_bits, before)
+
+        eng.restore(eng.target_addr, 1)
+        self.assertNotIn(eng.target_addr, eng.flips)
+        self.assertEqual(victim.flipped_bits, before - 1)
+        self.assertTrue(victim.flipped)
+        self.assertIn(key, eng.flipped_row_keys)
+
+        # Exposure is still above the same multiplicity threshold, so the missing
+        # deterministic first cell is emitted again on the next relevant ACT.
+        eng.consume(
+            [act(eng.known_target_row - 1)],
+            rd(eng.target_addr - eng.row_bytes),
+        )
+        self.assertEqual(eng.flips.get(eng.target_addr), eng.known_first_bit)
+        self.assertEqual(victim.flipped_bits, before)
+
+        eng.restore(victim.addr, eng.row_span)
+        self.assertFalse(victim.flipped)
+        self.assertEqual(victim.flipped_bits, 0)
+        self.assertNotIn(key, eng.flipped_row_keys)
+
 
 class RowPressTests(unittest.TestCase):
     """D7 — open-row dwell reduces hcfirst, and only for RowPress profiles."""

@@ -314,7 +314,7 @@ class RowHammerEnv(Environment[Phase2Action, Phase2Observation, Phase2State]):
             if action.tool == "dram.write":
                 raw = base64.b64decode(str(action.args.get("data_b64", "")), validate=True)
                 req = WorkerRequest("WRITE", self._next_id(), (str(self._logical_addr(action.args)), raw.hex()))
-                return self._from_worker(self._worker.call(req))
+                return self._from_worker(self._worker.call(req), written_data=raw)
             if action.tool == "dram.issue":
                 return self._issue(action.args)
             return self._error("UNSUPPORTED_TOOL", action.tool)
@@ -380,6 +380,7 @@ class RowHammerEnv(Environment[Phase2Action, Phase2Observation, Phase2State]):
                 budget_truncated = True
                 break
             op = command["op"]
+            written_data: bytes | None = None
             if op == "WAIT":
                 key = None
                 req = WorkerRequest("ISSUE", self._next_id(), ("WAIT", str(command.get("cycles", 0))))
@@ -389,8 +390,11 @@ class RowHammerEnv(Environment[Phase2Action, Phase2Observation, Phase2State]):
             else:  # WR (expand_commands only yields RD/WR/WAIT)
                 key = self._digest_addr_key(command)
                 raw = base64.b64decode(str(command.get("data_b64", "")), validate=True)
+                written_data = raw
                 req = WorkerRequest("ISSUE", self._next_id(), ("WR", str(self._addr_value(command)), raw.hex()))
-            last = self._from_worker(self._worker.call(req))  # type: ignore[union-attr]
+            last = self._from_worker(  # type: ignore[union-attr]
+                self._worker.call(req), written_data=written_data
+            )
             if last.error:
                 return last
             # ``last.feedback`` is already projected to the disclosure level by the
@@ -493,7 +497,13 @@ class RowHammerEnv(Environment[Phase2Action, Phase2Observation, Phase2State]):
     def _next_id(self) -> str:
         return f"a{self._state.step_count}"
 
-    def _from_worker(self, payload: dict[str, Any]) -> Phase2Observation:
+    def _from_worker(
+        self, payload: dict[str, Any], *, written_data: bytes | None = None
+    ) -> Phase2Observation:
+        # The bare environment has no disturbance state. Subclasses receive the
+        # validated bytes here because the worker intentionally echoes only the
+        # write address and size, not the written data.
+        del written_data
         if not payload.get("ok"):
             err = payload.get("error") or {}
             return self._error(err.get("code", "INTERNAL_SIMULATOR_ERROR"), err.get("message", "worker failed"))

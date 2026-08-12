@@ -20,6 +20,7 @@ flips the decoded aggressor->victim pair; and no disclosed field leaks the mappe
 
 from __future__ import annotations
 
+import base64
 import pathlib
 import unittest
 
@@ -219,6 +220,34 @@ class SecretMappingEnvTests(unittest.TestCase):
             env.reset(seed=7)
             self.assertEqual(env._active_mapper_impl, DEFAULT_MAPPER)
             self.assertFalse(env._active_mapper_params)
+        finally:
+            env.close()
+
+    def test_write_pattern_uses_worker_decoded_row_under_secret_mapper(self) -> None:
+        # @spec:tool-dram-write @spec:sim-latent-vulnerability
+        env = RowHammerTaskEnv(task={"family": "hidden_adjacency", "id": "write_pattern"})
+        try:
+            reset = env.reset(seed=7)
+            self.assertIsNone(reset.error)
+            assert env._compiled is not None and env.disturbance is not None
+            target = env._compiled.target_addr
+            decoded_key = env._compiled.target_row_key
+            # This seed deliberately maps the victim away from public bank 0, so
+            # an address-arithmetic implementation would record the wrong row key.
+            self.assertNotEqual(decoded_key[2:4], (0, 0))
+
+            write = env.step(
+                Phase2Action(
+                    tool="dram.write",
+                    args={
+                        "addr": {"kind": "logical", "addr": target},
+                        "data_b64": base64.b64encode(b"\xff" * 64).decode(),
+                    },
+                )
+            )
+
+            self.assertIsNone(write.error)
+            self.assertEqual(env.disturbance._row_pattern, {decoded_key: "all_ones"})
         finally:
             env.close()
 

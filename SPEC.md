@@ -124,10 +124,13 @@ Defined in: `rowhammer_env/phase2_env.py` (`Phase2Observation`, `_from_worker`),
 `rowhammer_env/phase5_env.py` (`step`).
 
 #### `@spec:rl-reward` — sparse, trusted reward
-Default reward is sparse: `1.0` on the task's success predicate, else `0.0`. The
-reward is computed **only** from trusted simulator state (the disturbance engine's
-committed flips / decoded flipped-row keys), never from policy-provided logs,
-stdout, or claims. `episode.finish` returns `1.0` iff the predicate already holds.
+Default reward is sparse: `1.0` once the task's success predicate has become true,
+else `0.0`. The first success is latched for the episode: a later write may retract
+the flip overlay, but cannot retract an already-earned reward. The reward is
+computed **only** from trusted simulator state (the disturbance engine's committed
+flips / decoded flipped-row keys), never from policy-provided logs, stdout, or
+claims. `episode.finish` returns `1.0` iff trusted success has already latched or
+the predicate holds when it is called.
 A **target row is a full physical coordinate**: every target-row family decides
 success by comparing the compiled task's decoded
 `(channel, rank, bankgroup, bank, row)` victim key against the engine's
@@ -141,7 +144,8 @@ and compare that resulting byte with the compiled bit/mask/value condition. The
 stored-byte read is side-effect-free, so checking reward cannot create unbudgeted
 DRAM events or alter cycles and public counters.
 Defined in: `rowhammer_env/rewards/predicates.py` (`success_for`, `PREDICATES`),
-`rowhammer_env/phase5_env.py` (`_trusted_success`, `_trusted_read_byte`, `step`,
+`rowhammer_env/phase5_env.py` (`_trusted_success`, `_latch_success`,
+`_trusted_read_byte`, `step`,
 `_script`), `cpp/simulator_service/ramulator_worker.cpp` (`read`).
 
 #### `@spec:rl-budgets` — resource budgets and enforcement
@@ -167,6 +171,9 @@ Defined in: `rowhammer_env/phase5_env.py` (`_charge`, `_issue_acts_ceiling`),
 An episode ends when: the success predicate becomes true; `episode.finish` is
 called; a budget is exhausted; an unrecoverable simulator/sandbox error occurs; or
 the worker's per-request cycle deadline is hit. Any of these sets `done=True`.
+Success is sticky within an episode: once a trusted predicate becomes true, later
+overlay retraction cannot change its reward, including when brokered calls continue
+inside an already-running `script.run`.
 Termination is enforced by the env, not assumed of the driver: once an episode has
 ended, every further `step` is **refused before dispatch** — no worker call, no
 disturbance, no budget charged — with `done` and a stable error code, and the worker
@@ -195,9 +202,14 @@ Defined in: `rowhammer_env/phase2_env.py` (`step` `dram.info` branch, `_geometry
 Read/write simulated memory at a disclosed address (logical / physical / handle per
 task). Reads return base64 bytes with any disturbance flips applied to the returned
 copy; writes update functional state and record the row's data pattern (for stratum
-selection) and restore overwritten flipped cells. `note_write` takes the write's
-*decoded* row key, not its linear address: which row an address belongs to is a
-property of the active mapper, which only the worker knows.
+selection) and restore overwritten flipped cells. Restoration retracts exactly the
+overlapping active cells from the victim's flip bookkeeping and removes its decoded
+row key from `flipped_row_keys` only when no active cells remain. A restored cell is
+eligible to flip again when exposure reaches the corresponding multiplicity. This
+overlay retraction does not retract latched episode success (`@spec:rl-reward`).
+`note_write` takes the write's *decoded* row key, not its linear address: which row
+an address belongs to is a property of the active mapper, which only the worker
+knows.
 Defined in: `rowhammer_env/phase2_env.py` (`step`), `rowhammer_env/phase4_env.py`
 (`_from_worker`), `rowhammer_env/disturbance.py` (`apply`, `note_write`, `restore`).
 
@@ -370,8 +382,10 @@ Double-sided exposure `= min(left,right)*2 + bonus` vs the double threshold;
 single-sided `= max(left,right) + bonus` vs the single threshold. Crossing the
 threshold flips ≥1 cell; multiplicity grows with exposure/threshold per the profile
 `multiplicity` curve, capped at `MAX_FLIPPED_BITS_PER_ROW` (64). Flips persist until
-overwritten or refresh-restored. Flip positions are deterministic from the seed;
-cell 0 is always column 0 / `first_bit`.
+overwritten or refresh-restored. An overwrite removes only its overlapping active
+cells from the victim and row-key indexes; those deterministic positions may flip
+again under later exposure. Flip positions are deterministic from the seed; cell 0
+is always column 0 / `first_bit`.
 A flip's recorded linear address is **the victim row's own column-0 base plus an
 offset inside `[0, row_span)`**, so every recorded address decodes back to the
 victim's `(channel, rank, bankgroup, bank, row)` key. The anchor is obtained by
@@ -707,7 +721,9 @@ Defined in: enforced across the codebase; gate `scripts/verify_release.py`,
 #### `@spec:invariant-trusted-reward` — reward from trusted state only
 Success/reward derives only from committed simulator state (`DisturbanceEngine.flips`
 / `flipped_row_keys`), never from policy logs, stdout, submitted claims, or
-`episode.finish` assertions.
+`episode.finish` assertions. The episode may retain a success bit only after this
+trusted state has satisfied its predicate; that bit is reset between episodes and
+is monotone within one episode.
 Defined in: `rowhammer_env/rewards/predicates.py`, `rowhammer_env/phase5_env.py`.
 
 #### `@spec:invariant-no-leakage` — hidden state never leaks
@@ -785,20 +801,6 @@ Deliberately **not** tagged as contracts — in flux, aspirational, or advisory:
 Places where code and the design bundle / docs / comments currently disagree.
 Flagged, not resolved — a human decides which side is authoritative.
 
-3. **`note_write` has no production caller, so the written-pattern half of the latent
-   model is unreachable.** `@spec:tool-dram-write` says writes "record the row's data
-   pattern (for stratum selection)" and names `note_write` under **Defined in**, but
-   nothing outside tests calls it: `phase4_env._from_worker` calls `consume` and
-   `apply` only. `_row_pattern` is therefore always empty, `_victim_pattern` always
-   returns `all_zeros`, and every victim gets `direction = "0->1"`. The profile's
-   `single|all_ones` / `double|all_ones` strata and its `direction.bias_strength` are
-   dead, so `@spec:sim-latent-vulnerability`'s "single/double × data pattern" is in
-   practice "single/double × constant". Wiring it in is decided (audit decision C)
-   but remains separate work; the stored-byte reward prerequisite that previously
-   blocked it is now resolved by `@spec:rl-reward`.
-   Files: `rowhammer_env/disturbance.py` (`note_write`) vs `SPEC.md`
-   (`@spec:tool-dram-write`, `@spec:sim-latent-vulnerability`).
-
 4. **The oracle port clears its counters per refresh *window*, not per all-bank
    refresh.** `@spec:mitigation-oracle` claims a faithful `OracleRH` port with
    "counters cleared on all-bank refresh"; `oracle_rh.cpp` clears `m_table` on every
@@ -811,20 +813,6 @@ Flagged, not resolved — a human decides which side is authoritative.
    no trained task enables `oracle`.
    Files: `rowhammer_env/disturbance.py` (`_refresh`) vs
    `third_party/ramulator2/.../plugin/impl/oracle_rh.cpp`.
-
-4. **A written-over cell can never flip again.** `@spec:tool-dram-read` says reads
-   return bytes "with any disturbance flips applied", but `restore` pops overwritten
-   cells from `flips` while leaving `victim.flipped_bits` untouched, and
-   `_flip_positions` never re-emits a cell index below it — so one `dram.write`
-   permanently prevents that cell from ever flipping again, which is unphysical. On
-   the overlay rather than on reward (`flipped_row_keys` is mapper-agnostic, so the
-   trusted success predicates are unaffected).
-   (The other half of this entry — victim addresses derived arithmetically as
-   `aggressor ± d * row_stride`, wrong under a secret mapper — is **resolved**: the
-   worker now publishes an `ENCODE` op and the engine anchors every victim at its own
-   column-0 address. See `@spec:sim-exposure-flip`.)
-   Files: `rowhammer_env/disturbance.py` (`restore`, `_flip`, `_flip_positions`) vs
-   `SPEC.md` (`@spec:tool-dram-read`).
 
 ---
 

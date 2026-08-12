@@ -323,6 +323,27 @@ class TaskEnvIntegrationTests(unittest.TestCase):
         self.assertEqual(outcomes[0], outcomes[1])
         self.assertEqual(outcomes[0][0], 1.0)
 
+    def test_trusted_success_latches_across_overlay_retraction(self) -> None:
+        # @spec:rl-reward @spec:rl-episode-termination
+        env = RowHammerTaskEnv(task={"family": "known_target_anybit"})
+        try:
+            env.reset(seed=21)
+            assert env._compiled is not None and env.disturbance is not None
+            key = env._compiled.target_row_key
+
+            env.disturbance.flipped_row_keys.add(key)
+            self.assertTrue(env._latch_success())
+            env.disturbance.flipped_row_keys.remove(key)
+            self.assertFalse(env._trusted_success())
+
+            # The raw predicate reflects the retracted overlay, but decision B
+            # makes the episode reward monotone once trusted success was observed.
+            fin = env.step(Phase2Action(tool="episode.finish", args={}))
+            self.assertEqual(fin.reward, 1.0)
+            self.assertTrue(fin.done)
+        finally:
+            env.close()
+
     def test_byte_predicates_read_worker_storage_and_apply_disturbance(self) -> None:
         # @spec:rl-reward @spec:invariant-trusted-reward
         # The trusted read is side-effect-free: checking reward must not tick the

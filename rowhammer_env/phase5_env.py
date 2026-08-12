@@ -154,15 +154,14 @@ class RowHammerTaskEnv(RowHammerDisturbanceEnv):
         if action.tool == "script.run":
             return self._script(action)
         if action.tool == "episode.finish":
-            obs = Phase2Observation(reward=1.0 if self._trusted_success() else 0.0, done=True, cycle=self._state.cycle)
+            obs = Phase2Observation(reward=1.0 if self._latch_success() else 0.0, done=True, cycle=self._state.cycle)
             self.close()
             return obs
 
         before = self._state.cycle
         obs = super().step(action, timeout_s=timeout_s, **kwargs)
         self._charge(obs, before)
-        self.success = self._trusted_success()
-        if self.success:
+        if self._latch_success():
             obs.reward = 1.0
             obs.done = True
         obs.metadata["budget_remaining"] = dict(self.budget_remaining)
@@ -260,7 +259,7 @@ class RowHammerTaskEnv(RowHammerDisturbanceEnv):
             ).run(code)
         except ScriptError as exc:
             return self._error(exc.code, str(exc))
-        self.success = self._trusted_success()
+        self._latch_success()
         # A brokered inner call may have ended the episode (budget exhaustion, a
         # simulator error); the script keeps running to completion either way, but
         # the observation must not report the episode as live once it is over.
@@ -301,6 +300,20 @@ class RowHammerTaskEnv(RowHammerDisturbanceEnv):
 
     def _trusted_success(self) -> bool:
         return rewards.success_for(self._compiled, self.disturbance, self._trusted_read_byte)
+
+    def _latch_success(self) -> bool:
+        """Record trusted success permanently for the current episode.
+
+        Overlay state may later be retracted by an overwriting write, but the
+        episode already terminated when its trusted predicate first became true.
+        Short-circuiting is also important for ``script.run``: a brokered inner
+        call may close the worker after winning, and the outer call must retain
+        that reward without trying to read torn-down state again.
+        @spec:rl-reward @spec:rl-episode-termination
+        """
+        if not self.success:
+            self.success = self._trusted_success()
+        return self.success
 
     # @spec:rl-reward @spec:invariant-trusted-reward
     def _trusted_read_byte(self, addr: int) -> int:

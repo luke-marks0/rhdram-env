@@ -90,8 +90,19 @@ class Victim:
     left: int = 0  # ACTs on the physical row immediately to the left (row-1)
     right: int = 0  # ACTs on the physical row immediately to the right (row+1)
     bonus: float = 0.0  # extra effective hammers accrued from RowPress dwell
-    flipped: bool = False
-    flipped_bits: int = 0
+    # Active overlay cells owned by this victim. Keeping the exact cells, rather
+    # than only a high-water count, lets a partial write remove a hole from the
+    # deterministic sequence and lets later exposure emit that same cell again.
+    # @spec:tool-dram-write @spec:sim-exposure-flip
+    flipped_cells: set[tuple[int, int]] = field(default_factory=set)
+
+    @property
+    def flipped(self) -> bool:
+        return bool(self.flipped_cells)
+
+    @property
+    def flipped_bits(self) -> int:
+        return len(self.flipped_cells)
 
 
 @dataclass
@@ -246,6 +257,10 @@ class DisturbanceEngine:
         self._row_addrs: dict[tuple[int, ...], int] = {}
         self.victims: dict[tuple[int, ...], Victim] = {}
         self.flips: dict[int, int] = {}
+        # Overlay address -> (victim key, (byte offset, bit)). This reverse index
+        # makes restore proportional to the write size while keeping the victim's
+        # active-cell state and decoded row-key index in lockstep with ``flips``.
+        self._flip_owners: dict[int, tuple[tuple[int, ...], tuple[int, int]]] = {}
         # Decoded (channel, rank, bankgroup, bank, row) keys of every victim that has
         # flipped. Mapper-agnostic (keys come from decoded issued events), so the
         # discovery-family success predicate can read the trusted decoded victim key
@@ -332,8 +347,25 @@ class DisturbanceEngine:
         return bytes(out)
 
     def restore(self, addr: int, size: int) -> None:
+        # @spec:tool-dram-write @spec:sim-exposure-flip
         for i in range(size):
-            self.flips.pop(addr + i, None)
+            cell_addr = addr + i
+            cleared_bit = self.flips.pop(cell_addr, None)
+            if cleared_bit is None:
+                continue
+
+            owner = self._flip_owners.pop(cell_addr, None)
+            if owner is None:
+                # ``flips`` is intentionally inspectable in tests and predicates;
+                # tolerate an externally seeded entry that has no victim owner.
+                continue
+            key, cell = owner
+            victim = self.victims.get(key)
+            if victim is None:
+                continue
+            victim.flipped_cells.discard(cell)
+            if not victim.flipped:
+                self.flipped_row_keys.discard(key)
 
     def note_write(self, row_key: tuple[int, ...], data: bytes) -> None:
         """Record the data pattern a write leaves in a physical row.
@@ -452,22 +484,31 @@ class DisturbanceEngine:
 
     def _flip(self, key: tuple[int, ...], victim: Victim, ratio: float, result: DisturbanceResult) -> None:
         n_bits = self._multiplicity_bits(victim, ratio)
-        if n_bits <= victim.flipped_bits:
-            return
         for byte_off, bit in self._flip_positions(key, victim, n_bits):
-            self.flips[victim.addr + byte_off] = bit
-            victim.flipped_bits += 1
+            cell = (byte_off, bit)
+            cell_addr = victim.addr + byte_off
+            previous_owner = self._flip_owners.get(cell_addr)
+            if previous_owner is not None and previous_owner != (key, cell):
+                previous_key, previous_cell = previous_owner
+                previous_victim = self.victims.get(previous_key)
+                if previous_victim is not None:
+                    previous_victim.flipped_cells.discard(previous_cell)
+                    if not previous_victim.flipped:
+                        self.flipped_row_keys.discard(previous_key)
+            self.flips[cell_addr] = bit
+            self._flip_owners[cell_addr] = (key, cell)
+            victim.flipped_cells.add(cell)
             result.new_flips += 1
             result.public_flips.append(
                 {
                     "row": key[-1],
-                    "addr": victim.addr + byte_off,
+                    "addr": cell_addr,
                     "bit": bit,
                     "direction": victim.direction,
                 }
             )
-        victim.flipped = True
-        self.flipped_row_keys.add(key)
+        if victim.flipped:
+            self.flipped_row_keys.add(key)
 
     # ---- RowPress dwell ------------------------------------------------------
     # @spec:sim-rowpress
@@ -680,12 +721,15 @@ class DisturbanceEngine:
         """Deterministic (byte_offset, bit) positions for the first ``n_bits`` flips.
 
         Cell 0 is always column 0 / ``first_bit`` (bit 0 for the known target);
-        further cells are drawn pseudo-randomly and distinctly across the victim
-        row. Offsets are bounded by ``row_span`` — the row's own size — and not by
-        the row *stride*, which spans every bank at this row index and would place
-        the extra cells in other banks' rows entirely. The full sequence is
-        regenerated from the seed each call, so it is stable as multiplicity grows;
-        only the cells beyond the ones already flipped are returned.
+        further distinct cells are drawn pseudo-randomly across the victim row.
+        Offsets are bounded by ``row_span`` — the row's own size — and not by the
+        row *stride*, which spans every bank at this row index and would place the
+        extra cells in other banks' rows entirely. The full sequence is regenerated
+        from the seed each call, so it is stable as multiplicity grows. Because the
+        overlay stores one bit per byte, the last sampled cell at a repeated byte
+        offset is the active one, matching assignment into ``flips``. Active cells
+        are filtered by identity rather than by a high-water count, so a cell
+        removed by ``restore`` is eligible to be emitted again.
         """
         rng = random.Random(int.from_bytes(hashlib.sha256(f"{self.seed}:mult:{key}".encode()).digest()[:8], "big"))
         cells: list[tuple[int, int]] = []
@@ -698,7 +742,8 @@ class DisturbanceEngine:
                 continue
             seen.add(cell)
             cells.append(cell)
-        return cells[victim.flipped_bits:n_bits]
+        overlay_cells = {byte_off: (byte_off, bit) for byte_off, bit in cells}
+        return [cell for cell in overlay_cells.values() if cell not in victim.flipped_cells]
 
     # ---- profile access helpers ---------------------------------------------
 

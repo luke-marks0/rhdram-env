@@ -201,14 +201,37 @@ class RowHammerDisturbanceEnv(RowHammerEnv):
             raise RuntimeError("worker reported geometry without a command vocabulary; rebuild the worker")
         return Geometry(geometry)
 
-    def _from_worker(self, payload: dict[str, Any]) -> Phase2Observation:
-        obs = super()._from_worker(payload)
+    def _from_worker(
+        self, payload: dict[str, Any], *, written_data: bytes | None = None
+    ) -> Phase2Observation:
+        obs = super()._from_worker(payload, written_data=written_data)
         if obs.error or self.disturbance is None:
             return obs
 
         request = payload.get("request", {})
         try:
-            result = self.disturbance.consume(payload.get("events", []), request)
+            events = payload.get("events", [])
+            if request.get("op") == "WR":
+                if written_data is None:
+                    raise RuntimeError("worker write response has no corresponding write data")
+                write_events = [event for event in events if event.get("op") == "WR"]
+                if len(write_events) != 1:
+                    raise RuntimeError(
+                        f"worker write response reported {len(write_events)} issued WR events; expected 1"
+                    )
+                write_event = write_events[0]
+                row_key = tuple(
+                    int(write_event.get(level, 0))
+                    for level in ("channel", "rank", "bankgroup", "bank", "row")
+                )
+                if row_key[-1] < 0:
+                    raise RuntimeError("worker write event has no decoded row")
+                # Record the written stratum from the worker-decoded physical row
+                # before consume restores overwritten flip cells. The decoded key
+                # is mapper-correct even for secret row->bank mappings.
+                # @spec:tool-dram-write @spec:sim-latent-vulnerability
+                self.disturbance.note_write(row_key, written_data)
+            result = self.disturbance.consume(events, request)
         except RuntimeError as exc:
             # Folding events needs the worker to resolve victim anchors (``ENCODE``).
             # If that fails the overlay would be silently incomplete, so the episode
