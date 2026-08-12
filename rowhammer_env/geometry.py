@@ -28,7 +28,25 @@ class Geometry:
         sizes = [int(s) for s in info["level_sizes"]]
         self.level_names = [n.lower() for n in names]
         self.level_sizes = {n.lower(): s for n, s in zip(names, sizes)}
+        # The standard's whole DRAMSpec command vocabulary: the closed set of op
+        # names the issued-event stream can contain.
+        self.command_names = tuple(str(c) for c in info.get("command_names", ()))
         self.row_stride = self._row_stride()
+        self.row_span = self._row_span()
+
+    def _row_span(self) -> int:
+        """Linear bytes one physical row occupies *inside its own bank*.
+
+        Distinct from :meth:`_row_stride`, and much smaller: the stride steps over
+        every bank/bankgroup/rank at a row index (they are mapped *below* Row), so a
+        single row's own addresses are only the prefetch-adjusted Column field above
+        the transaction offset — a contiguous ``row_span`` block starting at that
+        row's column 0. On the admitted DDR4 geometry the stride is 131072 bytes but
+        a row is 8192, the other 15/16 belonging to the same row index in the other
+        banks. Anything that has to stay *within* one row (a flip's cell offset) is
+        bounded by this, not by the stride.
+        """
+        return self.tx_bytes * (self.level_sizes["column"] // self.prefetch)
 
     def _row_stride(self) -> int:
         """Linear bytes between two physically adjacent rows in the same bank.

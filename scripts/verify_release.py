@@ -18,6 +18,10 @@ sys.path.insert(0, str(ROOT))
 
 
 PHASE_GATE_NUMBERS = tuple(list(range(0, 10)) + list(range(11, 20)))
+# Standing invariant guards, each a repro for a defect that once shipped. Unlike the
+# phase gates these are not build-order history and never retire, so they carry names
+# rather than phase numbers.
+REGRESSION_GUARDS = ("scripts/verify_rowpress_close.py",)
 FORBIDDEN_SYMBOLS = (
     "mock_dram",
     "fake_dram",
@@ -76,6 +80,7 @@ def main(argv: list[str] | None = None) -> int:
     check_manifest_provenance()
     check_no_mock_symbols()
     run_phase_gate_matrix()
+    run_regression_guards()
     run_unittest_matrix_without_skips()
     check_deterministic_replay()
     check_tracked_file_hygiene()
@@ -164,6 +169,14 @@ def run_phase_gate_matrix() -> None:
         if not script.is_file():
             fail(f"missing phase gate script: {script.relative_to(ROOT)}")
         run_python(str(script.relative_to(ROOT)))
+
+
+def run_regression_guards() -> None:
+    for relative_path in REGRESSION_GUARDS:
+        script = ROOT / relative_path
+        if not script.is_file():
+            fail(f"missing regression guard script: {relative_path}")
+        run_python(relative_path)
 
 
 def run_unittest_matrix_without_skips() -> None:

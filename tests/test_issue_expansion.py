@@ -46,8 +46,23 @@ class ExpandCommandsTest(unittest.TestCase):
         self.assertTrue(all(c["op"] == "RD" for c in out))
 
     def test_zero_repeat_emits_nothing(self):
+        # An *explicit* zero count stays a legal no-op for both forms.
         self.assertEqual(expand_commands([{"op": "RD", "addr": A, "repeat": 0}]), [])
         self.assertEqual(expand_commands([{"op": "HAMMER", "rows": [A, B], "pairs": 0}]), [])
+
+    def test_hammer_without_sweep_count_is_bad_schema(self):
+        # @spec:tool-dram-issue — the sweep count is required, so an omitted one is
+        # an error rather than a silent no-op turn.
+        for command in (
+            {"op": "HAMMER", "rows": [A, B]},
+            {"op": "HAMMER", "addrs": [A, B]},
+        ):
+            with self.subTest(command=command), self.assertRaises(IssueExpansionError) as ctx:
+                expand_commands([command])
+            self.assertEqual(ctx.exception.code, "BAD_SCHEMA")
+
+    def test_primitive_without_repeat_still_defaults_to_one(self):
+        self.assertEqual(len(expand_commands([{"op": "RD", "addr": A}])), 1)
 
     def test_realistic_threshold_sized_hammer(self):
         # ~25k double-sided pairs (the known-target hcfirst min) is a few tokens as

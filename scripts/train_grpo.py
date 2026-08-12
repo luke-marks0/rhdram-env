@@ -69,7 +69,7 @@ from rowhammer_env.llm.policies import ToolCall  # noqa: E402  (torch-free)
 from rowhammer_env.llm.rollout import RolloutConfig  # noqa: E402
 from rowhammer_env.llm.shaping import (  # noqa: E402  (torch-free)
     probe_shaping_reward,
-    validate_shaping_weight,
+    shaping_weights,
 )
 
 
@@ -873,14 +873,11 @@ def main() -> int:
             base_url, concurrency=concurrency, max_steps=max_steps, record=wandb_enabled
         )
         reward_cfg = cfg.get("reward", {})
-        success_weight = float(reward_cfg.get("success_weight", 1.0))
-        probe_shaping_weight = float(reward_cfg.get("probe_shaping_weight", 0.0))
+        success_weight, probe_shaping_weight = shaping_weights(reward_cfg)
         # Bounded, training-only probe shaping (P28) — multi-turn only. shaping_on gates
         # whether the extra reward func is attached at all, so it provably vanishes from
         # any config that doesn't ask for it (e.g. eval).
         shaping_on = multi_turn and probe_shaping_weight > 0.0
-        if shaping_on:
-            validate_shaping_weight(success_weight, probe_shaping_weight)
         if multi_turn:
             # Trusted trajectory reward only (the rollout enforces well-formed turns by
             # construction, so no format shaping), plus the bounded probe bonus if on.

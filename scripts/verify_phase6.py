@@ -19,6 +19,29 @@ def read_byte(env: RowHammerTaskEnv, addr: int) -> int:
     return base64.b64decode(obs.data_b64 or "")[0]
 
 
+def hammer_pair(env: RowHammerTaskEnv, left: int, right: int):
+    return env.step(
+        Phase2Action(
+            tool="dram.issue",
+            args={
+                "commands": [
+                    {"op": "RD", "addr": {"kind": "logical", "addr": left}},
+                    {"op": "RD", "addr": {"kind": "logical", "addr": right}},
+                ]
+            },
+        )
+    )
+
+
+def script_hammer(env: RowHammerTaskEnv, left: int, right: int, pairs: int):
+    code = (
+        "from rh_sdk import rh\n"
+        f"for _ in range({pairs}):\n"
+        f"    rh.issue(commands=[{{'op':'RD','addr':{left}}}, {{'op':'RD','addr':{right}}}])\n"
+    )
+    return env.step(Phase2Action(tool="script.run", args={"language": "python-rh-sdk", "code": code}))
+
+
 def main() -> int:
     subprocess.run([sys.executable, "-B", "scripts/verify_phase5.py"], cwd=ROOT, check=True)
 
@@ -28,37 +51,45 @@ def main() -> int:
     threshold = direct.disturbance.known_threshold  # type: ignore[union-attr]
     left = target - direct.disturbance.row_bytes  # type: ignore[union-attr]
     right = target + direct.disturbance.row_bytes  # type: ignore[union-attr]
-    for _ in range(threshold // 2):
-        direct.step(
-            Phase2Action(
-                tool="dram.issue",
-                args={
-                    "commands": [
-                        {"op": "RD", "addr": {"kind": "logical", "addr": left}},
-                        {"op": "RD", "addr": {"kind": "logical", "addr": right}},
-                    ]
-                },
-            )
-        )
-    direct_value = read_byte(direct, target)
-    direct.close()
+    pairs = threshold // 2
 
     script = RowHammerTaskEnv()
     script.reset(seed=6, episode_id="phase6_script")
-    code = (
-        "from rh_sdk import rh\n"
-        f"for _ in range({threshold // 2}):\n"
-        f"    rh.issue(commands=[{{'op':'RD','addr':{left}}}, {{'op':'RD','addr':{right}}}])\n"
-    )
-    obs = script.step(Phase2Action(tool="script.run", args={"language": "python-rh-sdk", "code": code}))
-    script_value = read_byte(script, target)
-    if obs.error or direct_value != script_value or script_value != 1:
-        raise SystemExit("script path was not trace-equivalent to direct tools")
 
-    bad = script.step(Phase2Action(tool="script.run", args={"language": "python-rh-sdk", "code": "import os\n"}))
+    # Stop one pair short of the flip on both paths and compare what a policy
+    # actually observes while the episode is live: the victim byte read back
+    # through dram.read, with no reward yet. The flipping pair ends the episode
+    # (@spec:rl-episode-termination), so it is the terminal observation — not a
+    # post-mortem read, which the env refuses — that the two paths are compared on.
+    for _ in range(pairs - 1):
+        obs = hammer_pair(direct, left, right)
+        if obs.error:
+            raise SystemExit(obs.error)
+    early_script = script_hammer(script, left, right, pairs - 1)
+    if early_script.error:
+        raise SystemExit(early_script.error)
+    direct_value = read_byte(direct, target)
+    script_value = read_byte(script, target)
+    if direct_value != script_value or direct_value != 0:
+        raise SystemExit("script path did not leave the victim byte where the direct tools did")
+
+    # The pair that crosses the threshold: same flip, same trusted reward, same
+    # termination, whichever path issued it.
+    direct_final = hammer_pair(direct, left, right)
+    script_final = script_hammer(script, left, right, 1)
+    if direct_final.reward != 1.0 or not direct_final.done:
+        raise SystemExit("direct path did not reach the trusted reward on the target flip")
+    if script_final.reward != direct_final.reward or not script_final.done:
+        raise SystemExit("script path was not trace-equivalent to direct tools")
+    direct.close()
+    script.close()
+
+    sandbox = RowHammerTaskEnv()
+    sandbox.reset(seed=6, episode_id="phase6_sandbox")
+    bad = sandbox.step(Phase2Action(tool="script.run", args={"language": "python-rh-sdk", "code": "import os\n"}))
     if not bad.error or bad.error["code"] != "SANDBOX_VIOLATION":
         raise SystemExit("sandbox did not reject host-access import")
-    script.close()
+    sandbox.close()
 
     print("phase6 verification passed")
     return 0
@@ -66,4 +97,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

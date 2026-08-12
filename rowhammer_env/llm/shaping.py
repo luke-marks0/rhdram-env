@@ -39,6 +39,12 @@ from __future__ import annotations
 
 from typing import Any
 
+
+# @spec:train-reward-shaping — shaping is opt-in. Keeping the default beside the
+# validation and scoring logic gives training code and tests one authoritative
+# value instead of inferring it from the presence of a particular config file.
+DEFAULT_PROBE_SHAPING_WEIGHT = 0.0
+
 # A decisive probe is a *pairwise* bank-conflict test: exactly the victim row alternated
 # against one candidate. Comparing two rows is what the bank-conflict channel measures;
 # a wider access is a hammer or a warm-up, not a same/different-bank probe.
@@ -124,6 +130,21 @@ def probe_shaping_reward(rollout: Any, *, per_probe: float = PER_PROBE_BONUS) ->
     return min(1.0, float(per_probe) * n)
 
 
+def shaping_weights(reward_config: dict[str, Any] | None) -> tuple[float, float]:
+    """Resolve success and probe-shaping weights from an optional reward config.
+
+    Probe shaping is disabled unless a config explicitly supplies a positive
+    ``probe_shaping_weight``. Validation remains conditional on enabling shaping,
+    matching the trainer: an absent reward block must be a valid, unshaped run.
+    """
+    config = reward_config or {}
+    success_weight = float(config.get("success_weight", 1.0))
+    probe_weight = float(config.get("probe_shaping_weight", DEFAULT_PROBE_SHAPING_WEIGHT))
+    if probe_weight > 0.0:
+        validate_shaping_weight(success_weight, probe_weight)
+    return success_weight, probe_weight
+
+
 def validate_shaping_weight(success_weight: float, probe_shaping_weight: float) -> None:
     """Fail closed if the shaping weight could rival or exceed a real success (SPEC §9).
 
@@ -144,11 +165,13 @@ def validate_shaping_weight(success_weight: float, probe_shaping_weight: float) 
 
 
 __all__ = [
+    "DEFAULT_PROBE_SHAPING_WEIGHT",
     "MIN_READS_PER_ROW",
     "PER_PROBE_BONUS",
     "PROBE_ROW_COUNT",
     "count_decisive_probes",
     "is_decisive_probe",
     "probe_shaping_reward",
+    "shaping_weights",
     "validate_shaping_weight",
 ]
