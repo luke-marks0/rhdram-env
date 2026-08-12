@@ -10,8 +10,13 @@ from .phase2_env import Phase2Action, Phase2Observation
 from .phase4_env import DEFAULT_PROFILE_ID, RowHammerDisturbanceEnv
 from .script_sandbox import RestrictedScriptBroker, ScriptError
 from .tasks.compiler import FAMILIES, CompiledTask, TaskConfigError, TaskSpec
+from .worker_protocol import WorkerRequest
 
 ALLOWED_TOOLS = ["dram.info", "dram.read", "dram.write", "dram.issue", "script.run", "episode.finish"]
+
+
+class TrustedRewardReadError(RuntimeError):
+    """The worker could not provide authoritative memory for reward evaluation."""
 
 
 class RowHammerTaskEnv(RowHammerDisturbanceEnv):
@@ -55,6 +60,7 @@ class RowHammerTaskEnv(RowHammerDisturbanceEnv):
         self._compiled: CompiledTask | None = None
         self.target_row = 0
         self._acts_prev = 0
+        self._episode_done = False
         self._target_handle: str | None = None
         self._candidate_handles: list[str] = []
 
@@ -66,6 +72,7 @@ class RowHammerTaskEnv(RowHammerDisturbanceEnv):
         budgets: dict[str, int] | None = None,
         **kwargs: Any,
     ) -> Phase2Observation:
+        self._episode_done = False
         # Per-episode task selection (P17): an orchestrator can pass a task config
         # (SPEC §10 shape or the ``{"family": ...}`` shorthand) at reset to drive a
         # curriculum without restarting the server. Task selection is a training-
@@ -77,7 +84,10 @@ class RowHammerTaskEnv(RowHammerDisturbanceEnv):
                 self._configure_task(task, budgets=budgets)
             except TaskConfigError as exc:
                 self.close()
-                return self._error("BAD_SCHEMA", f"invalid task config: {exc}")
+                self._episode_done = True
+                # The episode never starts, so this is terminal even though BAD_SCHEMA
+                # only rejects an action mid-episode. @spec:rl-episode-termination
+                return self._terminal_error("BAD_SCHEMA", f"invalid task config: {exc}")
         elif budgets is not None:
             self._budgets_override = budgets
             self.initial_budgets = self._budgets_override or self.spec.resolved_budgets()
@@ -89,6 +99,7 @@ class RowHammerTaskEnv(RowHammerDisturbanceEnv):
         # against the reported geometry and pins the disclosure + engine target.
         obs = super().reset(seed=seed, episode_id=episode_id, **kwargs)
         if obs.error:
+            self._episode_done = True
             return obs
         assert self._compiled is not None
         self.target_row = self._compiled.target_row
@@ -109,6 +120,37 @@ class RowHammerTaskEnv(RowHammerDisturbanceEnv):
         self.task_family = self.spec.family
 
     def step(self, action: Phase2Action, timeout_s: float | None = None, **kwargs: Any) -> Phase2Observation:
+        """Admit one action, or refuse it because the episode can no longer pay for it.
+
+        Both guards run *before* dispatch, so a refused action never reaches the
+        worker and never commits disturbance. This is what makes budget honesty a
+        property of the env rather than of whichever driver happens to stop on
+        ``done`` (``script_sandbox`` forwards ``done`` to the script without acting
+        on it, and would otherwise keep hammering an episode that is already over).
+        @spec:invariant-budget-honesty @spec:rl-episode-termination
+        """
+        if self._episode_done:
+            return self._refuse("UNAVAILABLE_CAPABILITY", "episode is over; reset to start a new one")
+        # A dispatched action needs a tool call to spend: ``dram.*`` charges one
+        # directly, ``script.run`` charges one per brokered inner call. At zero
+        # remaining there is nothing left to pay with, so nothing is dispatched —
+        # ``episode.finish`` included, since its reward was already granted by the
+        # step that achieved success, and the refusal tears the episode down anyway.
+        if self.budget_remaining["tool_calls"] <= 0:
+            return self._refuse("BUDGET_EXCEEDED", "tool-call budget exhausted")
+        try:
+            obs = self._dispatch(action, timeout_s=timeout_s, **kwargs)
+        except TrustedRewardReadError as exc:
+            return self._refuse("INTERNAL_SIMULATOR_ERROR", str(exc))
+        # ``obs.done`` is the single authority on termination: ``_error`` sets it only
+        # for TERMINAL_ERROR_CODES, so a rejected action (a malformed command, a
+        # script the sandbox refused) leaves the episode running rather than ending it
+        # over a typo, while success, ``episode.finish`` and a terminal error latch.
+        if obs.done:
+            self._episode_done = True
+        return obs
+
+    def _dispatch(self, action: Phase2Action, timeout_s: float | None = None, **kwargs: Any) -> Phase2Observation:
         if action.tool == "script.run":
             return self._script(action)
         if action.tool == "episode.finish":
@@ -123,6 +165,23 @@ class RowHammerTaskEnv(RowHammerDisturbanceEnv):
         if self.success:
             obs.reward = 1.0
             obs.done = True
+        obs.metadata["budget_remaining"] = dict(self.budget_remaining)
+        return obs
+
+    def _refuse(self, code: str, message: str) -> Phase2Observation:
+        """Terminal refusal: the action is not dispatched and no budget is charged.
+
+        The episode is over either way, so the worker is torn down here — otherwise
+        a policy that spends its last tool call and *then* calls ``episode.finish``
+        (the usual shape) would leave the simulator process running, since the
+        refusal replaces the ``finish`` that used to close it.
+        """
+        self._episode_done = True
+        self.close()
+        # Terminal whatever the code: BUDGET_EXCEEDED ends the episode by itself, and
+        # the post-termination refusal (UNAVAILABLE_CAPABILITY) reports an episode
+        # that is already over rather than rejecting an action within a live one.
+        obs = self._terminal_error(code, message)
         obs.metadata["budget_remaining"] = dict(self.budget_remaining)
         return obs
 
@@ -202,7 +261,11 @@ class RowHammerTaskEnv(RowHammerDisturbanceEnv):
         except ScriptError as exc:
             return self._error(exc.code, str(exc))
         self.success = self._trusted_success()
-        obs = Phase2Observation(reward=1.0 if self.success else 0.0, done=self.success, cycle=self._state.cycle)
+        # A brokered inner call may have ended the episode (budget exhaustion, a
+        # simulator error); the script keeps running to completion either way, but
+        # the observation must not report the episode as live once it is over.
+        done = self.success or self._episode_done
+        obs = Phase2Observation(reward=1.0 if self.success else 0.0, done=done, cycle=self._state.cycle)
         obs.feedback["script"] = result
         obs.metadata["budget_remaining"] = dict(self.budget_remaining)
         return obs
@@ -212,8 +275,12 @@ class RowHammerTaskEnv(RowHammerDisturbanceEnv):
         # monolithic HAMMER is truncated at the budget rather than running to
         # completion and crediting an over-budget flip. ``_acts_prev`` is the
         # cumulative ACT counter as of the last charge; adding the remaining budget
-        # gives the absolute counter value this issue may reach. Only families that
-        # actually budget activations are constrained (others hammer freely).
+        # gives the absolute counter value this issue may reach — the point at which
+        # the budget is exactly spent, which is what ``_issue`` compares its live
+        # counter against. Anchoring on ``_acts_prev`` rather than the live counter
+        # keeps the ceiling tied to the budget that was actually debited, so any
+        # drift between the two can only make the guard stricter, never looser.
+        # Only families that budget activations are constrained (others hammer freely).
         if "acts" not in self.budget_remaining:
             return None
         return self._acts_prev + max(0, self.budget_remaining["acts"])
@@ -233,7 +300,36 @@ class RowHammerTaskEnv(RowHammerDisturbanceEnv):
             obs.done = True
 
     def _trusted_success(self) -> bool:
-        return rewards.success_for(self._compiled, self.disturbance)
+        return rewards.success_for(self._compiled, self.disturbance, self._trusted_read_byte)
+
+    # @spec:rl-reward @spec:invariant-trusted-reward
+    def _trusted_read_byte(self, addr: int) -> int:
+        """Read one authoritative post-disturbance byte without issuing DRAM traffic.
+
+        Reward evaluation must use the worker's actual functional-memory byte, not
+        reconstruct it from ``flips`` or the disturbance model's ``data_pattern``.
+        The worker's internal ``READ ... STORED`` form reads that byte without
+        ticking Ramulator or draining events; applying the committed disturbance
+        overlay here produces exactly the byte a policy-facing ``dram.read`` would
+        return, without letting reward evaluation create unbudgeted disturbance.
+        """
+        if self._worker is None or self.disturbance is None:
+            raise TrustedRewardReadError("worker unavailable for trusted reward read")
+        request_id = f"{self._next_id()}:reward"
+        payload = self._worker.call(WorkerRequest("READ", request_id, (str(int(addr)), "1", "STORED")))
+        if not payload.get("ok"):
+            error = payload.get("error") or {}
+            raise TrustedRewardReadError(error.get("message", "trusted reward read failed"))
+        data_hex = payload.get("data_hex")
+        if not isinstance(data_hex, str):
+            raise TrustedRewardReadError("trusted reward read returned no data")
+        try:
+            stored = bytes.fromhex(data_hex)
+        except ValueError as exc:
+            raise TrustedRewardReadError("trusted reward read returned invalid data") from exc
+        if len(stored) != 1:
+            raise TrustedRewardReadError(f"trusted reward read returned {len(stored)} bytes, expected 1")
+        return self.disturbance.apply(int(addr), stored)[0]
 
     # ---- observation metadata (disclosure-projected) ------------------------
     def _task_metadata(self, seed: int | None) -> dict[str, Any]:
@@ -303,9 +399,9 @@ class RowHammerTaskEnv(RowHammerDisturbanceEnv):
         elif self.disclosure.victim in ("row_handle", "cell_handle") and self._target_handle is not None:
             out["target"] = {"kind": "handle", "id": self._target_handle}
 
-        # Candidate disclosure: opaque handles for handle-victim families (Tier 2a),
-        # numeric logical addresses for ``hidden_adjacency`` (Tier 2b). The ordering
-        # matches ``self._compiled.candidates`` in both cases so a fixed seed is
+        # Candidate disclosure: opaque handles for handle-victim families
+        # (``bounded_sweep``), numeric logical addresses for ``hidden_adjacency``.
+        # The ordering matches ``self._compiled.candidates`` in both cases so a fixed seed is
         # reproducible; the list itself is already role-shuffled by the compiler.
         if self.disclosure.adjacency == "candidate_set":
             if self._candidate_handles:
