@@ -35,6 +35,20 @@ MAX_ISSUE_ACTIVATIONS = 2_000_000
 # that matter — in the ``timing_digest`` (P22).
 ISSUE_TRACE_TAIL_CAP = 64
 
+# Error codes that end the *episode* rather than reject the *action*: budget
+# exhaustion, and an unrecoverable simulator failure (the worker's per-request cycle
+# deadline surfaces as INTERNAL_SIMULATOR_ERROR). Every other code in the stable set
+# — BAD_SCHEMA, UNSUPPORTED_TOOL, ADDRESS_NOT_DISCLOSED, ILLEGAL_COMMAND,
+# SANDBOX_VIOLATION, SCRIPT_TIMEOUT, QUEUE_FULL, UNAVAILABLE_CAPABILITY,
+# PROFILE_REJECTED — refuses one call and leaves the episode running: a policy that
+# asks for a capability this host does not offer (an unavailable script sandbox)
+# loses that call, not the episode. ``_error`` sets ``done`` from this set, so the
+# observation's own flag says what actually happened; an error that ends the episode
+# whatever its code (a failed ``reset``, a refusal after the episode is already over)
+# goes through ``_terminal_error`` instead.
+# @spec:rl-episode-termination @spec:error-codes
+TERMINAL_ERROR_CODES = frozenset({"BUDGET_EXCEEDED", "INTERNAL_SIMULATOR_ERROR"})
+
 
 class _TimingDigest:
     """Bounded, coordinate-free summary of the true events of one ``dram.issue``.
@@ -103,7 +117,12 @@ class IssueExpansionError(Exception):
         self.message = message
 
 
-def _repeat_count(command: dict[str, Any], *, keys: tuple[str, ...], default: int) -> int:
+def _explicit_count(command: dict[str, Any], *, keys: tuple[str, ...]) -> int | None:
+    """Return the count given under the first present key, or ``None`` if absent.
+
+    ``None`` means "no count field at all", which is distinct from an explicit
+    ``0``; callers decide whether an absent count has a default or is an error.
+    """
     for key in keys:
         if key in command:
             value = command[key]
@@ -114,7 +133,7 @@ def _repeat_count(command: dict[str, Any], *, keys: tuple[str, ...], default: in
             if n < 0:
                 raise IssueExpansionError("BAD_SCHEMA", f"'{key}' must be non-negative, got {n}")
             return n
-    return default
+    return None
 
 
 def expand_commands(commands: list[Any]) -> list[dict[str, Any]]:
@@ -130,7 +149,9 @@ def expand_commands(commands: list[Any]) -> list[dict[str, Any]]:
       single RD to each listed row — the canonical double-sided hammer when two
       rows are given. This expands to *exactly* the explicit alternating RD
       sequence, so it is bit-for-bit equivalent at the worker (and thus in the
-      disturbance model and reward) to writing every RD out by hand.
+      disturbance model and reward) to writing every RD out by hand. The sweep
+      count is **required**: HAMMER without one is ``BAD_SCHEMA``, not a silent
+      no-op. ``"pairs": 0`` remains a legal (explicit) no-op.
 
     Plain primitives without a repeat/expansion field pass through unchanged, so
     existing explicit command lists behave identically. Raises
@@ -154,13 +175,19 @@ def expand_commands(commands: list[Any]) -> list[dict[str, Any]]:
             rows = command.get("rows", command.get("addrs"))
             if not isinstance(rows, list) or not rows:
                 raise IssueExpansionError("BAD_SCHEMA", "HAMMER requires a non-empty 'rows' list")
-            pairs = _repeat_count(command, keys=("pairs", "count", "repeat"), default=0)
+            pairs = _explicit_count(command, keys=("pairs", "count", "repeat"))
+            if pairs is None:
+                raise IssueExpansionError(
+                    "BAD_SCHEMA",
+                    "HAMMER requires a sweep count 'pairs' (aliases 'count'/'repeat'); "
+                    "pass 'pairs': 0 for an explicit no-op",
+                )
             for _ in range(pairs):
                 for addr in rows:
                     _emit({"op": "RD", "addr": addr}, 1)
         elif op in ("RD", "WR", "WAIT"):
-            times = _repeat_count(command, keys=("repeat", "count"), default=1)
-            _emit(command, times)
+            times = _explicit_count(command, keys=("repeat", "count"))
+            _emit(command, 1 if times is None else times)
         else:
             raise IssueExpansionError("ILLEGAL_COMMAND", str(op))
     return out
@@ -219,6 +246,11 @@ class RowHammerEnv(Environment[Phase2Action, Phase2Observation, Phase2State]):
         # Address projection + disclosure enforcement (P12). Absent in the bare
         # phase-2 env (no geometry yet), which then only accepts logical addresses.
         self._resolver: AddressResolver | None = None
+        # The worker's cumulative public counters as of its last reply. A fresh
+        # worker starts at zero, so this is exact from reset onwards; ``_issue``
+        # reads the ``acts`` entry as the live counter for its pre-issue budget
+        # guard, and uses the whole dict for an issue that sends nothing.
+        self._public_counters: dict[str, Any] = {}
 
     def reset(
         self,
@@ -228,14 +260,18 @@ class RowHammerEnv(Environment[Phase2Action, Phase2Observation, Phase2State]):
     ) -> Phase2Observation:
         self.close()
         self._state = Phase2State(episode_id=episode_id or "p2_episode", step_count=0, cycle=0)
+        self._public_counters = {}
+        # An episode that cannot start at all is ended by ``reset`` itself, so these
+        # are terminal even though UNAVAILABLE_CAPABILITY rejects (not ends) a *step*.
+        # @spec:rl-episode-termination
         if not self.worker_path.is_file() or not self.config_path.is_file():
             self._worker = None
-            return self._error("UNAVAILABLE_CAPABILITY", "Phase 2 worker/config is not built")
+            return self._terminal_error("UNAVAILABLE_CAPABILITY", "Phase 2 worker/config is not built")
         try:
             self._worker = WorkerClient(self.worker_path, self.config_path)
         except FileNotFoundError:
             self._worker = None
-            return self._error("UNAVAILABLE_CAPABILITY", "Phase 2 worker/config is not built")
+            return self._terminal_error("UNAVAILABLE_CAPABILITY", "Phase 2 worker/config is not built")
         return Phase2Observation(
             reward=0.0,
             done=False,
@@ -278,7 +314,7 @@ class RowHammerEnv(Environment[Phase2Action, Phase2Observation, Phase2State]):
             if action.tool == "dram.write":
                 raw = base64.b64decode(str(action.args.get("data_b64", "")), validate=True)
                 req = WorkerRequest("WRITE", self._next_id(), (str(self._logical_addr(action.args)), raw.hex()))
-                return self._from_worker(self._worker.call(req))
+                return self._from_worker(self._worker.call(req), written_data=raw)
             if action.tool == "dram.issue":
                 return self._issue(action.args)
             return self._error("UNSUPPORTED_TOOL", action.tool)
@@ -330,9 +366,21 @@ class RowHammerEnv(Environment[Phase2Action, Phase2Observation, Phase2State]):
         # completion and crediting an over-budget flip (SPEC §8: ACTs are budgeted).
         acts_ceiling = self._issue_acts_ceiling()
         budget_truncated = False
-        last = Phase2Observation(reward=0.0, done=False, cycle=self._state.cycle)
+        last = Phase2Observation(
+            reward=0.0, done=False, cycle=self._state.cycle, public_counters=dict(self._public_counters)
+        )
         for command in primitives:
+            # Pre-issue guard, checked before the worker call: ``_acts_issued`` is
+            # the cumulative activation count already committed, so at the ceiling
+            # nothing more is sent. A post-issue check cannot enforce this — with a
+            # remaining budget of 0 the ceiling equals the current counter and the
+            # first primitive would already have run (and its flip been credited)
+            # by the time the check saw it. @spec:invariant-budget-honesty
+            if acts_ceiling is not None and self._acts_issued() >= acts_ceiling:
+                budget_truncated = True
+                break
             op = command["op"]
+            written_data: bytes | None = None
             if op == "WAIT":
                 key = None
                 req = WorkerRequest("ISSUE", self._next_id(), ("WAIT", str(command.get("cycles", 0))))
@@ -342,8 +390,11 @@ class RowHammerEnv(Environment[Phase2Action, Phase2Observation, Phase2State]):
             else:  # WR (expand_commands only yields RD/WR/WAIT)
                 key = self._digest_addr_key(command)
                 raw = base64.b64decode(str(command.get("data_b64", "")), validate=True)
+                written_data = raw
                 req = WorkerRequest("ISSUE", self._next_id(), ("WR", str(self._addr_value(command)), raw.hex()))
-            last = self._from_worker(self._worker.call(req))  # type: ignore[union-attr]
+            last = self._from_worker(  # type: ignore[union-attr]
+                self._worker.call(req), written_data=written_data
+            )
             if last.error:
                 return last
             # ``last.feedback`` is already projected to the disclosure level by the
@@ -355,12 +406,6 @@ class RowHammerEnv(Environment[Phase2Action, Phase2Observation, Phase2State]):
             flips += int(last.feedback.get("new_public_flips", 0) or 0)
             oracle_refreshes += int(last.feedback.get("oracle_refreshes", 0) or 0)
             public_flips.extend(last.feedback.get("public_flips", []) or [])
-            # Stop before issuing any primitive the activation budget cannot pay for.
-            # The primitive just issued is within budget (its flips, if any, count);
-            # the rest of a truncated HAMMER are never sent to the worker.
-            if acts_ceiling is not None and int(last.public_counters.get("acts", 0)) >= acts_ceiling:
-                budget_truncated = True
-                break
         # Aggregate the whole issue's feedback onto the last primitive's observation
         # (which carries the final cumulative ``public_counters``/``cycle``) instead
         # of surfacing only the last primitive's slice (0.2.2).
@@ -375,11 +420,18 @@ class RowHammerEnv(Environment[Phase2Action, Phase2Observation, Phase2State]):
         if self._trace_disclosed():
             last.feedback["timing_digest"] = digest.as_dict()
         if budget_truncated:
-            # The issue hit the activation ceiling mid-expansion: the flips above are
-            # the real ones the budget paid for; the episode terminates over budget.
+            # The issue hit the activation ceiling with primitives left to expand: the
+            # flips above are the real ones the budget paid for, and the rest were
+            # never issued. The episode ends — the policy asked for activations its
+            # budget cannot cover. An issue that fits exactly is *not* truncated; it
+            # is the next one, which has nothing left to spend, that ends the episode.
             last.error = {"code": "BUDGET_EXCEEDED", "message": "activation budget exhausted"}
             last.done = True
         return last
+
+    def _acts_issued(self) -> int:
+        """Cumulative activations the worker has reported so far this episode."""
+        return int(self._public_counters.get("acts", 0))
 
     def _issue_acts_ceiling(self) -> int | None:
         """Absolute cumulative-ACT ceiling a single ``dram.issue`` may reach.
@@ -445,11 +497,19 @@ class RowHammerEnv(Environment[Phase2Action, Phase2Observation, Phase2State]):
     def _next_id(self) -> str:
         return f"a{self._state.step_count}"
 
-    def _from_worker(self, payload: dict[str, Any]) -> Phase2Observation:
+    def _from_worker(
+        self, payload: dict[str, Any], *, written_data: bytes | None = None
+    ) -> Phase2Observation:
+        # The bare environment has no disturbance state. Subclasses receive the
+        # validated bytes here because the worker intentionally echoes only the
+        # write address and size, not the written data.
+        del written_data
         if not payload.get("ok"):
             err = payload.get("error") or {}
             return self._error(err.get("code", "INTERNAL_SIMULATOR_ERROR"), err.get("message", "worker failed"))
         self._state.cycle = int(payload["cycle"])
+        counters = dict(payload.get("public_counters", {}))
+        self._public_counters = counters
         data_hex = payload.get("data_hex")
         data_b64 = base64.b64encode(bytes.fromhex(data_hex)).decode() if data_hex else None
         return Phase2Observation(
@@ -458,9 +518,33 @@ class RowHammerEnv(Environment[Phase2Action, Phase2Observation, Phase2State]):
             cycle=self._state.cycle,
             data_b64=data_b64,
             last_action=payload.get("last_action", {}),
-            public_counters=payload.get("public_counters", {}),
+            public_counters=counters,
             feedback={"trace_tail": payload.get("events", [])},
         )
 
     def _error(self, code: str, message: str) -> Phase2Observation:
-        return Phase2Observation(reward=0.0, done=True, cycle=self._state.cycle, error={"code": code, "message": message})
+        """Refuse one action with a stable code; ``done`` only for a terminal code.
+
+        A rejected action leaves the episode running (@spec:rl-episode-termination),
+        so ``done`` follows :data:`TERMINAL_ERROR_CODES` rather than being set on
+        every error — otherwise the observation reports the episode as over when only
+        the call was refused.
+        """
+        return Phase2Observation(
+            reward=0.0,
+            done=code in TERMINAL_ERROR_CODES,
+            cycle=self._state.cycle,
+            error={"code": code, "message": message},
+        )
+
+    def _terminal_error(self, code: str, message: str) -> Phase2Observation:
+        """An error that ends the episode whatever its code.
+
+        For the two cases the termination list covers but the code does not name: an
+        episode that could not start (a failing ``reset``) and one already over (a
+        refusal after termination). Both are ends of an episode, not rejections of an
+        action within a live one.
+        """
+        obs = self._error(code, message)
+        obs.done = True
+        return obs

@@ -22,6 +22,7 @@ contract:
 
 from __future__ import annotations
 
+import base64
 import pathlib
 import unittest
 from collections import Counter
@@ -163,6 +164,29 @@ class BoundedSweepIntegrationTests(unittest.TestCase):
                               "pairs": thr}]}))
             self.assertEqual(last.reward, 1.0)
             self.assertTrue(last.done)
+        finally:
+            env.close()
+
+    def test_dram_read_shows_the_flip_at_the_disclosed_victim_handle(self) -> None:
+        # @spec:tool-dram-read — a committed flip must be readable at the address the
+        # task disclosed. The victim's anchor is its own column-0 address under the
+        # per-episode secret mapper (resolved through the worker ``ENCODE`` op), so
+        # resolving the target handle and reading it returns the flipped byte.
+        env = RowHammerTaskEnv(task=self._task("easy"))
+        try:
+            obs = env.reset(seed=7)
+            cands = env._compiled.candidates
+            meta = obs.metadata["candidates"]
+            aggr = [self._handle(meta[i]["id"]) for i, c in enumerate(cands) if c.is_aggressor]
+            target = obs.metadata["objective"]["target"]
+            self.assertEqual(target["kind"], "handle")
+            step = env.step(Phase2Action(tool="dram.issue", args={"commands": [
+                {"op": "HAMMER", "rows": aggr, "pairs": env.disturbance.known_threshold},
+                {"op": "RD", "addr": target},
+            ]}))
+            self.assertIsNone(step.error)
+            self.assertEqual(step.reward, 1.0)
+            self.assertNotEqual(base64.b64decode(step.data_b64)[0], 0)
         finally:
             env.close()
 

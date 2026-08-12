@@ -32,6 +32,7 @@ from rowhammer_env.llm.shaping import (
     count_decisive_probes,
     is_decisive_probe,
     probe_shaping_reward,
+    shaping_weights,
     validate_shaping_weight,
 )
 from rowhammer_env.observability.metrics import TrajectoryStep
@@ -143,20 +144,17 @@ class ShapingEnvelopeTests(unittest.TestCase):
             validate_shaping_weight(1.0, -0.1)
 
     def test_shaping_is_opt_in_and_off_by_default(self) -> None:
-        # Structural "vanishes from eval/benchmark scoring": the shaping weight defaults
-        # to 0.0, so any config that doesn't explicitly ask for it (the base training
-        # config, and every eval/benchmark path, which score on trusted success only)
-        # runs with no shaping term at all. Only the discovery *training* curriculum
-        # opts in — and even then strictly below success_weight.
-        base = yaml.safe_load((ROOT / "configs/training/grpo_qwen8b.yaml").read_text())
-        base_reward = base.get("reward", {})
-        self.assertEqual(float(base_reward.get("probe_shaping_weight", 0.0)), 0.0)
+        # @spec:train-reward-shaping — an absent reward block resolves to no shaping,
+        # independent of any particular model/config file. Only the discovery
+        # training curriculum opts in, and even then strictly below success_weight.
+        self.assertEqual(shaping_weights(None), (1.0, 0.0))
+        self.assertEqual(shaping_weights({}), (1.0, 0.0))
 
         curriculum = yaml.safe_load((ROOT / "configs/training/grpo_curriculum.yaml").read_text())
         cur_reward = curriculum["reward"]
-        weight = float(cur_reward["probe_shaping_weight"])
+        success_weight, weight = shaping_weights(cur_reward)
         self.assertGreater(weight, 0.0)  # training opts in
-        validate_shaping_weight(float(cur_reward.get("success_weight", 1.0)), weight)  # still below success
+        validate_shaping_weight(success_weight, weight)  # still below success
 
     def test_probing_never_reaches_a_real_success(self) -> None:
         # A no-flip trajectory with the maximum possible shaping still scores strictly

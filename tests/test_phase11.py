@@ -7,6 +7,7 @@ import unittest
 from rowhammer_env import Phase2Action, RowHammerDisturbanceEnv
 from rowhammer_env.disturbance import DisturbanceEngine
 from rowhammer_env.geometry import Geometry
+from rowhammer_env.tools.addressing import AddressMapper
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -24,7 +25,8 @@ DDR4_INFO = {
 
 
 def engine(**kwargs) -> DisturbanceEngine:
-    return DisturbanceEngine(geometry=Geometry(DDR4_INFO), seed=11, **kwargs)
+    geo = Geometry(DDR4_INFO)
+    return DisturbanceEngine(geometry=geo, row_encoder=AddressMapper(geo).encode, seed=11, **kwargs)
 
 
 def act(row: int, *, bank: int = 0, bankgroup: int = 0) -> dict:

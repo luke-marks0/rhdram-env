@@ -37,6 +37,7 @@ sys.path.insert(0, str(ROOT))
 from rowhammer_env import Phase2Action, RowHammerDisturbanceEnv, RowHammerTaskEnv  # noqa: E402
 from rowhammer_env.disturbance import DisturbanceEngine  # noqa: E402
 from rowhammer_env.geometry import Geometry  # noqa: E402
+from rowhammer_env.tools.addressing import AddressMapper  # noqa: E402
 
 SEED = 14
 
@@ -89,7 +90,7 @@ def real_geometry() -> Geometry:
 
 
 def new_engine(geo: Geometry, **kwargs) -> DisturbanceEngine:
-    return DisturbanceEngine(geometry=geo, seed=SEED, **kwargs)
+    return DisturbanceEngine(geometry=geo, row_encoder=AddressMapper(geo).encode, seed=SEED, **kwargs)
 
 
 def act(row: int, *, clk: int = 0) -> dict:
@@ -97,7 +98,8 @@ def act(row: int, *, clk: int = 0) -> dict:
 
 
 def pre(*, clk: int = 0) -> dict:
-    return {"op": "PRE", "channel": 0, "rank": 0, "bankgroup": 0, "bank": 0, "clk": clk}
+    """A per-bank precharge, as DDR4 names it."""
+    return {"op": "PREpb", "channel": 0, "rank": 0, "bankgroup": 0, "bank": 0, "clk": clk}
 
 
 def refab() -> dict:
@@ -321,7 +323,9 @@ def check_statistical_validity(geo: Geometry) -> None:
     within_sigmas: list[float] = []
     all_logs: list[float] = []
     for m in range(80):
-        eng = DisturbanceEngine(geometry=geo, seed=7000 + m, family=family, stratum=stratum)
+        eng = DisturbanceEngine(
+            geometry=geo, row_encoder=AddressMapper(geo).encode, seed=7000 + m, family=family, stratum=stratum
+        )
         logs = [math.log(eng._sample_threshold((0, 0, 0, 0, r), "double", "all_zeros")) for r in range(3, 500)]
         module_means.append(statistics.mean(logs))
         within_sigmas.append(statistics.pstdev(logs))

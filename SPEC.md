@@ -124,20 +124,40 @@ Defined in: `rowhammer_env/phase2_env.py` (`Phase2Observation`, `_from_worker`),
 `rowhammer_env/phase5_env.py` (`step`).
 
 #### `@spec:rl-reward` — sparse, trusted reward
-Default reward is sparse: `1.0` on the task's success predicate, else `0.0`. The
-reward is computed **only** from trusted simulator state (the disturbance engine's
-committed flips / decoded flipped-row keys), never from policy-provided logs,
-stdout, or claims. `episode.finish` returns `1.0` iff the predicate already holds.
+Default reward is sparse: `1.0` once the task's success predicate has become true,
+else `0.0`. The first success is latched for the episode: a later write may retract
+the flip overlay, but cannot retract an already-earned reward. The reward is
+computed **only** from trusted simulator state (the disturbance engine's committed
+flips / decoded flipped-row keys), never from policy-provided logs, stdout, or
+claims. `episode.finish` returns `1.0` iff trusted success has already latched or
+the predicate holds when it is called.
+A **target row is a full physical coordinate**: every target-row family decides
+success by comparing the compiled task's decoded
+`(channel, rank, bankgroup, bank, row)` victim key against the engine's
+`flipped_row_keys`, never a row *index* — the index alone names one physical row
+per bank, and under a secret mapper a flip's linear address does not encode its
+row at all. The `target_cell` and `pattern_target` predicates likewise do not
+reconstruct a byte from the engine's flip metadata or data-pattern stratum. Once a
+committed flip reaches the target cell, they obtain the worker's actual stored byte
+through the server-internal `READ … STORED` form, apply the disturbance overlay,
+and compare that resulting byte with the compiled bit/mask/value condition. The
+stored-byte read is side-effect-free, so checking reward cannot create unbudgeted
+DRAM events or alter cycles and public counters.
 Defined in: `rowhammer_env/rewards/predicates.py` (`success_for`, `PREDICATES`),
-`rowhammer_env/phase5_env.py` (`_trusted_success`, `step`, `_script`).
+`rowhammer_env/phase5_env.py` (`_trusted_success`, `_latch_success`,
+`_trusted_read_byte`, `step`,
+`_script`), `cpp/simulator_service/ramulator_worker.cpp` (`read`).
 
 #### `@spec:rl-budgets` — resource budgets and enforcement
 Every episode carries a budget dict (a subset of `tool_calls`, `acts`, `cycles`).
 Each `step` charges one `tool_call`, the observed `cycle_delta`, and
 the true `acts` delta from `public_counters`. A single `dram.issue` may not spend
 more activations than the remaining `acts` budget: the server expands compact forms
-and issues one primitive at a time, stopping at the ceiling — so **no flip is ever
-credited that the budget could not pay for**. Exhaustion sets `error =
+and issues one primitive at a time, checking the ceiling **before** each primitive
+leaves for the worker — so **no flip is ever credited that the budget could not pay
+for**. A `step` with no `tool_calls` left is likewise refused before dispatch (it
+reaches neither the worker nor `_charge`), so the budget is spent by actions that
+ran, never by an action the budget could not afford. Exhaustion sets `error =
 BUDGET_EXCEEDED` and `done`. Families without an `acts` budget hammer freely.
 The `script.run` path carries no separate budget: its per-call `timeout_ms` arg is
 a wall-clock safety deadline (not a reward-shaping cost), and its brokered inner
@@ -151,8 +171,23 @@ Defined in: `rowhammer_env/phase5_env.py` (`_charge`, `_issue_acts_ceiling`),
 An episode ends when: the success predicate becomes true; `episode.finish` is
 called; a budget is exhausted; an unrecoverable simulator/sandbox error occurs; or
 the worker's per-request cycle deadline is hit. Any of these sets `done=True`.
-Defined in: `rowhammer_env/phase5_env.py` (`step`, `_charge`),
-`rowhammer_env/phase2_env.py` (`_error`, `_issue`),
+Success is sticky within an episode: once a trusted predicate becomes true, later
+overlay retraction cannot change its reward, including when brokered calls continue
+inside an already-running `script.run`.
+Termination is enforced by the env, not assumed of the driver: once an episode has
+ended, every further `step` is **refused before dispatch** — no worker call, no
+disturbance, no budget charged — with `done` and a stable error code, and the worker
+is torn down. Only the conditions above latch; the codes that reject a single
+*action* (`BAD_SCHEMA`, `UNSUPPORTED_TOOL`, `ADDRESS_NOT_DISCLOSED`,
+`ILLEGAL_COMMAND`, `SANDBOX_VIOLATION`, `SCRIPT_TIMEOUT`, `QUEUE_FULL`,
+`PROFILE_REJECTED`, `UNAVAILABLE_CAPABILITY`) leave the episode running **and report
+`done=False`**, so a driver that stops on `done` does not abandon an episode over a
+typo — an episode that cannot start at all is ended by `reset` itself, whatever code
+that failure carries.
+Defined in: `rowhammer_env/phase2_env.py` (`_error`, `_terminal_error`,
+`TERMINAL_ERROR_CODES`, `reset`, `_issue`),
+`rowhammer_env/phase5_env.py` (`step`, `reset`, `_refuse`, `_charge`),
+`rowhammer_env/phase4_env.py` (`reset`),
 `cpp/simulator_service/ramulator_worker.cpp` (`complete_request` deadline).
 
 ### Tools (policy-facing interface)
@@ -167,7 +202,14 @@ Defined in: `rowhammer_env/phase2_env.py` (`step` `dram.info` branch, `_geometry
 Read/write simulated memory at a disclosed address (logical / physical / handle per
 task). Reads return base64 bytes with any disturbance flips applied to the returned
 copy; writes update functional state and record the row's data pattern (for stratum
-selection) and restore overwritten flipped cells.
+selection) and restore overwritten flipped cells. Restoration retracts exactly the
+overlapping active cells from the victim's flip bookkeeping and removes its decoded
+row key from `flipped_row_keys` only when no active cells remain. A restored cell is
+eligible to flip again when exposure reaches the corresponding multiplicity. This
+overlay retraction does not retract latched episode success (`@spec:rl-reward`).
+`note_write` takes the write's *decoded* row key, not its linear address: which row
+an address belongs to is a property of the active mapper, which only the worker
+knows.
 Defined in: `rowhammer_env/phase2_env.py` (`step`), `rowhammer_env/phase4_env.py`
 (`_from_worker`), `rowhammer_env/disturbance.py` (`apply`, `note_write`, `restore`).
 
@@ -176,10 +218,15 @@ Defined in: `rowhammer_env/phase2_env.py` (`step`), `rowhammer_env/phase4_env.py
 `RD`, `WR`, `WAIT`. Compact forms are expanded **server-side into the exact
 primitive sequence** before execution, so budget and disturbance accounting run on
 the true expanded event count:
-- `{op: RD|WR|WAIT, repeat|count: N}` — issue the primitive N times.
+- `{op: RD|WR|WAIT, repeat|count: N}` — issue the primitive N times; an absent
+  count defaults to 1.
 - `{op: HAMMER, rows: [...], pairs|count|repeat: N}` — N sweeps of one RD to each
   listed row (the canonical double-sided hammer for two rows). Bit-for-bit
-  equivalent at the worker to writing every alternating RD by hand.
+  equivalent at the worker to writing every alternating RD by hand. The sweep
+  count is **required** — HAMMER with no `pairs`/`count`/`repeat` fails
+  `BAD_SCHEMA` rather than silently expanding to nothing, so a policy cannot
+  spend a turn on a hammer that never happened. An explicit `pairs: 0` is a legal
+  no-op.
 Expansion beyond `MAX_ISSUE_ACTIVATIONS` (2,000,000) fails `ILLEGAL_COMMAND`.
 `ACT`/`PRE`/`REF`/`RFM` are **controller-generated, not policy-issuable** — the
 worker rejects them with `ILLEGAL_COMMAND`. They appear only in the issued-event
@@ -225,12 +272,18 @@ Defined in: `rowhammer_env/phase2_env.py` (`_error`),
 
 #### `@spec:env-worker-protocol` — Ramulator worker RPC
 A per-episode `ramulator_worker` subprocess speaks newline-delimited requests over
-stdio: `INFO`, `READ id addr len`, `WRITE id addr hex`, `ISSUE id op ...`,
-`DECODE id linear`, `QUIT`. Each response is one JSON line
+stdio: `INFO`, `READ id addr len [STORED]`, `WRITE id addr hex`, `ISSUE id op ...`,
+`DECODE id linear`, `ENCODE id c0 c1 … cN`, `QUIT`. Each response is one JSON line
 (`ok`, `cycle`, `last_action`, `public_counters`, `request`, `events`, optional
-`data_hex`/`addr_vec`/`geometry`). `DECODE` is **server-internal only** (used by the
-task compiler) and is never in the policy tool surface. A fresh worker = a fresh
-episode (sparse memory overlay reset, empty issued-event buffer).
+`data_hex`/`addr_vec`/`linear`/`geometry`). `DECODE` and `ENCODE` are the two
+directions of the same map — coordinates in DRAMSpec level order, one per level,
+channel first and column last — and both are side-effect-free (no tick, no drain, no
+counter change). `READ … STORED` returns raw functional-memory bytes without
+submitting a frontend request, ticking, draining events, or changing counters; it
+is used only by trusted reward evaluation, which applies the disturbance overlay
+server-side. `READ … STORED`, `DECODE`, and `ENCODE` are **server-internal only** and
+are never in the policy tool surface. A fresh worker = a fresh episode (sparse
+memory overlay reset, empty issued-event buffer).
 Defined in: `rowhammer_env/worker_protocol.py` (`WorkerClient`, `WorkerRequest`),
 `cpp/simulator_service/ramulator_worker.cpp`.
 
@@ -244,11 +297,21 @@ Defined in: `cpp/ramulator_extensions/issued_event_recorder.{h,cpp}`,
 
 #### `@spec:env-geometry` — geometry derivation
 `Geometry` is built from the worker's `INFO` (standard, `tx_bytes`, `prefetch`,
-level names/sizes). It derives the linear **row stride** (bytes between physically
-adjacent rows) from the real RoBaRaCoCh layout, for any standard, and exposes a
-`public_block()` (row stride + row/bank/bankgroup counts + standard) that is
-identical across every episode of a profile and leaks nothing about the target.
-Defined in: `rowhammer_env/geometry.py`.
+level names/sizes, `command_names`). It derives the linear **row stride** (bytes
+between physically adjacent rows) from the real RoBaRaCoCh layout, for any standard,
+and the **row span** (bytes one row occupies inside its own bank — the
+prefetch-adjusted Column field). These are not the same number and are not
+interchangeable: the stride steps over every bank/bankgroup/rank at a row index, so
+it measures "the next row along" while the span measures "still inside this row"
+(131072 vs 8192 on the admitted DDR4 geometry). It also exposes a `public_block()` (row stride + row/bank/bankgroup counts + standard)
+that is identical across every episode of a profile and leaks nothing about the
+target. `command_names` is the standard's whole `DRAMSpec` command vocabulary — the
+closed set of `op` names the issued-event stream can contain. It is **not** part of
+`public_block()`: it is an internal integrity input, not policy-facing. A worker
+`INFO` without it is rejected at `_fetch_geometry`, so the vocabulary check below can
+never be silently skipped.
+Defined in: `rowhammer_env/geometry.py`, `cpp/simulator_service/ramulator_worker.cpp`
+(`info`), `rowhammer_env/phase4_env.py` (`_fetch_geometry`).
 
 #### `@spec:env-address-mapper` — physical↔linear projection
 `AddressMapper` reproduces Ramulator's RoBaRaCoCh decode/encode from the reported
@@ -265,7 +328,9 @@ handle, digest, or the public geometry). Under it, `victim ± row_stride` lands 
 *different* bank, so adjacency is not computable from a numeric address and must be
 found via the timing channel. The Python projection is disabled for secret mappers
 (`physical` disclosure fails closed); the compiler builds candidate sets via the
-worker `DECODE` op instead.
+worker `DECODE` op instead, and the disturbance model anchors victim flips via the
+worker `ENCODE` op (`@spec:sim-exposure-flip`), so a flip is readable at the address
+the task disclosed rather than at an arithmetic guess.
 Defined in: `rowhammer_env/mappers.py`, `cpp/ramulator_extensions/row_xor_addr_mapper.cpp`,
 `rowhammer_env/phase5_env.py` (`_active_mapper`), `docs/adr-0004-secret-address-mapping.md`.
 
@@ -276,12 +341,30 @@ statistical read-disturbance**. Not transistor-level; not exact replay of any
 specific commercial module.
 
 #### `@spec:sim-disturbance-engine` — event → flip overlay
-`DisturbanceEngine.consume(events, request)` folds one worker response into state:
-`ACT` drives exposure (and the oracle counter); `PRE`/`PREA` settle RowPress dwell;
-`REF`/`RFM` decay exposure; a `WR` restores overwritten cells. `apply(addr, data)`
-overlays committed flips onto returned bytes. All keyed by *decoded* physical
-`(channel,rank,bankgroup,bank,row)`.
-Defined in: `rowhammer_env/disturbance.py` (`DisturbanceEngine`).
+`DisturbanceEngine.consume(events, request)` folds one worker response into state.
+Every issued command is dispatched by `classify_command` into exactly one class:
+
+| class | commands | effect |
+|---|---|---|
+| `hammer` | `ACT` | drives exposure and the oracle counter |
+| `close` | `PRE*`, `RDA`, `WRA` | settles the RowPress dwell of every open row in scope |
+| `refresh` | `REF*`, `RFM*` | decays exposure over the refresh window |
+| `inert` | `RD`, `WR`, `VRR` | no direct disturbance effect |
+
+`RDA`/`WRA` are closes because Ramulator runs `PREpb::action` as their own action —
+no `PRE` event marks the close. `VRR` is inert because its victim-row refresh is
+modelled from the ACT counter (`@spec:mitigation-oracle`) and it is targeted rather
+than part of the JEDEC auto-refresh window, so folding it into `refresh` would
+wrongly advance the window counter.
+
+Because dispatch is by command *name*, the name set must be closed: the engine
+validates the worker-published `command_names` (`@spec:env-geometry`) at
+construction and **fails closed** on any command it cannot classify, rather than
+silently dropping it. A `WR` request also restores the cells it overwrote.
+`apply(addr, data)` overlays committed flips onto returned bytes. All keyed by
+*decoded* physical `(channel,rank,bankgroup,bank,row)`.
+Defined in: `rowhammer_env/disturbance.py` (`DisturbanceEngine`, `classify_command`,
+`unclassified_commands`, `AUTO_PRECHARGE_OPS`, `INERT_OPS`).
 
 #### `@spec:sim-latent-vulnerability` — per-row latent state, sampled once
 Each victim row's thresholds (double-sided `hcfirst`, single-sided `hcfirst`),
@@ -299,17 +382,45 @@ Double-sided exposure `= min(left,right)*2 + bonus` vs the double threshold;
 single-sided `= max(left,right) + bonus` vs the single threshold. Crossing the
 threshold flips ≥1 cell; multiplicity grows with exposure/threshold per the profile
 `multiplicity` curve, capped at `MAX_FLIPPED_BITS_PER_ROW` (64). Flips persist until
-overwritten or refresh-restored. Flip positions are deterministic from the seed;
-cell 0 is always column 0 / `first_bit`.
-Defined in: `rowhammer_env/disturbance.py` (`_hammer`, `_maybe_flip`, `_flip`,
-`_multiplicity_bits`, `_flip_positions`).
+overwritten or refresh-restored. An overwrite removes only its overlapping active
+cells from the victim and row-key indexes; those deterministic positions may flip
+again under later exposure. Flip positions are deterministic from the seed; cell 0
+is always column 0 / `first_bit`.
+A flip's recorded linear address is **the victim row's own column-0 base plus an
+offset inside `[0, row_span)`**, so every recorded address decodes back to the
+victim's `(channel, rank, bankgroup, bank, row)` key. The anchor is obtained by
+encoding that decoded key (with column 0) through the **active mapper**, via the
+engine's `row_encoder` — the worker `ENCODE` op in the live env. It is never derived
+arithmetically from the activating access: `aggressor ± d * row_stride` holds only
+for the public RoBaRaCoCh mapper and lands in a *different bank* under
+`@spec:env-secret-mapper`, which would file a real flip at an address that reads
+clean and leave a phantom one where nothing flipped. The anchor is therefore
+independent of the intra-row offset and of the address the aggressor access carried.
+A victim row outside the device's row range is skipped rather than encoded.
+The `[0, row_span)` offset assumes the mapper keeps Column as one contiguous field
+just above the transaction offset, which both admitted mappers (`RoBaRaCoCh` and
+`RoBaRaCoChRowXOR`) do; a mapper that splits the Column field would need each cell's
+address encoded individually, not just the row's base.
+Defined in: `rowhammer_env/disturbance.py` (`_hammer`, `_row_addr`, `_maybe_flip`,
+`_flip`, `_multiplicity_bits`, `_flip_positions`), `rowhammer_env/phase4_env.py`
+(`_encode`), `cpp/simulator_service/ramulator_worker.cpp` (`encode`),
+`cpp/ramulator_extensions/issued_event_recorder.cpp` (`AddrInverter`).
 
 #### `@spec:sim-rowpress` — open-row dwell
 A row held open longer than `ROWPRESS_DWELL_NOMINAL` accrues extra effective
 hammers, scaling to the profile's `rowhammer_to_rowpress_hc_reduction` at
 `ROWPRESS_DWELL_SATURATION`. Applied only for profiles that characterise RowPress;
 ordinary back-to-back traffic accrues no bonus.
-Defined in: `rowhammer_env/disturbance.py` (`_settle_dwell`, `_rowpress_factor`).
+
+A row's dwell is the span from its `ACT` to the command that actually closes it —
+any command in the `close` class of `@spec:sim-disturbance-engine` (the per-bank
+`PREpb`; the rank-scoped `PREab` that precedes every auto-refresh, whose decoded
+bankgroup/bank of -1 means "every bank in this rank"; an auto-precharge `RDA`/`WRA`)
+— or a conflicting `ACT` in the same bank. Dwell is therefore bounded by the refresh
+interval: an idle `WAIT` between two activations does not extend the preceding one's
+dwell, and cannot buy the saturated bonus.
+Defined in: `rowhammer_env/disturbance.py` (`_close_bank`, `_settle_dwell`,
+`_rowpress_factor`).
 
 #### `@spec:sim-refresh-decay` — refresh window decay
 Ramulator auto-refresh events are ground truth. At each JEDEC refresh-window
@@ -323,10 +434,12 @@ Defined in: `rowhammer_env/disturbance.py` (`_refresh`).
 The engine keeps one "known target" row with a fixed calibrated `hcfirst` and a
 deterministic first flip (bit `first_bit`, direction from pattern), so the
 deterministic fixtures stay reproducible. Every other row is fully profile-sampled.
-The known row's decoded bank is pinned (bank 0 under the public mapper; the
-scrambled bank under a secret mapper).
+The known row's full decoded key is pinned — channel/rank/bankgroup/bank as well as
+row (all zero under the public mapper; the scrambled bank under a secret mapper, and
+whatever rank the compiler's decode reports) — so the fixed threshold lands on the
+same victim the success predicate reads.
 Defined in: `rowhammer_env/disturbance.py` (`known_threshold`, `_known_target_key`,
-`known_target_row`/`_bank`/`_bankgroup`/`known_first_bit`).
+`known_target_row`/`_channel`/`_rank`/`_bank`/`_bankgroup`/`known_first_bit`).
 
 #### `@spec:sim-standard-model` — standard-generic parameters
 `StandardModel.from_geometry` derives the blast neighbourhood, refresh-window
@@ -379,8 +492,16 @@ Defined in: `rowhammer_env/tasks/compiler.py` (`FAMILIES`, `FamilyDef`),
 `TaskSpec.compile(seed, geometry, decode)` samples the concrete target row/bit,
 resolves budgets and difficulty, pins disclosure, builds the candidate window (for
 discovery families, via the worker `DECODE` op against the true mapping), and
-records the decoded victim bank. Produces an immutable `CompiledTask` that carries
-everything reward and disclosure read. Deterministic per `(task_id, seed, manifest)`.
+records the victim's decoded `(channel, rank, bankgroup, bank, row)` key
+(`CompiledTask.target_row_key`) — from the worker `DECODE` op under a secret mapper,
+and from the equivalent public projection (`AddressMapper`) otherwise, so no
+coordinate of it is ever assumed. Which of the two applies is a property of the
+**family**, not of the caller: a `secret_mapping` family is exactly the family the
+env runs under a secret mapper, so compiling one without the worker `DECODE` op
+fails closed with `TaskConfigError`. So does a geometry the public projection cannot
+represent. Neither may yield a victim key no flip can match. Produces an immutable
+`CompiledTask` that carries everything reward and disclosure read. Deterministic per
+`(task_id, seed, manifest)`.
 Defined in: `rowhammer_env/tasks/compiler.py` (`TaskSpec.compile`, `CompiledTask`),
 `rowhammer_env/phase5_env.py` (`_disturbance_overrides`).
 
@@ -600,7 +721,9 @@ Defined in: enforced across the codebase; gate `scripts/verify_release.py`,
 #### `@spec:invariant-trusted-reward` — reward from trusted state only
 Success/reward derives only from committed simulator state (`DisturbanceEngine.flips`
 / `flipped_row_keys`), never from policy logs, stdout, submitted claims, or
-`episode.finish` assertions.
+`episode.finish` assertions. The episode may retain a success bit only after this
+trusted state has satisfied its predicate; that bit is reset between episodes and
+is monotone within one episode.
 Defined in: `rowhammer_env/rewards/predicates.py`, `rowhammer_env/phase5_env.py`.
 
 #### `@spec:invariant-no-leakage` — hidden state never leaks
@@ -613,9 +736,13 @@ Defined in: `rowhammer_env/tasks/disclosure.py`, `rowhammer_env/mappers.py`,
 #### `@spec:invariant-budget-honesty` — no over-budget credit
 Activations the `acts` budget cannot pay for are never issued to the worker, so no
 flip they would have caused is ever credited; budget counters are monotone
-non-increasing within an episode.
-Defined in: `rowhammer_env/phase5_env.py` (`_charge`, `_issue_acts_ceiling`),
-`rowhammer_env/phase2_env.py` (`_issue`).
+non-increasing within an episode. The same holds on the `tool_calls` axis: an action
+with no tool call left to pay for it is refused before dispatch rather than executed
+and charged afterwards, and no action at all runs once the episode is over. Both
+guards are pre-dispatch checks in the env, so the invariant does not depend on the
+driver honouring `done`.
+Defined in: `rowhammer_env/phase5_env.py` (`step`, `_refuse`, `_charge`,
+`_issue_acts_ceiling`), `rowhammer_env/phase2_env.py` (`_issue`, `_acts_issued`).
 
 #### `@spec:invariant-determinism` — replayable episodes
 An episode is deterministic given `(task_id, seed)` and the pinned source manifest/
@@ -674,10 +801,18 @@ Deliberately **not** tagged as contracts — in flux, aspirational, or advisory:
 Places where code and the design bundle / docs / comments currently disagree.
 Flagged, not resolved — a human decides which side is authoritative.
 
-1. **Doc phase naming lag.** `docs/api.md` and inline comments reference "the Tier 2b
-   numeric-address family" generically; the concrete family name is
-   `hidden_adjacency`. Not a behavior bug, but doc phrasing trails the code names.
-   Files: `docs/api.md` vs `rowhammer_env/tasks/compiler.py` (`FAMILIES`).
+4. **The oracle port clears its counters per refresh *window*, not per all-bank
+   refresh.** `@spec:mitigation-oracle` claims a faithful `OracleRH` port with
+   "counters cleared on all-bank refresh"; `oracle_rh.cpp` clears `m_table` on every
+   `REFab`, while `disturbance._refresh` clears them below the window-boundary early
+   return, i.e. every 8192nd. The port is materially *more* protective than the plugin
+   it claims to port. Left as-is on purpose (audit decision D): the one-line hoist
+   would make `oracle` close to a no-op at the current `tRH` default and move the
+   phase-7 protection fixture, which is a `tRH` calibration decision, and `tRH`
+   defaults are still under "Open / unsettled". `mitigation: none` is the default and
+   no trained task enables `oracle`.
+   Files: `rowhammer_env/disturbance.py` (`_refresh`) vs
+   `third_party/ramulator2/.../plugin/impl/oracle_rh.cpp`.
 
 ---
 

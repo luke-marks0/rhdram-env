@@ -10,6 +10,7 @@ import yaml
 from rowhammer_env import Phase2Action, RowHammerEnv, RowHammerTaskEnv
 from rowhammer_env.disturbance import DisturbanceEngine
 from rowhammer_env.geometry import Geometry
+from rowhammer_env.tools.addressing import AddressMapper
 from rowhammer_env.mitigations import (
     ADMITTED,
     public_mitigation_capabilities,
@@ -58,9 +59,10 @@ class MitigationRegistryTests(unittest.TestCase):
     def test_disturbance_engine_uses_registry_not_inline_allowlist(self) -> None:
         geo = Geometry(DDR4_INFO)
         self.assertIn("oracle", ADMITTED)
-        self.assertEqual(DisturbanceEngine(geometry=geo, mitigation="oracle").mitigation, "oracle")
+        oracle = DisturbanceEngine(geometry=geo, row_encoder=AddressMapper(geo).encode, mitigation="oracle")
+        self.assertEqual(oracle.mitigation, "oracle")
         with self.assertRaises(ValueError) as ctx:
-            DisturbanceEngine(geometry=geo, mitigation="para")
+            DisturbanceEngine(geometry=geo, row_encoder=AddressMapper(geo).encode, mitigation="para")
         self.assertEqual(str(ctx.exception), "UNAVAILABLE_CAPABILITY:para")
 
     def test_dram_info_exposes_only_admitted_capabilities(self) -> None:

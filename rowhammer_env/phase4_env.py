@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+from collections.abc import Mapping
 from typing import Any
 
 from .disturbance import DisturbanceEngine
@@ -42,6 +43,7 @@ class RowHammerDisturbanceEnv(RowHammerEnv):
         self.profile_id = profile_id
         self.temperature = temperature
         self.disclosure = FULL_DISCLOSURE
+        self.geometry: Geometry | None = None
         self.address_mapper: AddressMapper | None = None
         # The per-episode active mapper (impl name + params). The bare disturbance
         # env always uses the public default; the task layer overrides
@@ -66,10 +68,12 @@ class RowHammerDisturbanceEnv(RowHammerEnv):
             )
             self.config_path = worker_config_for_mitigation(mapped_config, self.mitigation)
         except ValueError as exc:
+            # Every failure below is a *reset* failure: the episode never starts, so it
+            # is terminal regardless of the code. @spec:rl-episode-termination
             if str(exc).startswith("UNAVAILABLE_CAPABILITY:"):
-                return self._error("UNAVAILABLE_CAPABILITY", str(exc).split(":", 1)[1])
+                return self._terminal_error("UNAVAILABLE_CAPABILITY", str(exc).split(":", 1)[1])
             if str(exc).startswith("BAD_SCHEMA:"):
-                return self._error("BAD_SCHEMA", str(exc).split(":", 1)[1])
+                return self._terminal_error("BAD_SCHEMA", str(exc).split(":", 1)[1])
             raise
         obs = super().reset(seed=seed, episode_id=episode_id, **kwargs)
         if obs.error:
@@ -78,12 +82,13 @@ class RowHammerDisturbanceEnv(RowHammerEnv):
             geometry = self._fetch_geometry()
         except RuntimeError as exc:
             self.close()
-            return self._error("INTERNAL_SIMULATOR_ERROR", str(exc))
+            return self._terminal_error("INTERNAL_SIMULATOR_ERROR", str(exc))
+        self.geometry = geometry
         try:
             self.address_mapper = AddressMapper(geometry)
         except ValueError as exc:
             self.close()
-            return self._error("UNAVAILABLE_CAPABILITY", f"geometry not projectable: {exc}")
+            return self._terminal_error("UNAVAILABLE_CAPABILITY", f"geometry not projectable: {exc}")
         # Let the task layer (P13) compile its task against the real geometry —
         # sampling the target row, choosing the disclosure, and picking the engine
         # overrides (known target row / first bit / disturbance family) — before
@@ -95,6 +100,10 @@ class RowHammerDisturbanceEnv(RowHammerEnv):
         self._resolver = AddressResolver(self.address_mapper, self.disclosure, HandleTable(seed or 0))
         engine_kwargs: dict[str, Any] = dict(
             geometry=geometry,
+            # Victim anchors come from the worker's own mapper, for every episode —
+            # the public mapper included, so there is one address path rather than a
+            # Python projection that silently diverges under a secret mapping.
+            row_encoder=self._encode,
             seed=seed or 0,
             mitigation=self.mitigation["name"],
             mitigation_params=self.mitigation.get("params"),
@@ -107,10 +116,10 @@ class RowHammerDisturbanceEnv(RowHammerEnv):
         except ValueError as exc:
             if str(exc).startswith("UNAVAILABLE_CAPABILITY:"):
                 self.close()
-                return self._error("UNAVAILABLE_CAPABILITY", str(exc).split(":", 1)[1])
+                return self._terminal_error("UNAVAILABLE_CAPABILITY", str(exc).split(":", 1)[1])
             if str(exc).startswith("PROFILE_REJECTED:"):
                 self.close()
-                return self._error("PROFILE_REJECTED", str(exc).split(":", 1)[1])
+                return self._terminal_error("PROFILE_REJECTED", str(exc).split(":", 1)[1])
             raise
         obs.metadata["profile"] = self.disturbance.profile_id
         obs.metadata["mitigation"] = self.mitigation
@@ -141,6 +150,24 @@ class RowHammerDisturbanceEnv(RowHammerEnv):
             raise RuntimeError((resp.get("error") or {}).get("message", "decode failed"))
         return resp["addr_vec"]
 
+    def _encode(self, coords: Mapping[str, int]) -> int:
+        """Encode physical coordinates to a linear address under the *active* mapper.
+
+        The exact inverse of :meth:`_decode`, and server-internal in the same way:
+        ``ENCODE`` is never in ``ALLOWED_TOOLS``. The disturbance engine uses it to
+        resolve each victim row's own column-0 address, which under a secret
+        row->bank mapping is not the aggressor's address plus a row stride
+        (# @spec:sim-exposure-flip). Raises if the worker is down or the active
+        mapper has no linear address for these coordinates.
+        """
+        if self._worker is None or self.geometry is None:
+            raise RuntimeError("worker unavailable for encode")
+        args = tuple(str(int(coords.get(level, 0))) for level in self.geometry.level_names)
+        resp = self._worker.call(WorkerRequest("ENCODE", self._next_id(), args))
+        if not resp.get("ok"):
+            raise RuntimeError((resp.get("error") or {}).get("message", "encode failed"))
+        return int(resp["linear"])
+
     def _disturbance_overrides(self, geometry: Geometry, seed: int) -> dict[str, Any]:
         """Engine constructor overrides for this episode (hook for the task layer).
 
@@ -166,15 +193,50 @@ class RowHammerDisturbanceEnv(RowHammerEnv):
         if not payload.get("ok") or "geometry" not in payload:
             err = payload.get("error") or {}
             raise RuntimeError(err.get("message", "worker did not report geometry"))
-        return Geometry(payload["geometry"])
+        geometry = payload["geometry"]
+        # The command vocabulary is what lets the disturbance engine check its event
+        # classification against a closed set, so a worker that does not publish it
+        # is rejected rather than silently skipping that check.
+        if not geometry.get("command_names"):
+            raise RuntimeError("worker reported geometry without a command vocabulary; rebuild the worker")
+        return Geometry(geometry)
 
-    def _from_worker(self, payload: dict[str, Any]) -> Phase2Observation:
-        obs = super()._from_worker(payload)
+    def _from_worker(
+        self, payload: dict[str, Any], *, written_data: bytes | None = None
+    ) -> Phase2Observation:
+        obs = super()._from_worker(payload, written_data=written_data)
         if obs.error or self.disturbance is None:
             return obs
 
         request = payload.get("request", {})
-        result = self.disturbance.consume(payload.get("events", []), request)
+        try:
+            events = payload.get("events", [])
+            if request.get("op") == "WR":
+                if written_data is None:
+                    raise RuntimeError("worker write response has no corresponding write data")
+                write_events = [event for event in events if event.get("op") == "WR"]
+                if len(write_events) != 1:
+                    raise RuntimeError(
+                        f"worker write response reported {len(write_events)} issued WR events; expected 1"
+                    )
+                write_event = write_events[0]
+                row_key = tuple(
+                    int(write_event.get(level, 0))
+                    for level in ("channel", "rank", "bankgroup", "bank", "row")
+                )
+                if row_key[-1] < 0:
+                    raise RuntimeError("worker write event has no decoded row")
+                # Record the written stratum from the worker-decoded physical row
+                # before consume restores overwritten flip cells. The decoded key
+                # is mapper-correct even for secret row->bank mappings.
+                # @spec:tool-dram-write @spec:sim-latent-vulnerability
+                self.disturbance.note_write(row_key, written_data)
+            result = self.disturbance.consume(events, request)
+        except RuntimeError as exc:
+            # Folding events needs the worker to resolve victim anchors (``ENCODE``).
+            # If that fails the overlay would be silently incomplete, so the episode
+            # ends rather than continuing on partial disturbance state.
+            return self._terminal_error("INTERNAL_SIMULATOR_ERROR", str(exc))
         if obs.data_b64 and request.get("op") == "RD":
             raw = base64.b64decode(obs.data_b64)
             flipped = self.disturbance.apply(int(request["addr"]), raw)

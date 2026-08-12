@@ -30,6 +30,7 @@ from profile_builder.standards import (
 from rowhammer_env import disturbance as disturbance_mod
 from rowhammer_env.disturbance import DisturbanceEngine
 from rowhammer_env.geometry import Geometry
+from rowhammer_env.tools.addressing import AddressMapper
 from rowhammer_env.profiles import ADMITTED_PROFILES, DEFERRED_PROFILES, load_profile
 from rowhammer_env.standards import StandardModel, ramulator_impl_for
 
@@ -49,6 +50,11 @@ HBM2_INFO = {
     "level_names": ["Channel", "PseudoChannel", "BankGroup", "Bank", "Row", "Column"],
     "level_sizes": [1, 2, 4, 4, 65536, 128],
 }
+
+
+def encoder(info: dict):
+    """Row->address resolution for a worker-free engine (public mapper only)."""
+    return AddressMapper(Geometry(info)).encode
 
 
 class GeometryStrideTests(unittest.TestCase):
@@ -108,7 +114,7 @@ class EngineStandardTests(unittest.TestCase):
     """The engine is parameterized by standard, with no DDR4 hard-gate."""
 
     def test_ddr4_engine_uses_adapter(self) -> None:
-        eng = DisturbanceEngine(geometry=Geometry(DDR4_INFO), seed=15)
+        eng = DisturbanceEngine(geometry=Geometry(DDR4_INFO), row_encoder=encoder(DDR4_INFO), seed=15)
         self.assertEqual(eng.standard, "DDR4")
         self.assertEqual(tuple(eng.blast), ((1, 1.0),))
         self.assertEqual(eng.refresh_window, 8192)
@@ -116,19 +122,19 @@ class EngineStandardTests(unittest.TestCase):
     def test_no_pooling_ddr4_profile_on_hbm2_geometry(self) -> None:
         # The DDR4-fitted profile must never run on an HBM2 geometry.
         with self.assertRaises(ValueError) as ctx:
-            DisturbanceEngine(geometry=Geometry(HBM2_INFO), seed=15)
+            DisturbanceEngine(geometry=Geometry(HBM2_INFO), row_encoder=encoder(HBM2_INFO), seed=15)
         self.assertTrue(str(ctx.exception).startswith("PROFILE_REJECTED:"))
 
     def test_no_pooling_ddr4_profile_on_ddr5_geometry(self) -> None:
         with self.assertRaises(ValueError) as ctx:
-            DisturbanceEngine(geometry=Geometry(DDR5_INFO), seed=15)
+            DisturbanceEngine(geometry=Geometry(DDR5_INFO), row_encoder=encoder(DDR5_INFO), seed=15)
         self.assertTrue(str(ctx.exception).startswith("PROFILE_REJECTED:"))
 
     def test_v1_profile_backward_compatible(self) -> None:
         # A legacy v1 package (no topology/refresh blocks) must give identical
         # engine behaviour by falling back to the standard adapter's values.
         geo = Geometry(DDR4_INFO)
-        v2 = DisturbanceEngine(geometry=geo, seed=15)
+        v2 = DisturbanceEngine(geometry=geo, row_encoder=AddressMapper(geo).encode, seed=15)
 
         legacy = copy.deepcopy(load_profile("ddr4_vts25_v1"))
         for key in ("schema_version", "topology", "refresh", "standard_dimensions"):
@@ -136,7 +142,7 @@ class EngineStandardTests(unittest.TestCase):
         original = disturbance_mod.load_profile
         disturbance_mod.load_profile = lambda _pid: copy.deepcopy(legacy)
         try:
-            v1 = DisturbanceEngine(geometry=geo, seed=15)
+            v1 = DisturbanceEngine(geometry=geo, row_encoder=AddressMapper(geo).encode, seed=15)
         finally:
             disturbance_mod.load_profile = original
 

@@ -26,9 +26,9 @@ OpenAI-compatible chat-completions endpoint configured with
 
 ## Discovery families and the secret address mapping
 
-Discovery families (`bounded_sweep`, and the Tier 2b numeric-address family) hide
-which candidate rows are same-bank physical neighbours of the victim. For these,
-the DRAM **address→bank mapping is a per-episode secret**: the worker runs the
+Discovery families (`bounded_sweep` and `hidden_adjacency`) hide which candidate
+rows are same-bank physical neighbours of the victim. For these, the
+DRAM **address→bank mapping is a per-episode secret**: the worker runs the
 authored `RoBaRaCoChRowXOR` mapper (RoBaRaCoCh decode plus a Row→Bank XOR with a
 seedable offset), so `victim ± row_stride` lands in a *different* bank and
 adjacency cannot be computed from a numeric address — it must be reverse-engineered
@@ -40,9 +40,11 @@ stride is identical to the public mapper. Success is scored on the trusted decod
 victim flip, never on a policy read or claim. See
 `docs/adr-0004-secret-address-mapping.md`.
 
-The server-internal `DECODE` request (true coordinates under the active mapper) is
-used only by the task compiler to build candidate sets; it is **not** in the policy
-tool surface and cannot be reached through `step`.
+The server-internal `DECODE` request (true coordinates under the active mapper) and
+its inverse `ENCODE` (the linear address of a set of coordinates) are used only by
+the task compiler, to build candidate sets, and by the disturbance model, to anchor
+each victim row's flips at that row's own column-0 address. Neither is in the policy
+tool surface and neither can be reached through `step`.
 
 ## Budgets, activation accounting, and termination
 

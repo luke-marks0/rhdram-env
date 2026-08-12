@@ -45,7 +45,7 @@ from profile_builder.ingest.hbm2 import require_admitted, source_status  # noqa:
 from profile_builder.errors import SourceUnavailable  # noqa: E402
 from profile_builder.package.build import verify_package  # noqa: E402
 from profile_builder.standards import as_profile_blocks, facts_for  # noqa: E402
-from rowhammer_env.disturbance import DisturbanceEngine  # noqa: E402
+from rowhammer_env.disturbance import DisturbanceEngine, unclassified_commands  # noqa: E402
 from rowhammer_env.geometry import Geometry  # noqa: E402
 from rowhammer_env.profiles import ADMITTED_PROFILES, DEFERRED_PROFILES, load_profile  # noqa: E402
 from rowhammer_env.standards import SUPPORTED_STANDARDS, StandardModel  # noqa: E402
@@ -128,7 +128,7 @@ def check_schema_v2_backward_compat() -> None:
     matches the full v2 engine.
     """
     geo = worker_geometry(DDR4_CONFIG)
-    eng_v2 = DisturbanceEngine(geometry=geo, seed=15)
+    eng_v2 = DisturbanceEngine(geometry=geo, row_encoder=AddressMapper(geo).encode, seed=15)
 
     legacy = copy.deepcopy(load_profile("ddr4_vts25_v1"))
     for key in ("schema_version", "topology", "refresh", "standard_dimensions"):
@@ -136,7 +136,7 @@ def check_schema_v2_backward_compat() -> None:
     orig_load = DisturbanceEngine.__init__.__globals__["load_profile"]
     DisturbanceEngine.__init__.__globals__["load_profile"] = lambda _pid: copy.deepcopy(legacy)
     try:
-        eng_v1 = DisturbanceEngine(geometry=geo, seed=15)
+        eng_v1 = DisturbanceEngine(geometry=geo, row_encoder=AddressMapper(geo).encode, seed=15)
     finally:
         DisturbanceEngine.__init__.__globals__["load_profile"] = orig_load
 
@@ -154,6 +154,26 @@ def check_schema_v2_backward_compat() -> None:
 def _fingerprint(geo: Geometry) -> tuple:
     return (geo.standard, geo.prefetch, geo.tx_bytes, tuple(geo.level_names),
             tuple(sorted(geo.level_sizes.items())))
+
+
+def check_command_vocabulary_is_classified() -> None:
+    """Every command each admitted standard can issue is accounted for by the engine.
+
+    The disturbance model dispatches on command names, so it is only correct if that
+    name set is closed. The worker publishes the real ``DRAMSpec`` vocabulary per
+    standard; nothing in it may fall through unclassified.
+    """
+    configs = {"DDR4": DDR4_CONFIG, **SECOND_STANDARD_CONFIGS}
+    for standard, config in configs.items():
+        if not config.is_file():
+            raise SystemExit(f"missing {standard} worker config {config} (run build_phase2)")
+        geo = worker_geometry(config)
+        if not geo.command_names:
+            raise SystemExit(f"{standard} worker published no command vocabulary")
+        unclassified = unclassified_commands(geo.command_names)
+        if unclassified:
+            raise SystemExit(f"{standard} issues command(s) the disturbance model ignores: {unclassified}")
+        print(f"  vocabulary: {standard} publishes {len(geo.command_names)} commands, all classified")
 
 
 def check_second_standard_no_ddr4_leak() -> None:
@@ -228,7 +248,9 @@ def check_no_parameter_pooling() -> None:
     for standard, config in SECOND_STANDARD_CONFIGS.items():
         geo = worker_geometry(config)
         try:
-            DisturbanceEngine(geometry=geo, seed=15, profile_id="ddr4_vts25_v1")
+            DisturbanceEngine(
+                geometry=geo, row_encoder=AddressMapper(geo).encode, seed=15, profile_id="ddr4_vts25_v1"
+            )
         except ValueError as exc:
             if not str(exc).startswith("PROFILE_REJECTED:"):
                 raise SystemExit(f"{standard}: DDR4 profile rejected with the wrong code: {exc}")
@@ -277,6 +299,7 @@ def main() -> int:
     check_ddr4_adapter_consistency()
     check_schema_v2_backward_compat()
     check_second_standard_no_ddr4_leak()
+    check_command_vocabulary_is_classified()
     check_no_parameter_pooling()
     print("phase15 verification passed")
     return 0

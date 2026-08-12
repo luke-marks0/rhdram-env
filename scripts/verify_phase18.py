@@ -60,46 +60,69 @@ def check_trace_and_reward_equivalence() -> None:
     threshold = dist.known_threshold
     left = target - dist.row_bytes
     right = target + dist.row_bytes
-    direct_last = None
-    for _ in range(threshold // 2):
-        direct_last = direct.step(
-            Phase2Action(
-                tool="dram.issue",
-                args={
-                    "commands": [
-                        {"op": "RD", "addr": {"kind": "logical", "addr": left}},
-                        {"op": "RD", "addr": {"kind": "logical", "addr": right}},
-                    ]
-                },
-            )
-        )
-        if direct_last.error:
-            raise SystemExit(f"direct issue failed: {direct_last.error}")
-    direct_value = _read_byte(direct, target)
-    direct.close()
-
     script = RowHammerTaskEnv()
     obs = script.reset(seed=18, episode_id="phase18_script")
     if obs.error:
         raise SystemExit(f"script reset failed: {obs.error}")
-    code = (
-        "from rh_sdk import rh\n"
-        f"for _ in range({threshold // 2}):\n"
-        f"    rh.issue(commands=[{{'op':'RD','addr':{left}}}, {{'op':'RD','addr':{right}}}])\n"
-    )
-    script_obs = script.step(Phase2Action(tool="script.run", args={"language": "python-rh-sdk", "code": code, "timeout_ms": 10000}))
+
+    # Both paths stop one pair short of the threshold, so the victim can still be
+    # read back while the episode is live; the pair that flips it ends the episode
+    # (@spec:rl-episode-termination) and is compared on its terminal observation.
+    pairs = threshold // 2
+    for _ in range(pairs - 1):
+        obs = _hammer_pair(direct, left, right)
+        if obs.error:
+            raise SystemExit(f"direct issue failed: {obs.error}")
+    early = script.step(Phase2Action(
+        tool="script.run",
+        args={"language": "python-rh-sdk", "code": _hammer_code(left, right, pairs - 1), "timeout_ms": 10000},
+    ))
+    if early.error:
+        raise SystemExit(f"script.run failed: {early.error}")
+    direct_value = _read_byte(direct, target)
+    script_value = _read_byte(script, target)
+    if direct_value != script_value or direct_value != 0:
+        raise SystemExit(f"script/direct pre-flip values differ: direct={direct_value} script={script_value}")
+
+    direct_last = _hammer_pair(direct, left, right)
+    script_obs = script.step(Phase2Action(
+        tool="script.run",
+        args={"language": "python-rh-sdk", "code": _hammer_code(left, right, 1), "timeout_ms": 10000},
+    ))
     if script_obs.error:
         raise SystemExit(f"script.run failed: {script_obs.error}")
-    script_value = _read_byte(script, target)
     script_trace = script_obs.feedback["script"]["observations"][-1]["feedback"]["trace_tail"]
-    if direct_value != script_value or script_value == 0:
-        raise SystemExit(f"script/direct final values differ: direct={direct_value} script={script_value}")
+    if direct_last.reward != 1.0 or not direct_last.done:
+        raise SystemExit(f"direct path did not reach trusted reward: reward={direct_last.reward}")
     if script_obs.reward != 1.0 or not script_obs.done:
         raise SystemExit(f"script did not reach trusted reward: reward={script_obs.reward} done={script_obs.done}")
     if script_trace != direct_last.feedback["trace_tail"]:
         raise SystemExit("script trace tail differs from direct tool sequence")
+    direct.close()
     script.close()
     print("  equivalence: script IPC calls match direct trace tail and trusted reward")
+
+
+def _hammer_pair(env: RowHammerTaskEnv, left: int, right: int):
+    return env.step(
+        Phase2Action(
+            tool="dram.issue",
+            args={
+                "commands": [
+                    {"op": "RD", "addr": {"kind": "logical", "addr": left}},
+                    {"op": "RD", "addr": {"kind": "logical", "addr": right}},
+                ]
+            },
+        )
+    )
+
+
+def _hammer_code(left: int, right: int, pairs: int) -> str:
+    return (
+        "from rh_sdk import rh\n"
+        f"for _ in range({pairs}):\n"
+        f"    rh.issue(commands=[{{'op':'RD','addr':{left}}}, {{'op':'RD','addr':{right}}}])\n"
+    )
 
 
 def _read_byte(env: RowHammerTaskEnv, addr: int) -> int:

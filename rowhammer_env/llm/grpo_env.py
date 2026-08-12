@@ -275,6 +275,7 @@ SYSTEM_PROMPT = (
     "     {\"op\":<RD|WR|WAIT>, ..., \"repeat\":<N>}          repeat that command N times\n"
     "     {\"op\":\"HAMMER\", \"rows\":[<addrA>,<addrB>], \"pairs\":<N>}\n"
     "         -> N double-sided sweeps (RD addrA, RD addrB) x N -- the compact hammer\n"
+    "         `pairs` is REQUIRED; omitting it is a BAD_SCHEMA error\n"
     "  episode.finish {}\n\n"
     "Addresses are objects, e.g. {\"kind\":\"logical\",\"addr\":<int>}. A real flip needs "
     "MANY thousands of aggressor activations, on the order of the disclosed "

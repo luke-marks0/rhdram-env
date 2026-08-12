@@ -29,6 +29,7 @@ the P25 "Done when" contract:
 
 from __future__ import annotations
 
+import base64
 import pathlib
 import unittest
 from collections import Counter
@@ -235,6 +236,47 @@ class HiddenAdjacencyIntegrationTests(unittest.TestCase):
             self.assertIn(key, env.disturbance.flipped_row_keys)
         finally:
             env.close()
+
+    def _hammer_then_read(self, probe: str) -> tuple[float, int]:
+        """Hammer the true aggressors, then read one byte and return (reward, byte).
+
+        ``probe`` picks the address read at the end of the same ``dram.issue``:
+        ``"victim"`` is the disclosed numeric victim address, ``"arithmetic"`` is
+        ``victim + row_stride`` — the address the overlay used to anchor to, which
+        the secret row->bank XOR puts in a different bank entirely.
+        """
+        env = RowHammerTaskEnv(task=self._task("easy"),
+                               budgets={"tool_calls": 60, "acts": 120_000, "cycles": 240_000_000})
+        try:
+            obs = env.reset(seed=7)
+            ct = env._compiled
+            meta = obs.metadata["candidates"]
+            aggr = [self._addr(meta[i]) for i, c in enumerate(ct.candidates) if c.is_aggressor]
+            victim = obs.metadata["objective"]["target"]["addr"]
+            addr = victim if probe == "victim" else victim + ct.row_bytes
+            step = env.step(Phase2Action(tool="dram.issue", args={"commands": [
+                {"op": "HAMMER", "rows": aggr, "pairs": env.disturbance.known_threshold},
+                {"op": "RD", "addr": {"kind": "logical", "addr": addr}},
+            ]}))
+            self.assertIsNone(step.error, probe)
+            self.assertIsNotNone(step.data_b64, probe)
+            return step.reward, base64.b64decode(step.data_b64)[0]
+        finally:
+            env.close()
+
+    def test_dram_read_shows_the_flip_at_the_disclosed_victim_address(self) -> None:
+        # @spec:tool-dram-read — a committed flip must be readable at the address it
+        # was disclosed at. The overlay anchors each victim's cells at that row's own
+        # column-0 address resolved through the worker ``ENCODE`` op, so under the
+        # secret mapper the disclosed numeric victim reads flipped and there is no
+        # phantom copy at ``victim + row_stride`` (a different bank under the XOR).
+        reward, victim_byte = self._hammer_then_read("victim")
+        self.assertEqual(reward, 1.0)
+        self.assertNotEqual(victim_byte, 0)
+
+        reward, arithmetic_byte = self._hammer_then_read("arithmetic")
+        self.assertEqual(reward, 1.0)  # same episode, same flip
+        self.assertEqual(arithmetic_byte, 0)
 
     def test_arithmetic_control_victim_plus_minus_stride_fails(self) -> None:
         # The P25 done-when: a real-attacker control that computes ``victim ± row_stride``
