@@ -199,7 +199,13 @@ class RowHammerDisturbanceEnv(RowHammerEnv):
         # is rejected rather than silently skipping that check.
         if not geometry.get("command_names"):
             raise RuntimeError("worker reported geometry without a command vocabulary; rebuild the worker")
-        return Geometry(geometry)
+        try:
+            return Geometry(geometry)
+        except (ValueError, KeyError, TypeError) as exc:
+            # A malformed INFO payload is a simulator failure, not a policy error, and
+            # must end the episode with a stable code rather than letting the geometry
+            # validation exception escape reset.
+            raise RuntimeError(f"worker reported an invalid geometry: {exc}") from exc
 
     def _from_worker(
         self, payload: dict[str, Any], *, written_data: bytes | None = None

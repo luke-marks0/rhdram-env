@@ -5,6 +5,8 @@ import pathlib
 from dataclasses import dataclass
 from typing import Any, Mapping
 
+from .mappers import atomic_write_text
+
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 RAMULATOR = ROOT / "third_party/ramulator2"
@@ -188,5 +190,8 @@ def worker_config_for_mitigation(
         for plugin in plugins:
             if not any(existing.get("impl") == plugin["impl"] for existing in controller_plugins):
                 controller_plugins.append(dict(plugin))
-    out_path.write_text(yaml.safe_dump(config, sort_keys=False))
+    # Published atomically for the same reason the derived mapper YAML is: the path is
+    # content-addressed, so concurrent sessions that chose the same mitigation race to
+    # rewrite it while another session's worker may be opening it.
+    atomic_write_text(out_path, yaml.safe_dump(config, sort_keys=False))
     return out_path

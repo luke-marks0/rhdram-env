@@ -6,12 +6,20 @@ from .compiler import (
     TaskConfigError,
     TaskSpec,
 )
-from .disclosure import AddressResolver, Disclosure, HandleTable
+from .disclosure import (
+    AddressResolver,
+    Disclosure,
+    DisclosureConfigError,
+    HandleTable,
+    check_logical_addr,
+)
 
 __all__ = [
     "AddressResolver",
     "Disclosure",
+    "DisclosureConfigError",
     "HandleTable",
+    "check_logical_addr",
     "TaskSpec",
     "CompiledTask",
     "TaskConfigError",

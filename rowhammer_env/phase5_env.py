@@ -97,14 +97,24 @@ class RowHammerTaskEnv(RowHammerDisturbanceEnv):
         self._compiled = None
         # super().reset() calls _disturbance_overrides, which compiles the task
         # against the reported geometry and pins the disclosure + engine target.
-        obs = super().reset(seed=seed, episode_id=episode_id, **kwargs)
-        if obs.error:
+        # A TaskConfigError raised anywhere below (the defensive secret-mapper gate,
+        # compilation, or physical target projection) means the episode cannot start
+        # under an internally inconsistent contract: report it as a stable terminal
+        # BAD_SCHEMA rather than letting the exception escape reset as a server error.
+        # @spec:rl-episode-termination @spec:error-codes
+        try:
+            obs = super().reset(seed=seed, episode_id=episode_id, **kwargs)
+            if obs.error:
+                self._episode_done = True
+                return obs
+            assert self._compiled is not None
+            self.target_row = self._compiled.target_row
+            self._register_handles()
+            obs.metadata.update(self._task_metadata(seed))
+        except TaskConfigError as exc:
+            self.close()
             self._episode_done = True
-            return obs
-        assert self._compiled is not None
-        self.target_row = self._compiled.target_row
-        self._register_handles()
-        obs.metadata.update(self._task_metadata(seed))
+            return self._terminal_error("BAD_SCHEMA", f"invalid task config: {exc}")
         return obs
 
     def _configure_task(self, task: dict[str, Any], budgets: dict[str, int] | None = None) -> None:
@@ -191,12 +201,22 @@ class RowHammerTaskEnv(RowHammerDisturbanceEnv):
         Secret-mapping families must be ``logical_only`` (the policy never gets a
         physical decoder, so a secret bank function cannot leak through
         ``physical`` addressing); fail closed otherwise.
+
+        The check reads ``self.spec.disclosure`` — the *effective* disclosure for this
+        episode — not ``fam.disclosure``, the immutable family default. A task config
+        may override the disclosure, and since every ``secret_mapping`` family defaults
+        to ``logical_only``, a guard on the default can never fire: it would admit an
+        overridden ``mapping: physical`` task, install the secret mapper, and then
+        publish that mapper's decoded coordinates. ``TaskSpec.from_config`` already
+        rejects such a config at parse time; this stays as a second, defensive gate so
+        the path remains fail-closed if that validation ever regresses.
         """
         fam = FAMILIES.get(self.spec.family)
         if fam is not None and fam.secret_mapping:
-            if fam.disclosure.mapping != "logical_only":
+            if self.spec.disclosure.mapping != "logical_only":
                 raise TaskConfigError(
-                    f"secret-mapping family {self.spec.family!r} must be logical_only"
+                    f"secret-mapping family {self.spec.family!r} must be logical_only, "
+                    f"got mapping={self.spec.disclosure.mapping!r}"
                 )
             return select_secret_mapper(self.spec.task_id, seed)
         return (DEFAULT_MAPPER, {})

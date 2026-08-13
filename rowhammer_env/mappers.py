@@ -24,7 +24,9 @@ Non-discovery families keep the public `RoBaRaCoCh` base config unchanged.
 from __future__ import annotations
 
 import hashlib
+import os
 import pathlib
+import tempfile
 from typing import Mapping
 
 # The public default mapper: the base worker YAML ships it, non-discovery families
@@ -44,6 +46,31 @@ SECRET_MAPPERS: tuple[tuple[str, dict[str, int]], ...] = tuple(
 )
 
 
+def atomic_write_text(path: pathlib.Path, text: str) -> None:
+    """Publish ``text`` at ``path`` atomically, so a reader never sees a partial file.
+
+    Derived worker YAMLs live at a *content-addressed* path, so concurrent resets that
+    made the same choice race to write byte-identical content. Writing in place is
+    still unsafe: ``write_text`` truncates first, and a worker launched by another
+    session can open the empty/partial file in that window and die with a Ramulator
+    configuration error. Writing to a unique temporary file in the same directory and
+    ``os.replace``-ing it makes publication a single rename — readers see either the
+    old complete file or the new complete file, never a torn one. Concurrent writers
+    are safe precisely because the bytes are identical.
+    """
+    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    tmp = pathlib.Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
 def is_python_projectable(mapper_impl: str) -> bool:
     """Whether ``tools/addressing.py``'s Python RoBaRaCoCh projection matches the worker.
 
@@ -55,9 +82,18 @@ def is_python_projectable(mapper_impl: str) -> bool:
 
 
 def select_secret_mapper(task_id: str, seed: int) -> tuple[str, dict[str, int]]:
-    """Deterministically pick a per-episode secret mapper from ``(task_id, seed)``."""
+    """Deterministically pick a per-episode secret mapper from ``(task_id, seed)``.
+
+    Returns a *fresh* params dict each call. ``SECRET_MAPPERS`` holds the admitted
+    seed-derived choices; handing out its dict by reference would let an accidental
+    trusted-side mutation (the environment exposes it as ``_active_mapper_params``)
+    rewrite the admitted value for every later episode in the process, so a
+    supposedly pure selection would depend on mutable state surviving reset.
+    @spec:invariant-determinism
+    """
     digest = hashlib.sha256(f"{task_id}:{seed}:mapper".encode()).digest()
-    return SECRET_MAPPERS[int.from_bytes(digest[:8], "big") % len(SECRET_MAPPERS)]
+    impl, params = SECRET_MAPPERS[int.from_bytes(digest[:8], "big") % len(SECRET_MAPPERS)]
+    return impl, dict(params)
 
 
 def worker_config_for_mapper(
@@ -78,6 +114,7 @@ def worker_config_for_mapper(
     never appears in a policy-visible field.
     """
     params = dict(params or {})
+    _validate_mapper_params(mapper_impl, params)
     if mapper_impl == DEFAULT_MAPPER and not params:
         return base_config_path
 
@@ -94,5 +131,35 @@ def worker_config_for_mapper(
     config = yaml.safe_load(base_config_path.read_text())
     for controller in config["memory_system"]["controllers"]:
         controller["addr_mapper"] = dict(node)
-    out_path.write_text(yaml.safe_dump(config, sort_keys=False))
+    atomic_write_text(out_path, yaml.safe_dump(config, sort_keys=False))
     return out_path
+
+
+# Widest Row field any admitted standard publishes; ``xor_offset`` must stay inside it
+# so the C++ shift is defined and the BankGroup scramble is not a silent no-op. The
+# mapper re-validates against the *actual* Row width at init, where the geometry is
+# known; this is the Python-side fail-closed check on the admitted parameter set.
+MAX_XOR_OFFSET = 31
+
+
+def _validate_mapper_params(mapper_impl: str, params: Mapping[str, int]) -> None:
+    """Reject a mapper parameter set the worker cannot safely apply (fail closed).
+
+    ``RoBaRaCoChRowXOR`` right-shifts a 32-bit Row value by ``xor_offset``; C++ leaves
+    a shift at or beyond the operand width undefined, so an oversized offset would make
+    the BankGroup decode vary by compiler/build instead of being rejected. The shipped
+    ``SECRET_MAPPERS`` offsets are all well inside the bound, so this guards a
+    hand-written or future config, not the discovery path.
+    """
+    if mapper_impl != "RoBaRaCoChRowXOR":
+        if params:
+            raise ValueError(f"BAD_SCHEMA:mapper {mapper_impl!r} takes no parameters")
+        return
+    unknown = set(params) - {"xor_offset"}
+    if unknown:
+        raise ValueError(f"BAD_SCHEMA:unknown mapper parameter(s) {sorted(unknown)}")
+    offset = params.get("xor_offset", 0)
+    if isinstance(offset, bool) or not isinstance(offset, int):
+        raise ValueError("BAD_SCHEMA:xor_offset must be an integer")
+    if not 0 <= offset <= MAX_XOR_OFFSET:
+        raise ValueError(f"BAD_SCHEMA:xor_offset must be in [0,{MAX_XOR_OFFSET}], got {offset}")
