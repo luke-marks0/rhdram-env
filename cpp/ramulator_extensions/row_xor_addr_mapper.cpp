@@ -47,6 +47,25 @@ class RoBaRaCoChRowXOR : public IAddrMapper, public AddrMapperBase {
     const auto& spec = *m_ctrl->m_device.m_spec;
     m_bank_idx = spec.has_level("Bank") ? spec.get_level_id("Bank") - 1 : -1;
     m_bankgroup_idx = spec.has_level("BankGroup") ? spec.get_level_id("BankGroup") - 1 : -1;
+    // The all-scattering property this mapper exists for (`addr` and
+    // `addr + row_stride` land in different banks) comes from folding Row bit 0 into
+    // Bank. On a geometry with no mapped Bank level that fold silently disappears and
+    // the mapper degrades into stock RoBaRaCoCh, which would hand a discovery episode
+    // a bank function the policy *can* compute from the address. Fail closed instead.
+    if (m_bank_idx < 0 || m_addr_bits[m_bank_idx] <= 0) {
+      throw std::runtime_error(
+          "RoBaRaCoChRowXOR: requires a mapped Bank level with a non-zero width");
+    }
+    // `apply` shifts the Row value right by m_xor_offset. C++ leaves a shift at or
+    // beyond the operand width undefined, and an offset past the Row field would make
+    // the BankGroup scramble a silent no-op, so bound it by the real Row width.
+    if (m_row_idx < 0 || m_addr_bits[m_row_idx] <= 0) {
+      throw std::runtime_error("RoBaRaCoChRowXOR: requires a mapped Row level");
+    }
+    if (m_xor_offset >= m_addr_bits[m_row_idx]) {
+      throw std::runtime_error(
+          "RoBaRaCoChRowXOR: xor_offset must be smaller than the Row field width");
+    }
   }
 
   void apply(Request& req) override {
@@ -59,14 +78,17 @@ class RoBaRaCoChRowXOR : public IAddrMapper, public AddrMapperBase {
     }
     // Row -> Bank / BankGroup XOR. Bit 0 of Row always folds into Bank, so
     // `addr` and `addr + row_stride` (Row differs by 1) land in different banks.
-    const int row = req.addr_vec[m_row_idx + 1];
-    if (m_bank_idx >= 0 && m_addr_bits[m_bank_idx] > 0) {
-      const int mask = (1 << m_addr_bits[m_bank_idx]) - 1;
-      req.addr_vec[m_bank_idx + 1] ^= row & mask;
+    // Unsigned for the shift/mask arithmetic: `init` has already bounded m_xor_offset
+    // by the Row width, and an unsigned operand keeps the shift well-defined rather
+    // than relying on the sign of a sliced field.
+    const unsigned row = static_cast<unsigned>(req.addr_vec[m_row_idx + 1]);
+    {
+      const unsigned mask = (1u << m_addr_bits[m_bank_idx]) - 1u;
+      req.addr_vec[m_bank_idx + 1] ^= static_cast<int>(row & mask);
     }
     if (m_bankgroup_idx >= 0 && m_addr_bits[m_bankgroup_idx] > 0) {
-      const int mask = (1 << m_addr_bits[m_bankgroup_idx]) - 1;
-      req.addr_vec[m_bankgroup_idx + 1] ^= (row >> m_xor_offset) & mask;
+      const unsigned mask = (1u << m_addr_bits[m_bankgroup_idx]) - 1u;
+      req.addr_vec[m_bankgroup_idx + 1] ^= static_cast<int>((row >> m_xor_offset) & mask);
     }
   }
 };

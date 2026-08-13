@@ -228,6 +228,15 @@ the true expanded event count:
   spend a turn on a hammer that never happened. An explicit `pairs: 0` is a legal
   no-op.
 Expansion beyond `MAX_ISSUE_ACTIVATIONS` (2,000,000) fails `ILLEGAL_COMMAND`.
+Every expanded primitive is resolved and validated — address form, WAIT cycles, WR
+payload — **before any of them is dispatched**, so a `dram.issue` that fails
+validation is a true no-op. Resolving immediately before each send instead would
+leave an already-issued prefix committed in the simulator and the disturbance model
+while the action was reported as a bare rejection carrying no feedback, no public
+counters, and therefore no chargeable ACT delta. A failure that can only surface
+after a committed prefix (a worker or disturbance error) instead returns that
+prefix's real counters and digest *alongside* the stable error, so activations
+already spent stay visible and chargeable.
 `ACT`/`PRE`/`REF`/`RFM` are **controller-generated, not policy-issuable** — the
 worker rejects them with `ILLEGAL_COMMAND`. They appear only in the issued-event
 stream, where they drive disturbance accounting.
@@ -531,7 +540,17 @@ Defined in: `rowhammer_env/tasks/compiler.py` (`_build_candidates`,
 `adjacency` (exact | candidate_set | hidden); `victim` (exact | logical_addr |
 row_handle | cell_handle | hidden_until_finish); `profile` (public_profile_id |
 family_only | hidden); `feedback` (full_trace | summarized_counts | reward_only).
-Defined in: `rowhammer_env/tasks/disclosure.py` (`Disclosure`).
+Each axis is a **closed** enum validated when the task config is parsed: an unknown
+value is a `TaskConfigError` → `BAD_SCHEMA`, never a silently selected code path.
+Validation is not merely defensive — the axes do not fail uniformly, and `feedback`
+in particular used to fail *open*, because every value other than the two hidden
+modes was treated as disclosed. A task whose *effective* disclosure contradicts its
+family is rejected the same way: a `secret_mapping` family admits neither
+`mapping: physical` (which would publish the per-episode secret bank function the
+family exists to hide) nor `victim: exact` (whose physical coordinates are not
+derivable under a secret mapper).
+Defined in: `rowhammer_env/tasks/disclosure.py` (`Disclosure`, `DISCLOSURE_LEVELS`),
+`rowhammer_env/tasks/compiler.py` (`_validate_family_disclosure`).
 
 #### `@spec:disclosure-leakage-guard` — the single enforcement point
 `Disclosure.project_feedback` / `project_trace` are the one place hidden physical
@@ -559,8 +578,18 @@ and per-address `{acts, hits, misses}` keyed by the token the policy supplied. T
 same-vs-different-bank discriminator is `acts_delta` (whether an alternating access
 forced a new ACT), **never** a policy RD's own `row_hit` (always true). This is the
 load-bearing signal discovery families are designed around.
-Defined in: `rowhammer_env/phase2_env.py` (`_TimingDigest`, `_issue`),
-`spec/TIER2_DISCOVERY_PLAN.md`.
+Each bucket is keyed by a namespaced form of the token the policy itself supplied —
+`logical:<n>`, `handle:<id>`, `physical:<coords>` — never by a resolved linear
+address, so equivalent-but-distinct tokens stay distinct and no key is derived from
+hidden state. The digest is bounded on both axes: `trace_tail` at
+`ISSUE_TRACE_TAIL_CAP` events, and the number of *distinct* address buckets at
+`MAX_DIGEST_ADDR_TOKENS` (256). An issue addressing more distinct locations than
+that is refused with `ILLEGAL_COMMAND` before anything is dispatched, since
+`per_addr_hits` otherwise grows linearly with policy-controlled unique addresses.
+The cap sits far above the widest admitted candidate window (64 candidates plus the
+victim), so no real probe is refused.
+Defined in: `rowhammer_env/phase2_env.py` (`_TimingDigest`, `_issue`,
+`_validate_issue`, `_digest_addr_key`), `spec/TIER2_DISCOVERY_PLAN.md`.
 
 ### Mitigations
 

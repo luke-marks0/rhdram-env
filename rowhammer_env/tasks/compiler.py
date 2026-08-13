@@ -7,7 +7,7 @@ from typing import Any, Callable
 
 from ..geometry import Geometry
 from ..tools.addressing import AddressMapper
-from .disclosure import Disclosure
+from .disclosure import Disclosure, DisclosureConfigError
 
 
 # --- difficulty bands ---------------------------------------------------------
@@ -188,6 +188,34 @@ def _canonical_family(name: str) -> str:
     return name
 
 
+def _validate_family_disclosure(family: str, fam: FamilyDef, disclosure: Disclosure) -> None:
+    """Reject a task whose *effective* disclosure contradicts its family (fail closed).
+
+    A task config may override the family's default disclosure, so the family default
+    says nothing about what an episode will actually publish — the admission check has
+    to read the effective ``Disclosure``. It matters most for a ``secret_mapping``
+    family: the per-episode secret row->bank function is the entire discovery problem,
+    and physical mapping would hand the policy each candidate's decoded bank/row
+    directly, while ``victim: exact`` would ask for physical target coordinates the
+    Python projection cannot produce under a secret mapper (raising mid-reset instead
+    of rejecting the task at admission).
+    @spec:env-secret-mapper @spec:invariant-no-leakage
+    """
+    if not fam.secret_mapping:
+        return
+    if disclosure.mapping != "logical_only":
+        raise TaskConfigError(
+            f"secret-mapping family {family!r} must be logical_only, "
+            f"got mapping={disclosure.mapping!r}: physical disclosure would publish the "
+            "per-episode secret bank mapping the task exists to hide"
+        )
+    if disclosure.victim == "exact":
+        raise TaskConfigError(
+            f"secret-mapping family {family!r} cannot disclose an exact victim: physical "
+            "target coordinates are not derivable under a secret mapper"
+        )
+
+
 def _derive_family(config: dict[str, Any]) -> str:
     """Infer the family of a full SPEC §10 config that does not name one."""
     objective = config.get("objective") or {}
@@ -251,7 +279,13 @@ class TaskSpec:
             family = _derive_family(config)
         fam = FAMILIES[family]
 
-        disclosure = Disclosure.from_config(config["disclosure"]) if "disclosure" in config else fam.disclosure
+        try:
+            disclosure = (
+                Disclosure.from_config(config["disclosure"]) if "disclosure" in config else fam.disclosure
+            )
+        except DisclosureConfigError as exc:
+            raise TaskConfigError(str(exc)) from exc
+        _validate_family_disclosure(family, fam, disclosure)
 
         objective = dict(config.get("objective") or {})
         objective_type = objective.get("type", fam.objective_type)

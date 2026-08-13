@@ -181,6 +181,9 @@ class Worker {
     if (t.size() != 3) return error_json(id, "BAD_SCHEMA", "DECODE id linear");
     Ramulator::Addr_t linear = 0;
     if (!parse_u64(t[2], linear)) return error_json(id, "BAD_SCHEMA", "invalid linear address");
+    if (!in_domain(linear, 1)) {
+      return error_json(id, "BAD_SCHEMA", "linear address outside the device address space");
+    }
     auto& sink = rhdram::IssuedEventSink::instance();
     if (!sink.has_decoder()) return error_json(id, "UNAVAILABLE_CAPABILITY", "address decoder not published");
     std::vector<int> vec = sink.decode(linear);
@@ -235,6 +238,35 @@ class Worker {
     return out.str();
   }
 
+  // Mapped byte capacity of the device: the exclusive bound on a linear address.
+  // The address mapper is a bijection only below this; above it every level is
+  // masked to its own width (Ramulator's own slice_lower_bits truncation), so an
+  // out-of-domain address silently aliases an in-domain one — leaving two different
+  // functional-memory cells sharing one physical DRAM location, since bytes_ keys on
+  // the raw linear value while Ramulator and the disturbance model see the aliased
+  // coordinates. Returns 0 when the geometry has not been published, which disables
+  // the check rather than rejecting everything.
+  uint64_t capacity() const {
+    if (!geometry_.valid || geometry_.tx_bytes <= 0 || geometry_.prefetch <= 0) return 0;
+    uint64_t cells = 1;
+    for (int size : geometry_.level_sizes) {
+      if (size <= 0) return 0;
+      cells *= static_cast<uint64_t>(size);
+    }
+    return static_cast<uint64_t>(geometry_.tx_bytes) * cells /
+           static_cast<uint64_t>(geometry_.prefetch);
+  }
+
+  // Whether the whole requested byte range lies inside the device. Policy-supplied
+  // addresses are already bounded on the Python side; this is the same domain
+  // enforced again at the worker boundary, so no path reaches the mapper with an
+  // address it cannot represent. parse_u64 has already rejected negatives.
+  bool in_domain(Ramulator::Addr_t addr, uint64_t len) const {
+    const uint64_t cap = capacity();
+    if (cap == 0) return true;
+    return static_cast<uint64_t>(addr) + len <= cap;
+  }
+
   std::string read(const std::string& id, const std::vector<std::string>& t) {
     // @spec:rl-reward @spec:env-worker-protocol
     // The server-internal STORED form exposes the authoritative functional-memory
@@ -250,6 +282,9 @@ class Worker {
     Ramulator::Addr_t len = 0;
     if (!parse_u64(t[2], addr) || !parse_u64(t[3], len) || len == 0 || len > static_cast<unsigned>(tx_bytes_)) {
       return error_json(id, "BAD_SCHEMA", "invalid read address or length");
+    }
+    if (!in_domain(addr, len)) {
+      return error_json(id, "BAD_SCHEMA", "read range outside the device address space");
     }
     if (stored_only) {
       if (len != 1) return error_json(id, "BAD_SCHEMA", "READ STORED requires length 1");
@@ -276,6 +311,9 @@ class Worker {
     std::vector<unsigned char> data;
     if (!parse_u64(t[2], addr) || !parse_hex(t[3], data) || data.empty() || data.size() > static_cast<size_t>(tx_bytes_)) {
       return error_json(id, "BAD_SCHEMA", "invalid write address or hex data");
+    }
+    if (!in_domain(addr, data.size())) {
+      return error_json(id, "BAD_SCHEMA", "write range outside the device address space");
     }
     long before = cycle_;
     auto result = complete_request(Ramulator::Request::Type::Write, addr, static_cast<int>(data.size()));

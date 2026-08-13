@@ -26,6 +26,7 @@ class Geometry:
         self.channel_width = int(info.get("channel_width", 0))
         names = [str(n) for n in info["level_names"]]
         sizes = [int(s) for s in info["level_sizes"]]
+        self._validate_levels(names, sizes)
         self.level_names = [n.lower() for n in names]
         self.level_sizes = {n.lower(): s for n, s in zip(names, sizes)}
         # The standard's whole DRAMSpec command vocabulary: the closed set of op
@@ -33,6 +34,41 @@ class Geometry:
         self.command_names = tuple(str(c) for c in info.get("command_names", ()))
         self.row_stride = self._row_stride()
         self.row_span = self._row_span()
+
+    @staticmethod
+    def _validate_levels(names: list[str], sizes: list[int]) -> None:
+        """Reject an INFO level vector that does not describe one coherent device.
+
+        ``zip(names, sizes)`` silently truncates to the shorter vector, so a malformed
+        or version-skewed INFO response (a dropped level name against an unchanged
+        size vector, say) used to be accepted as a *different* topology: levels pair
+        up shifted, the extra size is discarded, and the derived row stride and every
+        mapper field width are wrong. That geometry feeds target compilation, flip
+        placement, reward row keys, and public disclosure, so it must fail closed
+        rather than quietly describing a device the worker is not simulating.
+        Duplicate names are rejected for the same reason — the ``level_sizes`` dict
+        would keep only the last one. @spec:env-geometry
+        """
+        if not names or not sizes:
+            raise ValueError("geometry reported an empty level vector")
+        if len(names) != len(sizes):
+            raise ValueError(
+                f"geometry reported {len(names)} level names but {len(sizes)} level sizes"
+            )
+        lowered = [n.lower() for n in names]
+        if len(set(lowered)) != len(lowered):
+            raise ValueError(f"geometry reported duplicate level names: {names}")
+        if lowered[0] != "channel":
+            raise ValueError(f"geometry must report Channel as the first level, got {names[0]!r}")
+        if lowered[-1] != "column":
+            raise ValueError(f"geometry must report Column as the last level, got {names[-1]!r}")
+        if lowered.count("row") != 1:
+            raise ValueError("geometry must report exactly one Row level")
+        if "bank" not in lowered:
+            raise ValueError("geometry must report a Bank level")
+        for name, size in zip(names, sizes):
+            if size < 1:
+                raise ValueError(f"geometry level {name!r} has a non-positive size {size}")
 
     def _row_span(self) -> int:
         """Linear bytes one physical row occupies *inside its own bank*.

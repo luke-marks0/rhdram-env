@@ -9,8 +9,8 @@ from pydantic import Field
 
 from .mitigations import public_mitigation_capabilities
 from .openenv_source import load_openenv_server_types
-from .tasks import AddressResolver
-from .tools.addressing import AddressError
+from .tasks import AddressResolver, check_logical_addr
+from .tools.addressing import COORD_KEYS, AddressError
 from .worker_protocol import WorkerClient, WorkerRequest
 
 
@@ -34,6 +34,18 @@ MAX_ISSUE_ACTIVATIONS = 2_000_000
 # events verbatim; the full timing summary survives — losslessly for the counts
 # that matter — in the ``timing_digest`` (P22).
 ISSUE_TRACE_TAIL_CAP = 64
+
+# Upper bound on the number of *distinct* address tokens one ``dram.issue`` may put in
+# the digest's ``per_addr_hits`` map. Capping ``trace_tail`` alone does not bound the
+# observation: ``per_addr_hits`` gets one permanent bucket per distinct address, so a
+# wide probe grows it linearly with policy-controlled unique addresses (a 3000-address
+# sweep yields ~150 KB of JSON, well past a training prompt budget, and the rollout's
+# trace trimming does not touch it). The cap sits far above any admitted candidate
+# window (the widest band is 64 candidates plus the victim), so a real probe is never
+# refused; an issue that exceeds it is rejected up front, before anything is
+# dispatched, rather than silently merging buckets — the probe-shaping term keys on
+# the exact bucket count. @spec:timing-channel
+MAX_DIGEST_ADDR_TOKENS = 256
 
 # Error codes that end the *episode* rather than reject the *action*: budget
 # exhaustion, and an unrecoverable simulator failure (the worker's per-request cycle
@@ -353,6 +365,16 @@ class RowHammerEnv(Environment[Phase2Action, Phase2Observation, Phase2State]):
             primitives = expand_commands(commands)
         except IssueExpansionError as exc:
             return self._error(exc.code, exc.message)
+        # Phase 1 — validate and resolve *every* primitive before dispatching any of
+        # them. Resolution used to happen immediately before each send, so a later
+        # invalid primitive (an unknown handle, a malformed WR payload) left the
+        # already-issued prefix committed in the simulator and the disturbance model
+        # while the action was reported as a bare rejection: empty feedback, empty
+        # public counters, and an ACT delta the task layer could not charge because it
+        # reads them from the observation. Validating first makes an invalid issue a
+        # true no-op. Anything raised here reaches ``step``'s handlers with nothing
+        # dispatched. @spec:invariant-budget-honesty @spec:tool-dram-issue
+        self._validate_issue(primitives)
         digest = _TimingDigest()
         trace_tail: list[dict[str, Any]] = []
         flips = 0
@@ -369,6 +391,11 @@ class RowHammerEnv(Environment[Phase2Action, Phase2Observation, Phase2State]):
         last = Phase2Observation(
             reward=0.0, done=False, cycle=self._state.cycle, public_counters=dict(self._public_counters)
         )
+        # A failure *after* a committed prefix (a worker/disturbance error). Unlike a
+        # validation failure it cannot be made a no-op, so the prefix's real feedback,
+        # counters and digest are reported alongside the stable error instead of being
+        # discarded — the activations already paid for stay visible and chargeable.
+        error_obs: Phase2Observation | None = None
         for command in primitives:
             # Pre-issue guard, checked before the worker call: ``_acts_issued`` is
             # the cumulative activation count already committed, so at the ceiling
@@ -381,22 +408,31 @@ class RowHammerEnv(Environment[Phase2Action, Phase2Observation, Phase2State]):
                 break
             op = command["op"]
             written_data: bytes | None = None
-            if op == "WAIT":
-                key = None
-                req = WorkerRequest("ISSUE", self._next_id(), ("WAIT", str(command.get("cycles", 0))))
-            elif op == "RD":
-                key = self._digest_addr_key(command)
-                req = WorkerRequest("ISSUE", self._next_id(), ("RD", str(self._addr_value(command))))
-            else:  # WR (expand_commands only yields RD/WR/WAIT)
-                key = self._digest_addr_key(command)
-                raw = base64.b64decode(str(command.get("data_b64", "")), validate=True)
-                written_data = raw
-                req = WorkerRequest("ISSUE", self._next_id(), ("WR", str(self._addr_value(command)), raw.hex()))
-            last = self._from_worker(  # type: ignore[union-attr]
-                self._worker.call(req), written_data=written_data
+            try:
+                if op == "WAIT":
+                    key = None
+                    req_args = ("WAIT", str(self._wait_cycles(command)))
+                elif op == "RD":
+                    key = self._digest_addr_key(command)
+                    req_args = ("RD", str(self._addr_value(command)))
+                else:  # WR (expand_commands only yields RD/WR/WAIT)
+                    key = self._digest_addr_key(command)
+                    written_data = self._write_bytes(command)
+                    req_args = ("WR", str(self._addr_value(command)), written_data.hex())
+            except AddressError as exc:
+                # Phase 1 resolved these same primitives with the same resolver, so
+                # this is unreachable; handled like any other post-commit failure so
+                # the accounting invariant holds without depending on that argument.
+                error_obs = self._error(exc.code, exc.message)
+                break
+            reply = self._from_worker(  # type: ignore[union-attr]
+                self._worker.call(WorkerRequest("ISSUE", self._next_id(), req_args)),
+                written_data=written_data,
             )
-            if last.error:
-                return last
+            if reply.error:
+                error_obs = reply
+                break
+            last = reply
             # ``last.feedback`` is already projected to the disclosure level by the
             # per-primitive ``_from_worker`` override, so aggregating it here keeps
             # the leakage guard: coordinates are already stripped from these events.
@@ -419,7 +455,12 @@ class RowHammerEnv(Environment[Phase2Action, Phase2Observation, Phase2State]):
             last.feedback["trace_tail"] = trace_tail[-ISSUE_TRACE_TAIL_CAP:]
         if self._trace_disclosed():
             last.feedback["timing_digest"] = digest.as_dict()
-        if budget_truncated:
+        if error_obs is not None:
+            # Carry the prefix's aggregates (already folded onto ``last`` above) and
+            # report the failure that stopped it.
+            last.error = error_obs.error
+            last.done = error_obs.done
+        elif budget_truncated:
             # The issue hit the activation ceiling with primitives left to expand: the
             # flips above are the real ones the budget paid for, and the rest were
             # never issued. The episode ends — the policy asked for activations its
@@ -428,6 +469,50 @@ class RowHammerEnv(Environment[Phase2Action, Phase2Observation, Phase2State]):
             last.error = {"code": "BUDGET_EXCEEDED", "message": "activation budget exhausted"}
             last.done = True
         return last
+
+    def _validate_issue(self, primitives: list[dict[str, Any]]) -> None:
+        """Resolve and validate every expanded primitive, dispatching none of them.
+
+        Runs exactly the resolution the dispatch loop runs — the same address
+        resolution, WAIT cycle parse and WR payload decode, through the same helpers —
+        so an issue that survives this cannot fail validation halfway through. Also
+        enforces :data:`MAX_DIGEST_ADDR_TOKENS` here, where refusing the issue is still
+        free, rather than discovering an oversized digest after the activations have
+        been spent.
+        """
+        tokens: set[str] = set()
+        for command in primitives:
+            op = command["op"]
+            if op == "WAIT":
+                self._wait_cycles(command)
+                continue
+            key = self._digest_addr_key(command)
+            self._addr_value(command)
+            if op == "WR":
+                self._write_bytes(command)
+            if key not in tokens:
+                tokens.add(key)
+                if len(tokens) > MAX_DIGEST_ADDR_TOKENS:
+                    raise AddressError(
+                        "ILLEGAL_COMMAND",
+                        f"dram.issue addresses more than {MAX_DIGEST_ADDR_TOKENS} distinct "
+                        "locations; split it into several issues",
+                    )
+
+    @staticmethod
+    def _wait_cycles(command: dict[str, Any]) -> int:
+        """The WAIT cycle count, which must be a non-negative JSON integer."""
+        value = command.get("cycles", 0)
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise AddressError("BAD_SCHEMA", f"WAIT 'cycles' must be a JSON integer, got {value!r}")
+        if value < 0:
+            raise AddressError("BAD_SCHEMA", f"WAIT 'cycles' must be non-negative, got {value}")
+        return value
+
+    @staticmethod
+    def _write_bytes(command: dict[str, Any]) -> bytes:
+        """The WR payload, decoded from strict base64."""
+        return base64.b64decode(str(command.get("data_b64", "")), validate=True)
 
     def _acts_issued(self) -> int:
         """Cumulative activations the worker has reported so far this episode."""
@@ -447,11 +532,13 @@ class RowHammerEnv(Environment[Phase2Action, Phase2Observation, Phase2State]):
 
         Mirrors :meth:`Disclosure.project_trace`: only ``full_trace`` echoes the
         trace, so the ``timing_digest`` (a summary of that trace) is gated the same
-        way. The bare env (no resolver) discloses everything.
+        way. Both now test for ``full_trace`` positively rather than excluding the two
+        known hidden modes, so an unrecognised feedback level cannot select the most
+        informative path. The bare env (no resolver) discloses everything.
         """
         if self._resolver is None:
             return True
-        return self._resolver.disclosure.feedback not in ("summarized_counts", "reward_only")
+        return self._resolver.disclosure.trace_disclosed()
 
     def _digest_addr_key(self, command: dict[str, Any]) -> str:
         """A leak-safe ``per_addr_hits`` key: the address token the policy supplied.
@@ -460,6 +547,12 @@ class RowHammerEnv(Environment[Phase2Action, Phase2Observation, Phase2State]):
         policy already holds; a logical/bare-int address is itself what the policy
         supplied (== its linear address). Physical is only ever supplied under
         physical disclosure, where the linear address is publicly computable.
+
+        Every form gets a namespaced key derived only from the token the policy
+        supplied. A physical token used to fall through to its *resolved linear*
+        address, which is neither a canonical form of what was supplied nor distinct
+        from the equivalent logical form — mixing both in one issue collapsed them into
+        a single bucket and lost token identity.
         """
         supplied = command.get("addr", command)
         if isinstance(supplied, dict):
@@ -467,10 +560,13 @@ class RowHammerEnv(Environment[Phase2Action, Phase2Observation, Phase2State]):
             if kind == "handle":
                 return f"handle:{supplied.get('id')}"
             if kind == "logical":
-                return str(supplied.get("addr"))
+                return f"logical:{supplied.get('addr')}"
+            if kind == "physical":
+                coords = ",".join(f"{name}={supplied.get(name, 0)}" for name in COORD_KEYS)
+                return f"physical:{coords}"
         if isinstance(supplied, int) and not isinstance(supplied, bool):
-            return str(supplied)
-        return str(self._addr_value(command))
+            return f"logical:{supplied}"
+        return f"logical:{self._addr_value(command)}"
 
     def _logical_addr(self, args: dict[str, Any]) -> int:
         return self._addr_value(args)
@@ -489,10 +585,11 @@ class RowHammerEnv(Environment[Phase2Action, Phase2Observation, Phase2State]):
             raise AddressError("BAD_SCHEMA", "address must be an object")
         if addr.get("kind") != "logical":
             raise AddressError("ADDRESS_NOT_DISCLOSED", "only logical addresses are disclosed")
-        try:
-            return int(addr["addr"])
-        except (KeyError, TypeError, ValueError):
+        if "addr" not in addr:
             raise AddressError("BAD_SCHEMA", "logical address requires an integer 'addr'")
+        # No geometry here, so only the schema half of the check applies; the task env
+        # resolves through ``AddressResolver``, which also bounds it by device capacity.
+        return check_logical_addr(addr["addr"], None)
 
     def _next_id(self) -> str:
         return f"a{self._state.step_count}"

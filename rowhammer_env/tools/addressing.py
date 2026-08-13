@@ -77,6 +77,18 @@ class AddressMapper:
             shift += widths[field]
         self.total_bits = shift  # first bit above the whole mapped address
 
+    @property
+    def capacity(self) -> int:
+        """Mapped byte capacity of the device: the exclusive bound on a linear address.
+
+        The mapper is a bijection only inside ``[0, capacity)``. Above it every field
+        is masked to its width (as Ramulator's own ``slice_lower_bits`` truncation
+        does), so an out-of-domain address silently aliases an in-domain one — two
+        different functional-memory cells sharing one physical DRAM location. Callers
+        enforce this bound so oversized input fails closed instead of aliasing.
+        """
+        return 1 << self.total_bits
+
     def decode(self, linear: int) -> dict[str, int]:
         """Decode a linear address into physical coordinates (matches ``addr_vec``).
 
@@ -110,8 +122,18 @@ class AddressMapper:
 
     @staticmethod
     def _coord_int(coords: dict[str, Any], field: str) -> int:
+        """A physical coordinate, which must be a JSON integer (not a coercible value).
+
+        ``spec/schemas/action.schema.json`` types every coordinate as an integer, and
+        the broad runtime action model does not apply that nested schema, so this is
+        the effective validator. ``int(value)`` would silently redirect the request to
+        a *different* physical row — ``row: 1.9`` and ``row: true`` both truncate to
+        row 1 — making behaviour depend on Python coercion rules rather than on the
+        action contract. ``bool`` is excluded explicitly because it is an ``int``.
+        """
         value = coords.get(field, 0)
-        try:
-            return int(value)
-        except (TypeError, ValueError):
-            raise AddressError("BAD_SCHEMA", f"coordinate '{field}' is not an integer")
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise AddressError(
+                "BAD_SCHEMA", f"coordinate '{field}' must be a JSON integer, got {value!r}"
+            )
+        return value
