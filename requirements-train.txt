@@ -1,13 +1,14 @@
 # GRPO training extras for scripts/train_grpo.py.
 # Install on top of the core env deps:  python3 -m pip install -r requirements.txt -r requirements-train.txt
 # (These are intentionally NOT in requirements.txt so the server/CI stay light.)
-trl>=0.14
-transformers>=4.51        # Qwen3 chat template + enable_thinking support
-datasets>=2.19
-peft>=0.11
-accelerate>=0.30
-torch>=2.3
-wandb>=0.17           # rollout + training-metric monitoring (configs/training/*.yaml wandb:)
-vllm>=0.6             # fast 8B generation; config defaults to use_vllm: true (vllm_mode: colocate)
+# Supported PoC binding. Python 3.12; one CUDA GPU. Runtime records all transitives.
+trl==1.8.0
+transformers==4.57.6
+datasets==4.7.0
+peft==0.18.1
+accelerate==1.12.0
+torch==2.8.0
+# Optional logging: install wandb separately. PoC logs locally by default.
+# vLLM is not part of the supported PoC stack; rollout uses the current HF model.
 # Optional, further speeds attention if your GPU/toolchain supports it:
 # flash-attn>=2.5      # enables model.attn_implementation: flash_attention_2

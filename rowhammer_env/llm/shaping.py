@@ -37,6 +37,7 @@ All of this is host-testable with no ``torch`` — it operates on the plain
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 
@@ -134,14 +135,13 @@ def shaping_weights(reward_config: dict[str, Any] | None) -> tuple[float, float]
     """Resolve success and probe-shaping weights from an optional reward config.
 
     Probe shaping is disabled unless a config explicitly supplies a positive
-    ``probe_shaping_weight``. Validation remains conditional on enabling shaping,
-    matching the trainer: an absent reward block must be a valid, unshaped run.
+    ``probe_shaping_weight``. Negative or non-finite weights always fail; an absent
+    reward block is a valid, unshaped run.
     """
     config = reward_config or {}
     success_weight = float(config.get("success_weight", 1.0))
     probe_weight = float(config.get("probe_shaping_weight", DEFAULT_PROBE_SHAPING_WEIGHT))
-    if probe_weight > 0.0:
-        validate_shaping_weight(success_weight, probe_weight)
+    validate_shaping_weight(success_weight, probe_weight)
     return success_weight, probe_weight
 
 
@@ -154,7 +154,9 @@ def validate_shaping_weight(success_weight: float, probe_shaping_weight: float) 
     line SPEC §9 draws. A non-negative weight strictly below ``success_weight`` is the
     only admissible configuration.
     """
-    if probe_shaping_weight < 0.0:
+    if not math.isfinite(success_weight) or success_weight <= 0:
+        raise ValueError("success_weight must be finite and positive")
+    if not math.isfinite(probe_shaping_weight) or probe_shaping_weight < 0.0:
         raise ValueError(f"probe_shaping_weight must be non-negative, got {probe_shaping_weight}")
     if probe_shaping_weight >= success_weight:
         raise ValueError(
@@ -162,6 +164,71 @@ def validate_shaping_weight(success_weight: float, probe_shaping_weight: float) 
             f"success_weight ({success_weight}): the bounded shaping term must never be "
             "able to earn as much as one real successful flip (SPEC §9)."
         )
+
+
+def _address_token(addr: Any) -> str:
+    import json
+
+    if type(addr) is int:
+        addr = {"kind": "logical", "addr": addr}
+    if not isinstance(addr, dict):
+        return ""
+    if addr.get("kind") == "logical":
+        return f"logical:{addr.get('addr')}"
+    if addr.get("kind") == "handle":
+        return f"handle:{addr.get('id')}"
+    return json.dumps(addr, sort_keys=True)
+
+
+def unique_probe_candidates(rollout: Any) -> set[str]:
+    """Distinct disclosed candidates measured against the victim with short probes.
+
+    Validate the requested alternation AND its real digest. A large hammer, grouped
+    repeated reads, errors, and re-probing the same candidate cannot farm this bonus.
+    No decoded coordinates or server-private candidate labels are consulted.
+    """
+    from rowhammer_env.phase2_env import IssueExpansionError, expand_commands
+    from .grpo_env import summarize_actions
+    from .policies import ToolCall
+
+    metadata = getattr(rollout, "metadata", {}) or {}
+    if not metadata and hasattr(rollout, "initial_observation"):
+        metadata = rollout.initial_observation.get("metadata", {})
+    target = _address_token(metadata.get("target") or (metadata.get("objective") or {}).get("target"))
+    candidates = {_address_token(c) for c in metadata.get("candidates", [])}
+    measured: set[str] = set()
+    for step in getattr(rollout, "trajectory", []):
+        if step.error or not is_decisive_probe(step):
+            continue
+        if summarize_actions([ToolCall("dram.issue", step.action.get("args") or {})])["n_commands"] > 128:
+            continue
+        try:
+            commands = expand_commands((step.action.get("args") or {}).get("commands"))
+        except (IssueExpansionError, TypeError, ValueError):
+            continue
+        if not 4 <= len(commands) <= 128 or len(commands) % 2 or any(c.get("op") != "RD" for c in commands):
+            continue
+        tokens = [_address_token(c.get("addr")) for c in commands]
+        a, b = tokens[:2]
+        if a == b or tokens != [a, b] * (len(tokens) // 2) or target not in (a, b):
+            continue
+        candidate = b if a == target else a
+        if candidate not in candidates:
+            continue
+        digest = _timing_digest(step)
+        if set(digest.get("per_addr_hits", {})) != {a, b}:
+            continue
+        acts = int(digest.get("acts_delta", 0))
+        if acts != 0 and acts < len(tokens) - 1:
+            continue
+        measured.add(candidate)
+    return measured
+
+
+def unique_probe_shaping_reward(rollout: Any) -> float:
+    metadata = getattr(rollout, "metadata", {}) or {}
+    n = len(metadata.get("candidates", []))
+    return len(unique_probe_candidates(rollout)) / n if n else 0.0
 
 
 __all__ = [

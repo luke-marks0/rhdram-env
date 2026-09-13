@@ -5,6 +5,21 @@ from dataclasses import dataclass, field
 from typing import Any
 
 
+def observation_dict(observation: Any) -> dict[str, Any]:
+    """Only the already-disclosed observation; never inspect environment internals."""
+    if hasattr(observation, "model_dump"):
+        data = observation.model_dump()
+        data["metadata"] = dict(getattr(observation, "metadata", {}) or {})
+        data.pop("info", None)  # duplicate wire mirror
+        return data
+    return {
+        name: getattr(observation, name, default)
+        for name, default in (("cycle", 0), ("reward", 0.0), ("done", False),
+                              ("error", None), ("metadata", {}), ("feedback", {}),
+                              ("public_counters", {}), ("last_action", {}))
+    }
+
+
 @dataclass(frozen=True)
 class TrajectoryStep:
     action: dict[str, Any]
@@ -13,6 +28,10 @@ class TrajectoryStep:
     error: dict[str, str] | None
     cycle: int
     feedback: dict[str, Any] = field(default_factory=dict)
+    observation: dict[str, Any] = field(default_factory=dict)
+    assistant_text: str | None = None
+    parse_valid: bool = True
+    driver_generated: bool = False
 
     def as_public(self) -> dict[str, Any]:
         return {
@@ -39,6 +58,7 @@ class EpisodeResult:
     budget_remaining: dict[str, Any]
     trajectory: list[TrajectoryStep]
     final_observation: Any = field(repr=False, compare=False)
+    initial_observation: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_rollout(
@@ -51,6 +71,7 @@ class EpisodeResult:
         done: bool,
         trajectory: list[TrajectoryStep],
         metadata: dict[str, Any],
+        initial_observation: dict[str, Any] | None = None,
     ) -> "EpisodeResult":
         objective = (task or {}).get("objective") or {}
         return cls(
@@ -61,12 +82,13 @@ class EpisodeResult:
             split=objective.get("split") or (task or {}).get("split"),
             reward=float(reward),
             done=bool(done),
-            success=float(reward) > 0.0,
+            success=float(reward) == 1.0,
             steps=len(trajectory),
             final_cycle=int(getattr(final_observation, "cycle", 0)),
             budget_remaining=dict(metadata.get("budget_remaining") or {}),
             trajectory=list(trajectory),
             final_observation=final_observation,
+            initial_observation=initial_observation or {},
         )
 
     def as_metrics_input(self) -> dict[str, Any]:

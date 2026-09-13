@@ -84,3 +84,9 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
 
 def tool_schema_by_name() -> dict[str, dict[str, Any]]:
     return {schema["function"]["name"]: schema for schema in TOOL_SCHEMAS}
+
+
+def poc_tool_schemas() -> list[dict[str, Any]]:
+    from rowhammer_env.poc import POC_TOOLS
+
+    return [schema for schema in TOOL_SCHEMAS if schema["function"]["name"] in POC_TOOLS]

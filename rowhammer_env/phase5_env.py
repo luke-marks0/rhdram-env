@@ -61,6 +61,7 @@ class RowHammerTaskEnv(RowHammerDisturbanceEnv):
         self.target_row = 0
         self._acts_prev = 0
         self._episode_done = False
+        self._episode_seed: int | None = None
         self._target_handle: str | None = None
         self._candidate_handles: list[str] = []
 
@@ -73,6 +74,7 @@ class RowHammerTaskEnv(RowHammerDisturbanceEnv):
         **kwargs: Any,
     ) -> Phase2Observation:
         self._episode_done = False
+        self._episode_seed = seed
         # Per-episode task selection (P17): an orchestrator can pass a task config
         # (SPEC §10 shape or the ``{"family": ...}`` shorthand) at reset to drive a
         # curriculum without restarting the server. Task selection is a training-
@@ -164,7 +166,14 @@ class RowHammerTaskEnv(RowHammerDisturbanceEnv):
         if action.tool == "script.run":
             return self._script(action)
         if action.tool == "episode.finish":
-            obs = Phase2Observation(reward=1.0 if self._latch_success() else 0.0, done=True, cycle=self._state.cycle)
+            obs = Phase2Observation(
+                reward=1.0 if self._latch_success() else 0.0, done=True,
+                cycle=self._state.cycle, public_counters=dict(self._public_counters),
+            )
+            self._charge(obs, self._state.cycle)
+            obs.metadata["budget_remaining"] = dict(self.budget_remaining)
+            if self._compiled is not None:
+                obs.metadata.update(self._task_metadata(self._episode_seed))
             self.close()
             return obs
 

@@ -691,6 +691,12 @@ chat transcript alongside the trajectory as a `MultiTurnRollout`.
 Defined in: `rowhammer_env/llm/multiturn_rollout.py`, `rowhammer_env/llm/rollout.py`.
 
 #### `@spec:train-completion-mask` — assistant-span token mask
+On the supported PoC HF path, `GeneratedTurn` retains the exact sampled token IDs
+and each turn's conditioning prefix. `to_grpo_example` extends those prefixes with
+zero masks on tool/template tokens and ones only on sampled tokens. A rewriting
+template fails closed. Context-limit driver finishes are never training targets.
+The following render-based builder remains for reference/SFT trajectories and
+legacy tokenizer tests:
 `build_masked_completion` tokenizes a full transcript and marks only assistant-turn
 tokens trainable (each turn anchored independently, robust to the Qwen3
 `enable_thinking` `<think></think>` quirk); `to_grpo_example` emits
@@ -718,6 +724,14 @@ never rival one real flip. Training-only; eval/benchmark scoring uses the truste
 reward alone.
 Defined in: `rowhammer_env/llm/shaping.py`.
 
+The scoped configuration selects `unique_candidate_probe` shaping: each distinct
+disclosed candidate earns credit at most once, from a short, actually alternating
+victim/candidate read probe with a decisive real digest. Repeated probes, grouped
+reads, long hammers, and rejected actions earn no additional credit. The term is
+normalized by candidate count. It is zero during trainer validation as well as
+standalone benchmark evaluation. This bounded auxiliary objective is not a claim
+of potential-based shaping or of guaranteed useful gradients.
+
 #### `@spec:train-reference-policy` — deterministic DRAMA reference solver
 `ReferenceProbePolicy` is a hand-written reference (labelled a fixture, never the
 LLM policy) that solves the discovery families using only disclosed tools/signals:
@@ -730,9 +744,22 @@ Defined in: `rowhammer_env/llm/policies.py`.
 
 #### `@spec:eval-metrics` — episode result + aggregation
 `EpisodeResult.from_rollout` normalizes one rollout (family, difficulty, split,
-success = reward > 0, steps, final cycle, budget); `summarize_episodes` aggregates
+success = reward == 1.0, steps, final cycle, budget); `summarize_episodes` aggregates
 success rate / reward / budget efficiency, bucketed by family/difficulty/split.
 Defined in: `rowhammer_env/observability/metrics.py`.
+
+#### `@spec:poc-experiment` — scoped experiment contract
+`rowhammer_env/poc.py` narrows the served environment when `RH_POC=1`: only DDR4,
+the admitted profile at 50 C, baseline refresh, easy/medium discovery, and
+`dram.info` / `dram.issue` / `episode.finish` are available. Other policy tools are
+rejected before dispatch. The general environment remains available for regression
+utilities. The canonical recipe is `configs/training/poc.yaml`; training seeds,
+development-validation seeds, and final benchmark seeds are disjoint.
+`scripts/verify_poc.py` fails on any skipped required test. `eval_poc.py` writes
+disclosed trajectories, resource/error metrics, source snapshots, model identity,
+and per-task Wilson intervals. Timing-hidden evaluation strips every dynamic timing
+view only at the policy boundary; trusted simulator state and scoring are unchanged.
+GPU optimizer/reload/resume qualification is a separate `smoke_train_poc.py` gate.
 
 ### Cross-cutting invariants
 
@@ -868,7 +895,7 @@ Flagged, not resolved — a human decides which side is authoritative.
 `@spec:train-prompt`, `@spec:train-completion-parse`, `@spec:train-reward-eval`,
 `@spec:train-multiturn-rollout`, `@spec:train-completion-mask`,
 `@spec:train-curriculum`, `@spec:train-reward-shaping`, `@spec:train-reference-policy`,
-`@spec:eval-metrics`,
+`@spec:eval-metrics`, `@spec:poc-experiment`,
 `@spec:invariant-no-mock`, `@spec:invariant-trusted-reward`,
 `@spec:invariant-no-leakage`, `@spec:invariant-budget-honesty`,
 `@spec:invariant-determinism`.

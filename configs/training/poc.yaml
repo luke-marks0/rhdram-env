@@ -1,0 +1,119 @@
+# Canonical PoC: all ranges include both endpoints. One 80 GB CUDA GPU.
+poc: true
+model:
+  name: Qwen/Qwen3-4B-Instruct-2507
+  revision: cdbee75f17c01a7cc42f958dc650907174af0554
+  enable_thinking: false
+  torch_dtype: bfloat16
+  attn_implementation: sdpa
+peft:
+  enabled: true
+  r: 32
+  lora_alpha: 64
+  lora_dropout: 0.0
+  target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+env:
+  launch_server: true
+  server_host: 127.0.0.1
+  server_mode: production
+  max_concurrent_envs: 8
+  concurrency: 4
+  max_steps: 40
+prompt:
+  hint_level: none
+rollout:
+  multi_turn: true
+  max_turns: 40
+  max_prompt_tokens: 32768
+  max_turn_tokens: 512
+curriculum:
+  - name: known_target
+    tier: tier0
+    band: ""
+    tasks: [configs/tasks/known_target_anybit.yaml]
+    seed_range: &train_seeds [1, 256]
+    multi_turn: true
+    reference_min_success: 1.0
+    max_steps: 50
+    probe_shaping_weight: 0.0
+  - name: bounded_easy
+    tier: tier2a
+    band: easy
+    tasks: [configs/tasks/bounded_sweep_easy.yaml]
+    seed_range: *train_seeds
+    multi_turn: true
+    reference_min_success: 1.0
+    max_steps: 100
+    probe_shaping_weight: 0.1
+  - name: bounded_medium
+    tier: tier2a
+    band: medium
+    tasks: [configs/tasks/bounded_sweep_medium.yaml]
+    seed_range: *train_seeds
+    multi_turn: true
+    reference_min_success: 1.0
+    max_steps: 150
+    probe_shaping_weight: 0.1
+  - name: hidden_easy
+    tier: tier2b
+    band: easy
+    tasks: [configs/tasks/hidden_adjacency_easy.yaml]
+    seed_range: *train_seeds
+    multi_turn: true
+    reference_min_success: 1.0
+    max_steps: 100
+    probe_shaping_weight: 0.1
+  - name: hidden_medium
+    tier: tier2b
+    band: medium
+    tasks: [configs/tasks/hidden_adjacency_medium.yaml]
+    seed_range: *train_seeds
+    multi_turn: true
+    reference_min_success: 1.0
+    max_steps: 200
+    probe_shaping_weight: 0.0
+# Development validation may be used for checkpoint selection.
+eval:
+  seed_range: [1000, 1031]
+# Final test seeds: never used for SFT, GRPO, or checkpoint selection.
+benchmark:
+  seed_range: [10000, 10031]
+reward:
+  success_weight: 1.0
+  probe_shaping_weight: 0.1
+  shaping_kind: unique_candidate_probe
+wandb:
+  enabled: false
+grpo:
+  output_dir: runs/poc_training
+  learning_rate: 5.0e-6
+  lr_scheduler_type: cosine
+  warmup_ratio: 0.05
+  max_grad_norm: 1.0
+  beta: 0.0
+  num_generations: 8
+  num_generations_eval: 1
+  per_device_train_batch_size: 1
+  gradient_accumulation_steps: 32
+  # Two samples keep TRL's logged sample standard deviation defined.
+  per_device_eval_batch_size: 2
+  generation_batch_size: 32
+  max_steps: 200
+  max_completion_length: 32768
+  temperature: 0.8
+  top_p: 1.0
+  top_k: 0
+  loss_type: dapo
+  scale_rewards: batch
+  bf16: true
+  gradient_checkpointing: true
+  gradient_checkpointing_kwargs: {use_reentrant: false}
+  logging_steps: 1
+  save_steps: 50
+  save_total_limit: 2
+  eval_steps: 50
+  eval_strategy: steps
+  report_to: none
+  seed: 42
+  use_vllm: false
+  mask_truncated_completions: false

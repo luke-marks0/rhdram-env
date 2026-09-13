@@ -33,6 +33,7 @@ def main() -> int:
     ap.add_argument("--output-root", default=None, help="base dir for per-stage runs (default from grpo.output_dir)")
     ap.add_argument("--base-url", default=None, help="reuse a running env server across all stages")
     ap.add_argument("--from-stage", default=None, help="start at this stage name (skip earlier stages)")
+    ap.add_argument("--initial-adapter", help="initialize the first selected stage from a supervised warm-start adapter")
     args = ap.parse_args()
 
     cfg = yaml.safe_load(args.config.read_text())
@@ -47,9 +48,11 @@ def main() -> int:
     else:
         start = 0
 
-    prev_adapter = None
-    if start > 0:
+    prev_adapter = args.initial_adapter
+    if start > 0 and prev_adapter is None:
         prev_adapter = str(output_root / names[start - 1])
+    if prev_adapter and not (pathlib.Path(prev_adapter) / "adapter_config.json").is_file():
+        raise SystemExit(f"missing initial adapter: {prev_adapter}")
 
     for stage in stages[start:]:
         out = output_root / stage.name

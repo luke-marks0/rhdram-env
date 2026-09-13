@@ -3,3 +3,6 @@ __pycache__/
 
 build/
 third_party/
+.venv/
+.venv-train/
+runs/

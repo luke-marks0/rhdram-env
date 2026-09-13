@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Iterable
 
 from rowhammer_env import Phase2Action
-from rowhammer_env.observability.metrics import EpisodeResult, TrajectoryStep
+from rowhammer_env.observability.metrics import EpisodeResult, TrajectoryStep, observation_dict
 
 from .policies import ToolCall, ToolPolicy
 
@@ -33,6 +33,8 @@ async def run_episode(config: RolloutConfig, policy: ToolPolicy) -> EpisodeResul
     async with RowHammerClient(base_url=config.base_url, message_timeout_s=120.0) as client:
         reset = await client.reset(seed=config.seed, episode_id=config.episode_id, task=config.task)
         observation = reset.observation
+        initial = observation_dict(observation)
+        metadata = dict(observation.metadata or {})
         last_reward = float(reset.reward or 0.0)
         done = bool(reset.done)
         for _ in range(config.max_steps):
@@ -41,6 +43,7 @@ async def run_episode(config: RolloutConfig, policy: ToolPolicy) -> EpisodeResul
             call = policy.next_tool(observation, transcript)
             result = await client.step(_action(call))
             observation = result.observation
+            metadata.update(observation.metadata or {})
             last_reward = float(result.reward or 0.0)
             done = bool(result.done)
             step = TrajectoryStep(
@@ -50,12 +53,12 @@ async def run_episode(config: RolloutConfig, policy: ToolPolicy) -> EpisodeResul
                 error=observation.error,
                 cycle=observation.cycle,
                 feedback=observation.feedback,
+                observation=observation_dict(observation),
             )
             trajectory.append(step)
             transcript.append(step.as_public())
             if done:
                 break
-        metadata = observation.metadata
         return EpisodeResult.from_rollout(
             seed=config.seed,
             task=config.task,
@@ -64,6 +67,7 @@ async def run_episode(config: RolloutConfig, policy: ToolPolicy) -> EpisodeResul
             done=done,
             trajectory=trajectory,
             metadata=metadata,
+            initial_observation=initial,
         )
 
 
@@ -114,6 +118,7 @@ def run_episode_local(
     if budgets is not None:
         reset_kwargs["budgets"] = budgets
     observation = env.reset(**reset_kwargs)
+    initial = observation_dict(observation)
     last_reward = float(observation.reward or 0.0)
     done = bool(observation.done)
     # The terminal (episode.finish) observation carries no task metadata; keep the
@@ -127,7 +132,7 @@ def run_episode_local(
         last_reward = float(observation.reward or 0.0)
         done = bool(observation.done)
         if observation.metadata:
-            metadata = dict(observation.metadata)
+            metadata.update(observation.metadata)
         step = TrajectoryStep(
             action={"tool": call.name, "args": call.args},
             reward=last_reward,
@@ -135,6 +140,7 @@ def run_episode_local(
             error=observation.error,
             cycle=observation.cycle,
             feedback=observation.feedback,
+            observation=observation_dict(observation),
         )
         trajectory.append(step)
         transcript.append(step.as_public())
@@ -148,6 +154,7 @@ def run_episode_local(
         done=done,
         trajectory=trajectory,
         metadata=metadata,
+        initial_observation=initial,
     )
 
 

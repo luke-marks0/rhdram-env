@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from rowhammer_env import Phase2Action
-from rowhammer_env.observability.metrics import EpisodeResult, TrajectoryStep
+from rowhammer_env.observability.metrics import EpisodeResult, TrajectoryStep, observation_dict
 
 from .grpo_env import build_messages, parse_actions
 from .policies import ToolCall, ToolPolicy
@@ -96,8 +96,29 @@ def render_tool_result(observation: Any) -> str:
         "last_action": getattr(observation, "last_action", {}) or {},
         "public_counters": getattr(observation, "public_counters", {}) or {},
         "feedback": _trim_trace_tail(getattr(observation, "feedback", {}) or {}),
+        "budget_remaining": (getattr(observation, "metadata", {}) or {}).get("budget_remaining", {}),
     }
-    return json.dumps(payload, sort_keys=True)
+    if (getattr(observation, "metadata", {}) or {}).get("policy_surface") == "poc":
+        payload["feedback"] = dict(payload["feedback"])
+        payload["feedback"].pop("trace_tail", None)
+        payload["feedback"].pop("trace_tail_len", None)
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+
+class GeneratedTurn(str):
+    """Model text plus the exact sampled tokens and their conditioning context.
+
+    Template-inserted headers/newlines are not sampled actions. Keeping token IDs
+    avoids pretending that decode/re-encode and whole-chat rendering reproduce the
+    behavior policy. ``sampled=False`` marks a driver-inserted context-limit finish.
+    """
+
+    def __new__(cls, text: str, *, prompt_ids: list[int], token_ids: list[int], sampled: bool = True):
+        obj = super().__new__(cls, text)
+        obj.prompt_ids = prompt_ids
+        obj.token_ids = token_ids
+        obj.sampled = sampled
+        return obj
 
 
 class ToolPolicyGenerator:
@@ -168,6 +189,7 @@ def _append_step(
     done: bool,
     trajectory: list[TrajectoryStep],
     transcript: list[dict[str, Any]],
+    text: str | None = None,
 ) -> None:
     step = TrajectoryStep(
         action={"tool": call.name, "args": call.args},
@@ -176,6 +198,10 @@ def _append_step(
         error=observation.error,
         cycle=observation.cycle,
         feedback=observation.feedback,
+        observation=observation_dict(observation),
+        assistant_text=str(text) if text is not None else None,
+        parse_valid=(len(parse_actions(text)) == 1 and getattr(text, "sampled", True)) if text is not None else True,
+        driver_generated=not getattr(text, "sampled", True),
     )
     trajectory.append(step)
     transcript.append(step.as_public())
@@ -220,6 +246,7 @@ async def run_training_episode(
     async with RowHammerClient(base_url=config.base_url, message_timeout_s=120.0) as client:
         reset = await client.reset(seed=config.seed, episode_id=config.episode_id, task=config.task)
         observation = reset.observation
+        initial = observation_dict(observation)
         metadata = dict(getattr(observation, "metadata", {}) or {})
         prompt_messages = build_messages(metadata)
         messages = list(prompt_messages)
@@ -238,8 +265,8 @@ async def run_training_episode(
             last_reward = float(result.reward or 0.0)
             done = bool(result.done)
             if getattr(observation, "metadata", None):
-                richest = dict(observation.metadata)
-            _append_step(call, observation, last_reward, done, trajectory, transcript)
+                richest.update(observation.metadata)
+            _append_step(call, observation, last_reward, done, trajectory, transcript, text)
             if done:
                 break
             messages.append({"role": TOOL_ROLE, "content": render_tool_result(observation)})
@@ -251,6 +278,7 @@ async def run_training_episode(
             done=done,
             trajectory=trajectory,
             metadata=richest,
+            initial_observation=initial,
         )
         return MultiTurnRollout(
             prompt_messages=prompt_messages,
@@ -273,6 +301,7 @@ def _drive(
 ) -> MultiTurnRollout:
     """Shared synchronous loop body for the in-process driver."""
     metadata = dict(getattr(observation, "metadata", {}) or {})
+    initial = observation_dict(observation)
     prompt_messages = build_messages(metadata)
     messages = list(prompt_messages)
     transcript: list[dict[str, Any]] = []
@@ -289,8 +318,8 @@ def _drive(
         last_reward = float(getattr(observation, "reward", 0.0) or 0.0)
         done = bool(getattr(observation, "done", False))
         if getattr(observation, "metadata", None):
-            richest = dict(observation.metadata)
-        _append_step(call, observation, last_reward, done, trajectory, transcript)
+            richest.update(observation.metadata)
+        _append_step(call, observation, last_reward, done, trajectory, transcript, text)
         if done:
             break
         messages.append({"role": TOOL_ROLE, "content": render_tool_result(observation)})
@@ -302,6 +331,7 @@ def _drive(
         done=done,
         trajectory=trajectory,
         metadata=richest,
+        initial_observation=initial,
     )
     return MultiTurnRollout(
         prompt_messages=prompt_messages,
@@ -352,12 +382,14 @@ class _EpisodeState:
     last_reward: float = 0.0
     done: bool = False
     richest: dict[str, Any] = field(default_factory=dict)
+    initial: dict[str, Any] = field(default_factory=dict)
 
     def start(self, *, reward: float | None = None, done: bool | None = None) -> None:
         metadata = dict(getattr(self.observation, "metadata", {}) or {})
         self.prompt_messages = build_messages(metadata)
         self.messages = list(self.prompt_messages)
         self.richest = dict(metadata)
+        self.initial = observation_dict(self.observation)
         self.last_reward = float(getattr(self.observation, "reward", 0.0) or 0.0) if reward is None else float(reward)
         self.done = bool(getattr(self.observation, "done", False)) if done is None else bool(done)
 
@@ -377,8 +409,9 @@ class _EpisodeState:
         self.last_reward = float(reward or 0.0)
         self.done = bool(done)
         if getattr(observation, "metadata", None):
-            self.richest = dict(observation.metadata)
-        _append_step(call, observation, self.last_reward, self.done, self.trajectory, self.transcript)
+            self.richest.update(observation.metadata)
+        _append_step(call, observation, self.last_reward, self.done, self.trajectory, self.transcript,
+                     self.messages[-1]["content"])
         if not self.done:
             self.messages.append({"role": TOOL_ROLE, "content": render_tool_result(observation)})
 
@@ -391,6 +424,7 @@ class _EpisodeState:
             done=self.done,
             trajectory=self.trajectory,
             metadata=self.richest,
+            initial_observation=self.initial,
         )
         return MultiTurnRollout(
             prompt_messages=self.prompt_messages,
@@ -429,6 +463,8 @@ def run_batched_training_episodes_local(
         if not active:
             break
         texts = batch_generator([st.request() for st, _ in active])
+        if len(texts) != len(active):
+            raise ValueError("batch generator must return exactly one completion per active episode")
         for (st, env), text in zip(active, texts):
             call, action = st.begin_turn(text)
             obs = env.step(action)
@@ -471,6 +507,8 @@ async def run_batched_training_episodes(
             if not active:
                 break
             texts = batch_generator([st.request() for st, _ in active])
+            if len(texts) != len(active):
+                raise ValueError("batch generator must return exactly one completion per active episode")
 
             async def _advance(st: _EpisodeState, client: Any, text: str) -> None:
                 call, action = st.begin_turn(text)
@@ -621,12 +659,31 @@ def to_grpo_example(
     is computed across a group of these. ``enable_thinking`` must match the value
     used to bake the dataset prompt so the mask's token boundaries line up.
     """
-    prompt_ids, completion_ids, completion_mask = build_masked_completion(
-        rollout.messages,
-        tokenizer,
-        n_prompt_messages=len(rollout.prompt_messages),
-        enable_thinking=enable_thinking,
-    )
+    turns = [m["content"] for m in rollout.completion_messages if m["role"] == "assistant"]
+    if turns and all(isinstance(t, GeneratedTurn) for t in turns):
+        # Every later generation context must extend the exact earlier sampled
+        # prefix. Fail closed on a rewriting template; the supported non-thinking
+        # Qwen Instruct template preserves it.
+        prompt_ids = list(turns[0].prompt_ids)
+        ids, mask = list(prompt_ids), [0] * len(prompt_ids)
+        for turn in turns:
+            if not turn.sampled:
+                continue
+            context = turn.prompt_ids
+            if context[:len(ids)] != ids:
+                raise ValueError("generation context rewrote previously sampled tokens")
+            mask.extend([0] * (len(context) - len(ids)))
+            ids = list(context)
+            ids.extend(turn.token_ids)
+            mask.extend([1 if turn.sampled else 0] * len(turn.token_ids))
+        completion_ids, completion_mask = ids[len(prompt_ids):], mask[len(prompt_ids):]
+    else:
+        prompt_ids, completion_ids, completion_mask = build_masked_completion(
+            rollout.messages,
+            tokenizer,
+            n_prompt_messages=len(rollout.prompt_messages),
+            enable_thinking=enable_thinking,
+        )
     return {
         "prompt_ids": prompt_ids,
         "completion_ids": completion_ids,

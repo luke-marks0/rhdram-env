@@ -60,6 +60,7 @@ from rowhammer_env.llm.grpo_env import (  # noqa: E402
     summarize_actions,
 )
 from rowhammer_env.llm.multiturn_rollout import (  # noqa: E402  (torch-free)
+    GeneratedTurn,
     render_tool_call,
     run_batched_training_episodes,
     run_training_episode,
@@ -70,6 +71,7 @@ from rowhammer_env.llm.rollout import RolloutConfig  # noqa: E402
 from rowhammer_env.llm.shaping import (  # noqa: E402  (torch-free)
     probe_shaping_reward,
     shaping_weights,
+    unique_probe_shaping_reward,
 )
 
 
@@ -329,11 +331,12 @@ class HFCompletionGenerator:
             )
         except TypeError:
             prompt = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
+        inputs = self.tokenizer(prompt, return_tensors="pt", add_special_tokens=False).to(self.model.device)
+        prompt_ids = inputs["input_ids"][0].tolist()
         prompt_len = int(inputs["input_ids"].shape[1])
         room = self.max_prompt_tokens - prompt_len - self.response_margin
         if room <= 0:
-            return self._FINISH_TURN
+            return GeneratedTurn(self._FINISH_TURN, prompt_ids=prompt_ids, token_ids=[], sampled=False)
         turn_new_tokens = min(self.max_new_tokens, room)
         # Generating from a model mid-training is a trap: gradient checkpointing forces
         # use_cache=False and .train() leaves dropout on, and that no-KV-cache path
@@ -359,11 +362,12 @@ class HFCompletionGenerator:
                 )
         finally:
             if gc_enabled and hasattr(self.model, "gradient_checkpointing_enable"):
-                self.model.gradient_checkpointing_enable()
+                self.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
             if was_training:
                 self.model.train()
         gen = out[0][inputs["input_ids"].shape[1] :]
-        return self.tokenizer.decode(gen, skip_special_tokens=True)
+        return GeneratedTurn(self.tokenizer.decode(gen, skip_special_tokens=True),
+                             prompt_ids=prompt_ids, token_ids=gen.tolist())
 
 
 # Shared graceful end-of-episode turn for the batched generators below.
@@ -449,14 +453,19 @@ class HFBatchedGenerator:
         import torch
 
         texts = [_FINISH_TURN] * len(requests)
-        prompts, slots = [], []
+        prompts, slots, contexts, rooms = [], [], [], []
         for i, req in enumerate(requests):
             prompt = _render_prompt(self.tokenizer, req.messages, self.enable_thinking)
-            n_tok = len(self.tokenizer(prompt, add_special_tokens=False)["input_ids"])
-            if self.max_prompt_tokens - n_tok - self.response_margin <= 0:
+            context = self.tokenizer(prompt, add_special_tokens=False)["input_ids"]
+            n_tok = len(context)
+            room = self.max_prompt_tokens - n_tok - self.response_margin
+            texts[i] = GeneratedTurn(_FINISH_TURN, prompt_ids=list(context), token_ids=[], sampled=False)
+            if room <= 0:
                 continue
             prompts.append(prompt)
             slots.append(i)
+            contexts.append(list(context))
+            rooms.append(room)
         if not prompts:
             return texts
 
@@ -476,7 +485,7 @@ class HFBatchedGenerator:
             with torch.no_grad():
                 out = self.model.generate(
                     **enc,
-                    max_new_tokens=self.max_turn_tokens,
+                    max_new_tokens=min(self.max_turn_tokens, min(rooms)),
                     do_sample=True,
                     temperature=self.temperature,
                     top_p=self.top_p,
@@ -487,12 +496,16 @@ class HFBatchedGenerator:
                 )
         finally:
             if gc_enabled and hasattr(self.model, "gradient_checkpointing_enable"):
-                self.model.gradient_checkpointing_enable()
+                self.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
             if was_training:
                 self.model.train()
         gen = out[:, enc["input_ids"].shape[1]:]
         for j, slot in enumerate(slots):
-            texts[slot] = self.tokenizer.decode(gen[j], skip_special_tokens=True)
+            ids = gen[j].tolist()
+            if self.tokenizer.eos_token_id in ids:
+                ids = ids[:ids.index(self.tokenizer.eos_token_id) + 1]
+            texts[slot] = GeneratedTurn(self.tokenizer.decode(ids, skip_special_tokens=True),
+                                        prompt_ids=contexts[j], token_ids=ids)
         return texts
 
 
@@ -510,6 +523,11 @@ def make_multiturn_rollout_func(
     max_prompt_tokens=None,
     concurrency=8,
     emit_probe_shaping=False,
+    shaping_kind="legacy",
+    top_p=1.0,
+    top_k=0,
+    artifact_dir=None,
+    zero_variance_patience=20,
 ):
     """A TRL GRPO ``rollout_func`` that runs real multi-turn episodes, batched.
 
@@ -538,24 +556,30 @@ def make_multiturn_rollout_func(
     ``reward_probe_shaping`` only when shaping is enabled.
     """
 
-    def _logprobs(prompt_ids: list[int], completion_ids: list[int]) -> list[float]:
+    def _logprobs(active_model, prompt_ids: list[int], completion_ids: list[int]) -> list[float]:
         # Teacher-forcing pass over prompt+completion -> per-completion-token logprob
-        # under the current policy (reproduces the sampling logprobs at temperature
-        # 1.0, since each token was generated left-to-right from this same context).
+        # under the same temperature-scaled policy used to sample each token.
         import torch
 
-        ids = torch.tensor([prompt_ids + completion_ids], device=model.device)
-        was_training = model.training
-        model.eval()  # match the eval-mode sampling distribution (no dropout)
+        ids = torch.tensor([prompt_ids + completion_ids], device=active_model.device)
+        was_training = active_model.training
+        active_model.eval()  # match the eval-mode sampling distribution (no dropout)
         try:
             with torch.no_grad():
-                logits = model(ids).logits[0]
+                # Avoid a second full sequence x vocabulary FP32 allocation.
+                logits = active_model(ids, use_cache=False).logits[0]
+                start = len(prompt_ids)
+                values = []
+                for offset in range(0, len(completion_ids), 128):
+                    count = min(128, len(completion_ids) - offset)
+                    scores = logits[start + offset - 1:start + offset - 1 + count].float() / temperature
+                    targets = ids[0, start + offset:start + offset + count]
+                    selected = scores.gather(1, targets[:, None]).squeeze(1) - scores.logsumexp(dim=-1)
+                    values.extend(selected.cpu().tolist())
         finally:
             if was_training:
-                model.train()
-        logp = torch.log_softmax(logits.float(), dim=-1)
-        start = len(prompt_ids)
-        return [float(logp[start + t - 1, tok]) for t, tok in enumerate(completion_ids)]
+                active_model.train()
+        return values
 
     logged_backend: list[str] = []
 
@@ -568,7 +592,6 @@ def make_multiturn_rollout_func(
         """
         llm = getattr(trainer, "llm", None)
         sync = getattr(trainer, "_move_model_to_vllm", None)
-        top_p = 0.95 if enable_thinking else 0.8
         cap = _turn_cap(max_turn_tokens, enable_thinking, max_new_tokens)
         if llm is not None and not callable(sync) and not logged_backend:
             print(
@@ -581,13 +604,13 @@ def make_multiturn_rollout_func(
             sync()  # push current policy weights into the vLLM engine (once per step)
             gen = VLLMBatchedGenerator(
                 llm, tokenizer, max_turn_tokens=cap, enable_thinking=enable_thinking,
-                temperature=temperature, top_p=top_p, top_k=20, max_prompt_tokens=max_prompt_tokens,
+                temperature=temperature, top_p=top_p, top_k=top_k, max_prompt_tokens=max_prompt_tokens,
             )
             backend = "vllm-batched"
         else:
             gen = HFBatchedGenerator(
-                model, tokenizer, max_turn_tokens=cap, enable_thinking=enable_thinking,
-                temperature=temperature, top_p=top_p, top_k=20, max_prompt_tokens=max_prompt_tokens,
+                trainer.model, tokenizer, max_turn_tokens=cap, enable_thinking=enable_thinking,
+                temperature=temperature, top_p=top_p, top_k=top_k, max_prompt_tokens=max_prompt_tokens,
             )
             backend = "hf-batched"
         if not logged_backend:
@@ -595,7 +618,15 @@ def make_multiturn_rollout_func(
             print(f"multi-turn rollout backend: {backend} (concurrency={concurrency}, max_turns={max_turns})")
         return gen
 
+    zero_groups_in_a_row = 0
+
     def rollout_func(prompts, trainer):
+        nonlocal zero_groups_in_a_row
+        is_training = trainer.model.training
+        if is_training:
+            size = trainer.num_generations
+            if len(prompts) % size or any(len(set(prompts[i:i+size])) != 1 for i in range(0, len(prompts), size)):
+                raise RuntimeError("TRL must supply complete groups of repeated, identical task prompts")
         batch_gen = _pick_batch_generator(trainer)
         # A unique episode_id per rollout so concurrent same-seed generations get
         # distinct live env sessions (same deterministic task, independent exploration).
@@ -630,7 +661,9 @@ def make_multiturn_rollout_func(
         for rollout in rollouts:
             example = to_grpo_example(rollout, tokenizer, enable_thinking=enable_thinking)
             mask = example["completion_mask"]  # 1 = assistant/model token, 0 = tool/env
-            logprobs = _logprobs(example["prompt_ids"], example["completion_ids"])
+            if not example["completion_ids"] or not any(mask):
+                raise RuntimeError("rollout contains no sampled assistant tokens; check context limits")
+            logprobs = _logprobs(trainer.model, example["prompt_ids"], example["completion_ids"])
             # Zero logprobs on env/tool tokens, matching TRL's own tool-loop convention;
             # they're excluded from the loss by env_mask anyway.
             logprobs = [lp if m == 1 else 0.0 for lp, m in zip(logprobs, mask)]
@@ -642,7 +675,39 @@ def make_multiturn_rollout_func(
             # Bounded, outcome-neutral shaping computed here (torch-free) from the
             # rollout's trusted timing digests — never from completion text (SPEC §9).
             if emit_probe_shaping:
-                probe_shaping_b.append(probe_shaping_reward(rollout))
+                score = unique_probe_shaping_reward if shaping_kind == "unique_candidate_probe" else probe_shaping_reward
+                probe_shaping_b.append(score(rollout) if is_training else 0.0)
+        if artifact_dir is not None:
+            from rowhammer_env.observability.experiment import episode_record
+
+            path = pathlib.Path(artifact_dir)
+            path.mkdir(parents=True, exist_ok=True)
+            with (path / "rollouts.jsonl").open("a") as stream:
+                for i, rollout in enumerate(rollouts):
+                    record = episode_record(rollout.result, condition="train" if is_training else "validation", messages=rollout.messages)
+                    record.update(global_step=trainer.state.global_step,
+                                  probe_shaping=probe_shaping_b[i] if emit_probe_shaping else 0.0,
+                                  assistant_tokens=sum(env_mask_b[i]), external_tokens=env_mask_b[i].count(0),
+                                  episode_id=specs[i][2])
+                    stream.write(json.dumps(record) + "\n")
+        if is_training:
+            group_size = trainer.num_generations
+            if len(rollouts) % group_size:
+                raise RuntimeError("rollout batch does not contain complete GRPO groups")
+            weight = float(trainer.reward_weights[1]) if emit_probe_shaping else 0.0
+            totals = [float(trainer.reward_weights[0]) * reward + weight * (probe_shaping_b[i] if emit_probe_shaping else 0.0)
+                      for i, reward in enumerate(trusted_reward_b)]
+            groups = [totals[i:i+group_size] for i in range(0, len(totals), group_size)]
+            mixed = sum(max(group) > min(group) for group in groups)
+            diagnostic = {"global_step": trainer.state.global_step, "groups": len(groups), "nonzero_advantage_groups": mixed,
+                          "zero_variance_fraction": 1 - mixed / len(groups),
+                          "sparse_success_rate": sum(trusted_reward_b) / len(trusted_reward_b)}
+            if artifact_dir is not None:
+                with (pathlib.Path(artifact_dir) / "signal.jsonl").open("a") as stream:
+                    stream.write(json.dumps(diagnostic) + "\n")
+            zero_groups_in_a_row = zero_groups_in_a_row + 1 if mixed == 0 else 0
+            if zero_variance_patience and zero_groups_in_a_row >= zero_variance_patience:
+                raise RuntimeError("no reward variation across consecutive GRPO batches; inspect signal.jsonl and warm-start the policy")
         out = {
             "prompt_ids": prompt_ids_b,
             "completion_ids": completion_ids_b,
@@ -659,7 +724,9 @@ def make_multiturn_rollout_func(
         # The reward is the trusted episode reward carried from the rollout — not
         # re-derived from completion text (SPEC §9).
         if trusted_reward is None:
-            return [0.0] * len(completions)
+            raise RuntimeError("TRL dropped the trusted rollout reward column")
+        if len(trusted_reward) != len(completions):
+            raise RuntimeError("trusted reward count does not match completions")
         return [float(r) for r in trusted_reward]
 
     def reward_probe_shaping(completions, probe_shaping=None, **_):
@@ -715,24 +782,23 @@ def setup_wandb(cfg: dict, grpo_cfg: dict) -> tuple[list, bool]:
 # Dry run: no model, just prove the data + reward pipeline end-to-end.
 # --------------------------------------------------------------------------- #
 def dry_run(base_url: str, pairs: list[tuple[dict, int]], concurrency: int, max_steps: int) -> int:
-    rows = build_rows(base_url, pairs)
-    print(f"built {len(rows)} task-instance rows")
-    print("--- sample prompt (messages) ---")
-    print(json.dumps(rows[0]["messages"], indent=2)[:2000])
+    from collections import Counter
+    from rowhammer_env.llm.multiturn_rollout import ToolPolicyGenerator
+    from rowhammer_env.llm.poc_policy import control_policy
 
-    # Score the reference double-sided hammer (should earn 1.0 on known targets).
-    items: list[RolloutItem] = []
-    for i, row in enumerate(rows):
-        task = json.loads(row["task_json"]) if row["task_json"] else None
-        meta = asyncio.run(disclose_metadata(base_url, row["seed"], task))
-        items.append(
-            RolloutItem(seed=row["seed"], task=task, actions=hint_actions(meta), episode_id=f"grpo_dry_{i}")
-        )
-    rewards = evaluate_rewards(base_url, items, concurrency=concurrency, max_steps=max_steps)
-    for row, r in zip(rows, rewards):
-        print(f"  {row['family']:<28} seed={row['seed']:<3} reference-hammer reward={r}")
-    print(f"reference-hammer mean reward = {sum(rewards) / len(rewards):.3f}")
-    return 0
+    counts = Counter()
+    for entry, seed in pairs:
+        task, label = resolve_task(entry)
+        if counts[label] >= 2:
+            continue
+        counts[label] += 1
+        policy = control_policy("reference", (task or {}).get("family", "known_target_anybit"))
+        result = asyncio.run(run_training_episode(RolloutConfig(base_url, seed, task),
+                            ToolPolicyGenerator(policy), max_turns=max_steps))
+        print(f"reference gate: {label} seed={seed} reward={result.reward} turns={len(result.trajectory)}", flush=True)
+        if result.reward != 1.0:
+            return 1
+    return 0 if counts else 1
 
 
 # --------------------------------------------------------------------------- #
@@ -745,17 +811,43 @@ def main() -> int:
     parser.add_argument("--dry-run", action="store_true", help="build data + score the reference hammer, no training")
     parser.add_argument("--stage", default=None, help="train only this curriculum stage by name")
     parser.add_argument("--resume-adapter", default=None, help="load a LoRA adapter as init weights (stage chaining)")
+    parser.add_argument("--resume-from-checkpoint", default=None, help="resume optimizer, scheduler, RNG, and trainer state")
     parser.add_argument("--output-dir", default=None, help="override grpo.output_dir")
+    parser.add_argument("--smoke", action="store_true", help="two optimizer steps; fail unless parameters change")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
+    full_cfg = cfg
+    if cfg.get("poc"):
+        from rowhammer_env.poc import validate_config
+
+        validate_config(cfg)
+        if not args.dry_run and not args.stage:
+            parser.error("use train_curriculum.py or select --stage for the PoC")
+        if cfg.get("grpo", {}).get("use_vllm"):
+            parser.error("the supported PoC binding uses HF generation")
+        if int(os.getenv("WORLD_SIZE", "1")) != 1:
+            parser.error("the supported PoC recipe uses one GPU/process")
+        if args.resume_adapter and args.resume_from_checkpoint:
+            parser.error("choose adapter initialization or full checkpoint resume")
     if args.stage:
         cfg = filter_curriculum_to_stage(cfg, args.stage)
+        cfg = {**cfg, "grpo": dict(cfg.get("grpo", {})), "reward": dict(cfg.get("reward", {}))}
+        stage_entry = cfg["curriculum"][0]
+        if "max_steps" in stage_entry:
+            cfg["grpo"]["max_steps"] = stage_entry["max_steps"]
+        if "probe_shaping_weight" in stage_entry:
+            cfg["reward"]["probe_shaping_weight"] = stage_entry["probe_shaping_weight"]
     env_cfg = cfg.get("env", {})
     task_entries = cfg.get("tasks") or [{"family": "known_target_anybit"}]
     seeds = [int(s) for s in cfg.get("seeds", list(range(1, 9)))]
     pairs = task_seed_pairs(cfg, task_entries, seeds)
     eval_pairs = eval_task_seed_pairs(cfg, task_entries)
+    if args.smoke:
+        pairs = pairs[:4]
+        eval_pairs = eval_pairs[:2]
+        cfg = {**cfg, "grpo": {**cfg["grpo"], "max_steps": 2, "save_steps": 1, "eval_steps": 1,
+                               "generation_batch_size": 8, "gradient_accumulation_steps": 8}}
     if cfg.get("curriculum"):
         stages = load_curriculum(cfg)
         plan = " -> ".join(f"{s.name}({len(s.tasks)}x{len(s.seeds)})" for s in stages)
@@ -794,13 +886,26 @@ def main() -> int:
             port=env_cfg.get("server_port"),
             max_concurrent_envs=int(env_cfg.get("max_concurrent_envs", 8)),
             mode=str(env_cfg.get("server_mode", "production")),
+            env_overrides={"RH_POC": "1"} if cfg.get("poc") else None,
         )
         base_url = server.base_url
         print(f"launched OpenEnv server at {base_url}")
 
     try:
+        if cfg.get("poc") and pairs:
+            first_task, _ = resolve_task(pairs[0][0])
+            metadata = asyncio.run(disclose_metadata(base_url, pairs[0][1], first_task))
+            if metadata.get("policy_surface") != "poc":
+                raise RuntimeError("PoC training requires a PoC server (RH_POC=1)")
         if args.dry_run:
-            return dry_run(base_url, pairs, concurrency, max_steps)
+            return dry_run(base_url, pairs, concurrency, max_turns if multi_turn else max_steps)
+
+        if cfg.get("poc"):
+            from rowhammer_env.llm.runtime import check_training_stack
+
+            check_training_stack()
+            if dry_run(base_url, pairs, concurrency, max_turns):
+                raise RuntimeError("reference gate failed; training not started")
 
         # Heavy training imports live here so --dry-run needs no torch/trl.
         from datasets import Dataset
@@ -812,7 +917,8 @@ def main() -> int:
         enable_thinking = bool(model_cfg.get("enable_thinking", False))
         print(f"model={model_name} enable_thinking={enable_thinking}")
 
-        tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+        revision = model_cfg.get("revision", "main")
+        tokenizer = AutoTokenizer.from_pretrained(model_name, revision=revision)
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
 
@@ -834,7 +940,7 @@ def main() -> int:
 
         dtype_name = str(model_cfg.get("torch_dtype", "bfloat16"))
         torch_dtype = getattr(torch, dtype_name, torch.bfloat16)
-        model_kwargs = {"torch_dtype": torch_dtype, "trust_remote_code": True}
+        model_kwargs = {"torch_dtype": torch_dtype, "revision": revision}
         if model_cfg.get("attn_implementation"):
             model_kwargs["attn_implementation"] = str(model_cfg["attn_implementation"])
         model = AutoModelForCausalLM.from_pretrained(model_name, **model_kwargs)
@@ -865,6 +971,22 @@ def main() -> int:
         grpo_cfg.setdefault("output_dir", "runs/grpo_rowhammer")
         if args.output_dir:
             grpo_cfg["output_dir"] = args.output_dir
+        artifact_dir = pathlib.Path(grpo_cfg["output_dir"])
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        if cfg.get("poc"):
+            from rowhammer_env.observability.experiment import provenance, snapshot_sources
+            from rowhammer_env.poc import resolved_config
+
+            manifest = {"configuration": resolved_config(full_cfg), "stage_configuration": cfg,
+                        "stage": args.stage, "provenance": provenance(),
+                        "model_revision": getattr(model.config, "_commit_hash", revision),
+                        "resume_adapter": args.resume_adapter, "resume_from_checkpoint": args.resume_from_checkpoint}
+            manifest_path = artifact_dir / (f"resume_{uuid.uuid4().hex[:8]}.json" if args.resume_from_checkpoint else "training_run.json")
+            if manifest_path.exists():
+                raise FileExistsError(f"run already exists: {artifact_dir}; choose a new directory or resume a checkpoint")
+            manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+            if not (artifact_dir / "source_snapshot.zip").exists():
+                snapshot_sources(artifact_dir, manifest["provenance"])
 
         # Monitoring: must run before make_reward_functions so the reward fn records rollouts.
         wandb_callbacks, wandb_enabled = setup_wandb(cfg, grpo_cfg)
@@ -896,6 +1018,8 @@ def main() -> int:
         grpo_cfg.pop("reward_weights", None)  # derived from reward: above, not grpo:
         unknown = set(grpo_cfg) - valid
         if unknown:
+            if cfg.get("poc"):
+                raise ValueError(f"unsupported GRPO configuration keys: {sorted(unknown)}")
             print(f"warning: dropping GRPO keys unsupported by installed TRL: {sorted(unknown)}")
         training_args = GRPOConfig(
             reward_weights=reward_weights,
@@ -910,6 +1034,10 @@ def main() -> int:
             peft_config=peft_config,
             callbacks=wandb_callbacks or None,
         )
+        if cfg.get("poc"):
+            from rowhammer_env.llm.runtime import evidence_callback
+
+            trainer_kwargs["callbacks"] = [*wandb_callbacks, evidence_callback(artifact_dir, require_update=args.smoke)]
         if eval_dataset is not None:
             trainer_kwargs["eval_dataset"] = eval_dataset
         if multi_turn:
@@ -928,6 +1056,10 @@ def main() -> int:
                 r["prompt"]: (int(r["seed"]), json.loads(r["task_json"]) if r["task_json"] else None)
                 for r in (rows + eval_rows)
             }
+            for r in rows + eval_rows:
+                expected = (int(r["seed"]), json.loads(r["task_json"]) if r["task_json"] else None)
+                if prompt_to_meta[r["prompt"]] != expected:
+                    raise RuntimeError("different task instances produced the same prompt; cannot recover rollout seeds")
             rollout_func, reward_trusted, reward_probe_shaping = make_multiturn_rollout_func(
                 base_url,
                 tokenizer,
@@ -941,6 +1073,9 @@ def main() -> int:
                 max_prompt_tokens=max_prompt_tokens,
                 concurrency=concurrency,
                 emit_probe_shaping=shaping_on,
+                shaping_kind=str(reward_cfg.get("shaping_kind", "legacy")),
+                top_p=float(grpo_cfg.get("top_p", 1.0)), top_k=int(grpo_cfg.get("top_k", 0)),
+                artifact_dir=str(artifact_dir) if cfg.get("poc") else None,
             )
             # Reward funcs line up positionally with reward_weights above: trusted
             # success first, the bounded probe bonus second iff shaping is on.
@@ -957,8 +1092,9 @@ def main() -> int:
             )
         else:
             trainer = GRPOTrainer(reward_funcs=[reward_env, reward_format], **trainer_kwargs)
-        trainer.train()
+        trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
         trainer.save_model(training_args.output_dir)
+        trainer.save_state()
         tokenizer.save_pretrained(training_args.output_dir)
         print(f"saved policy to {training_args.output_dir}")
         return 0

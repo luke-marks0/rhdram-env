@@ -45,7 +45,12 @@ def make_env(task: dict[str, Any] | None = None) -> RowHammerTaskEnv:
     config); an orchestrator can also override it per-episode by passing ``task``
     to ``reset`` over the WebSocket transport.
     """
-    return RowHammerTaskEnv(task=task if task is not None else _default_task())
+    env_type = RowHammerTaskEnv
+    if os.getenv("RH_POC") == "1":
+        from rowhammer_env.poc import PoCEnv
+
+        env_type = PoCEnv
+    return env_type(task=task if task is not None else _default_task())
 
 
 def create_rowhammer_app(

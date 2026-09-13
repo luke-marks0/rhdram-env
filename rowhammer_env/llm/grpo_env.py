@@ -287,6 +287,21 @@ SYSTEM_PROMPT = (
     "\"rows\":[<addrA>,<addrB>],\"pairs\":<int>}]}}]}."
 )
 
+POC_SYSTEM_PROMPT = (
+    "You control a simulation-only DRAM environment. Earn reward 1 only by causing "
+    "the trusted target-row flip within the disclosed budgets. Each turn, emit exactly "
+    "one JSON tool call and wait for its result. Tools: dram.info {}, "
+    "dram.issue {commands:[...]}, episode.finish {}. A command is "
+    '{"op":"RD","addr":<address>}, {"op":"WAIT","cycles":<integer>}, or '
+    '{"op":"HAMMER","rows":[<addresses>],"pairs":<integer>}. '
+    "HAMMER runs that many sweeps of reads over ALL listed rows; pairs is required. "
+    "RD is a memory request: the controller may serve a row hit without an activation. "
+    "Addresses use the disclosed logical, physical, or handle forms. "
+    "For discovery tasks, address arithmetic does not reveal bank membership. "
+    "Timing feedback summarizes actual controller events; only a trusted flip proves success. "
+    'Response format: {"tool":"<tool name>","args":{...}}. No prose or reasoning text.'
+)
+
 
 # How much of the derived reference hint the task prompt discloses. "full" gives the
 # exact aggressor rows + suggested hammer count — a copyable answer that collapses
@@ -324,6 +339,9 @@ def build_messages(metadata: dict[str, Any], hint_level: str | None = None) -> l
     same level (the trainer matches rollout prompts against the baked dataset prompts).
     """
     level = hint_level if hint_level is not None else _HINT_LEVEL
+    poc = metadata.get("policy_surface") == "poc"
+    if poc:
+        level = "none"
     task_view = {
         "objective": metadata.get("objective"),
         "task_family": metadata.get("task_family"),
@@ -335,16 +353,22 @@ def build_messages(metadata: dict[str, Any], hint_level: str | None = None) -> l
         "allowed_tools": metadata.get("allowed_tools"),
         "budgets": metadata.get("budget_remaining"),
     }
+    if poc:
+        # These are disclosed constants, not derived answers. Keep the calibrated
+        # threshold available on the known-target control even without hints.
+        task_view["geometry"] = metadata.get("geometry")
+        task_view["disturbance"] = metadata.get("disturbance")
+        task_view["instance_seed"] = (metadata.get("difficulty") or {}).get("seed")
     reference_hints = _reference_hints_view(metadata, level)
     if reference_hints is not None:
         task_view["reference_hints"] = reference_hints
     user = (
         "Task instance (only disclosed fields are shown):\n"
-        + json.dumps(task_view, sort_keys=True, indent=2)
+        + json.dumps(task_view, sort_keys=True, **({"separators": (",", ":")} if poc else {"indent": 2}))
         + "\n\nProduce the tool call(s) that cause the objective flip within budget."
     )
     return [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": POC_SYSTEM_PROMPT if poc else SYSTEM_PROMPT},
         {"role": "user", "content": user},
     ]
 
@@ -411,6 +435,8 @@ async def disclose_metadata(base_url: str, seed: int, task: dict[str, Any] | Non
 
     async with RowHammerClient(base_url=base_url, message_timeout_s=timeout_s) as client:
         reset = await client.reset(seed=seed, episode_id=f"grpo_disclose_{seed}", task=task)
+        if reset.observation.error:
+            raise RuntimeError(f"task reset failed: {reset.observation.error}")
         return observation_metadata(reset.observation)
 
 
@@ -497,7 +523,8 @@ def launch_server(
     if env_overrides:
         env.update(env_overrides)
     proc = subprocess.Popen(
-        [sys.executable, "-B", "-m", "uvicorn", "rowhammer_env.server.app:app", "--host", host, "--port", str(port)],
+        [sys.executable, "-B", "-m", "uvicorn", "rowhammer_env.server.app:app", "--host", host, "--port", str(port),
+         "--log-level", "warning", "--no-access-log"],
         cwd=root,
         env=env,
         stdout=subprocess.PIPE,

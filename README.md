@@ -2,6 +2,14 @@
 
 Repository for the RowHammer-OpenEnv environment described in `spec/`.
 
+For the supported proof of concept, start with [SCOPE.md](SCOPE.md) and the
+[training runbook](docs/poc_training.md). The frozen experiment is
+[`configs/training/poc.yaml`](configs/training/poc.yaml). Run
+`./.venv/bin/python -B scripts/verify_poc.py` for its direct-tool environment gate;
+the broader historical release gates below include features outside the PoC.
+Observed control results and remaining GPU validation are recorded in
+[CURRENT_WORK.md](CURRENT_WORK.md).
+
 Current scope:
 
 - provenance manifest format and source admission rules;

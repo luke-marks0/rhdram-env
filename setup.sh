@@ -16,6 +16,7 @@
 #   ./setup.sh --venv          # create/use ./.venv for the Python deps
 #   ./setup.sh --clean         # force a clean native rebuild
 #   ./setup.sh --full-verify   # run the complete release re-qualification gate
+#   ./setup.sh --poc-verify    # run only the required direct-tool PoC gate
 #   ./setup.sh --no-verify     # stop after building; skip all gates
 #   ./setup.sh --skip-deps     # assume Python deps are already installed
 #   ./setup.sh -h | --help
@@ -29,6 +30,7 @@ WANT_TRAIN=0
 WANT_VENV=0
 WANT_CLEAN=0
 WANT_FULL_VERIFY=0
+WANT_POC_VERIFY=0
 WANT_VERIFY=1
 WANT_DEPS=1
 
@@ -40,6 +42,7 @@ for arg in "$@"; do
     --venv)        WANT_VENV=1 ;;
     --clean)       WANT_CLEAN=1 ;;
     --full-verify) WANT_FULL_VERIFY=1 ;;
+    --poc-verify)  WANT_POC_VERIFY=1 ;;
     --no-verify)   WANT_VERIFY=0 ;;
     --skip-deps)   WANT_DEPS=0 ;;
     -h|--help)     usage; exit 0 ;;
@@ -77,6 +80,9 @@ if [ "$WANT_VENV" = 1 ]; then
   source .venv/bin/activate
   PY=python
   ok "using $(command -v python)"
+fi
+if [ "$WANT_TRAIN" = 1 ]; then
+  "$PY" -c 'import sys; raise SystemExit(0 if sys.version_info[:2] == (3, 12) else 1)' || die "PoC training requires Python 3.12 (use PYTHON=python3.12 with a fresh venv)"
 fi
 
 # ---- 2. python dependencies ------------------------------------------------
@@ -136,6 +142,10 @@ elif [ "$WANT_FULL_VERIFY" = 1 ]; then
   "$PY" -B scripts/verify_release.py
   "$PY" -B scripts/verify_phase20.py
   ok "release gate passed"
+elif [ "$WANT_POC_VERIFY" = 1 ]; then
+  step "Running scoped direct-tool PoC verification"
+  "$PY" -B scripts/verify_poc.py
+  ok "PoC environment gate passed; GPU smoke is a separate check"
 else
   step "Running fast verification gate (P0 policy, P1 build, P2 worker, P3 profile)"
   "$PY" -B scripts/verify_phase0.py
@@ -150,7 +160,8 @@ step "Setup complete"
 cat <<EOF
 Next steps:
   - Serve the environment:   ${PY} -m rowhammer_env.server.app
-  - GRPO training dry-run:   ${PY} -B scripts/train_grpo.py --config configs/training/grpo_qwen4b.yaml --dry-run
-$( [ "$WANT_TRAIN" = 0 ] && echo "  - Add training extras:     ./setup.sh --train --skip-deps" )
+  - PoC training guide:      docs/poc_training.md
+  - GRPO training dry-run:   ${PY} -B scripts/train_grpo.py --config configs/training/poc.yaml --dry-run
+$( [ "$WANT_TRAIN" = 0 ] && echo "  - Add training extras:     ${PY} -m pip install -r requirements-train.txt (Python 3.12 required)" )
 $( [ "$WANT_VENV" = 1 ]  && echo "  - Reactivate the venv:     source .venv/bin/activate" )
 EOF
