@@ -1,0 +1,45 @@
+# One adapter, one GPU, one in-process simulator path. See docs/training.md.
+run_seed: 42
+model:
+  name: Qwen/Qwen3-8B
+  revision: main
+  device: cuda
+  dtype: bfloat16
+  lora_rank: 16
+  lora_alpha: 32
+  gradient_checkpointing: true
+rollout:
+  max_turns: 40
+  max_context_tokens: 16384
+  max_new_tokens: 256
+  temperature: 0.8
+optimizer:
+  learning_rate: 0.00001
+  weight_decay: 0.0
+  max_grad_norm: 1.0
+  warmup_steps: 5
+grpo:
+  group_size: 8
+  updates_per_group: 1
+  clip_epsilon: 0.2
+  kl_beta: 0.02
+  probe_shaping: 0.2  # Maximum per episode; set to 0 for sparse-only training.
+sft:
+  enabled: false
+  demonstrations_per_stage: 8
+  epochs: 1
+curriculum:
+  known_target_anybit: 20
+  bounded_sweep_easy: 40
+  bounded_sweep_medium: 60
+  hidden_adjacency_easy: 40
+  hidden_adjacency_medium: 100
+seeds:
+  train: [1, 256]       # Inclusive ranges, NOT two individual seeds.
+  validation: [1000, 1031]
+  benchmark: [10000, 10031]
+checkpoint_every: 10
+wandb:
+  enabled: false
+  project: rhdram-poc
+  entity: null

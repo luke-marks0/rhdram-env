@@ -1,7 +1,6 @@
-"""The deliberately narrow, real-simulator PoC runtime and experiment contract."""
+"""The deliberately narrow, real-simulator PoC environment."""
 from __future__ import annotations
 
-import copy
 import pathlib
 from typing import Any
 
@@ -81,59 +80,3 @@ class PoCEnv(RowHammerTaskEnv):
             obs.metadata["budget_remaining"] = dict(self.budget_remaining)
             return obs
         return super()._dispatch(action, **kwargs)
-
-
-def seed_list(spec: dict[str, Any]) -> list[int]:
-    """Resolve one explicit seed list or an inclusive range, rejecting ambiguity."""
-    if ("seeds" in spec) == ("seed_range" in spec):
-        raise ValueError("give exactly one of seeds or seed_range")
-    if "seed_range" in spec:
-        bounds = spec["seed_range"]
-        if not isinstance(bounds, list) or len(bounds) != 2:
-            raise ValueError("seed_range must be [start, stop]")
-        if any(type(n) is not int for n in bounds) or bounds[1] < bounds[0]:
-            raise ValueError("seed_range needs ordered integer bounds")
-        seeds = list(range(bounds[0], bounds[1] + 1))
-    else:
-        seeds = spec["seeds"]
-    if not isinstance(seeds, list) or not seeds or any(type(n) is not int for n in seeds):
-        raise ValueError("seeds must be a nonempty integer list")
-    if len(seeds) != len(set(seeds)):
-        raise ValueError("duplicate seeds would overweight episodes")
-    return list(seeds)
-
-
-def validate_config(cfg: dict[str, Any]) -> None:
-    from .llm.curriculum import load_curriculum
-    from .llm.shaping import shaping_weights
-
-    stages = load_curriculum(cfg)
-    paths = [path for stage in stages for path in stage.tasks]
-    if paths != list(TASK_PATHS):
-        raise ValueError("PoC curriculum must contain exactly the five scoped tasks in order")
-    for path in paths:
-        load_task(path)
-    train = set().union(*(set(stage.seeds) for stage in stages))
-    validation = set(seed_list(cfg["eval"]))
-    test = set(seed_list(cfg["benchmark"]))
-    if train & validation or train & test or validation & test:
-        raise ValueError("training, validation, and benchmark seeds must be disjoint")
-    if len(test) < 32:
-        raise ValueError("PoC benchmark needs at least 32 held-out seeds")
-    if "probe_shaping_weight" not in cfg.get("reward", {}):
-        raise ValueError("record probe_shaping_weight explicitly, including zero")
-    shaping_weights(cfg["reward"])
-    if not cfg.get("rollout", {}).get("multi_turn"):
-        raise ValueError("PoC requires multi-turn rollouts")
-    if cfg.get("model", {}).get("enable_thinking"):
-        raise ValueError("the supported PoC recipe uses action-only, non-thinking responses")
-    if int(cfg["rollout"].get("max_turns", 0)) < 33:
-        raise ValueError("medium reference discovery needs at least 33 turns")
-
-
-def resolved_config(cfg: dict[str, Any]) -> dict[str, Any]:
-    out = copy.deepcopy(cfg)
-    out["resolved_tasks"] = {p: load_task(p) for p in TASK_PATHS}
-    out["resolved_validation_seeds"] = seed_list(cfg["eval"])
-    out["resolved_benchmark_seeds"] = seed_list(cfg["benchmark"])
-    return out

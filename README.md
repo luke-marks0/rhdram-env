@@ -2,13 +2,9 @@
 
 Repository for the RowHammer-OpenEnv environment described in `spec/`.
 
-For the supported proof of concept, start with [SCOPE.md](SCOPE.md) and the
-[training runbook](docs/poc_training.md). The frozen experiment is
-[`configs/training/poc.yaml`](configs/training/poc.yaml). Run
-`./.venv/bin/python -B scripts/verify_poc.py` for its direct-tool environment gate;
-the broader historical release gates below include features outside the PoC.
-Observed control results and remaining GPU validation are recorded in
-[CURRENT_WORK.md](CURRENT_WORK.md).
+For the supported proof of concept, start with [SCOPE.md](SCOPE.md). The previous
+training implementation has been removed; [TRAINING_SCOPE.md](TRAINING_SCOPE.md)
+defines the intentionally small replacement.
 
 Current scope:
 
@@ -39,8 +35,6 @@ Current scope:
 - phase 17 OpenEnv HTTP/WebSocket serving with a policy-side client.
 - phase 18 OS-isolated `script.run` using `unshare` + `bwrap` and JSON-line
   IPC back to the normal tool surface.
-- phase 19 HTTP policy adapter, rollout/eval metrics, and a reward-updated
-  training example for the LLM-testable milestone.
 - phase 20 release re-qualification: full admitted gate matrix, zero-skip unit
   suite, deterministic replay, no-mock executable scan, and release provenance.
 
@@ -57,7 +51,6 @@ idempotent and safe to re-run.
 
 ```sh
 ./setup.sh                 # full setup + fast verify (P0/P1/P2/P3 gates)
-./setup.sh --train         # also install the GRPO training extras
 ./setup.sh --venv          # install deps into a local ./.venv
 ./setup.sh --clean         # force a clean native rebuild (after a source re-pin)
 ./setup.sh --full-verify   # run the complete release re-qualification gate
@@ -155,13 +148,6 @@ Phase 18 verifies the OS-level sandbox and trace-equivalent IPC broker:
 python3 -B scripts/verify_phase18.py
 ```
 
-Phase 19 verifies the HTTP policy adapter, held-out eval metrics, and training
-example:
-
-```sh
-python3 -B scripts/verify_phase19.py
-```
-
 Phase 20 runs the release re-qualification gate:
 
 ```sh
@@ -169,38 +155,8 @@ python3 -B scripts/verify_release.py
 python3 -B scripts/verify_phase20.py
 ```
 
-## GRPO training (TRL)
+## Training
 
-`scripts/train_grpo.py` trains the model named by `model.name` in the config
-against the served environment with TRL's `GRPOTrainer`. The shipped
-`grpo_curriculum.yaml` pins `Qwen/Qwen3-8B`; if `model.name` is omitted the trainer
-falls back to `Qwen/Qwen3-4B`. Each dataset row is one task instance
-(task config + seed); the environment discloses its objective/target at reset,
-which is baked into the prompt. GRPO samples several completions per prompt, each
-is parsed into a tool-call sequence and **replayed through the real OpenEnv
-server**, and the reward is the trusted sparse episode reward (`1.0` only on a real
-flip). Hyperparameters — including the `enable_thinking` toggle that disables the
-Qwen3 `<think>` block — live in `configs/training/grpo_curriculum.yaml`.
-
-```sh
-python3 -m pip install -r requirements.txt -r requirements-train.txt
-
-# Validate the data + reward pipeline first (no GPU/model load; needs a built
-# Phase-2 worker and the P17 HTTP deps):
-python3 -B scripts/train_grpo.py --config configs/training/grpo_curriculum.yaml --dry-run
-
-# Train (launches its own server unless env.base_url is set):
-python3 -B scripts/train_grpo.py --config configs/training/grpo_curriculum.yaml
-```
-
-### Monitoring (Weights & Biases)
-
-Set `wandb.enabled: true` in the config (on by default) and training autologs to
-wandb: the TRL scalar metrics, TRL's own prompt/completion table
-(`log_completions`), and a custom per-rollout table + metrics from
-`rowhammer_env.llm.wandb_logging` — the parsed tool calls, the trusted env reward,
-and the emitted command-list size (`rollout/n_commands_mean|max`, `rollout/n_pairs_mean`).
-The command-list size is the key signal: a real flip needs on the order of the
-disclosed `known_threshold` activations, so it makes plain whether completions are
-anywhere near the threshold or just truncated at `max_completion_length`. Needs
-`pip install wandb` and a `wandb login` (or set `wandb.mode: offline`).
+Training is deliberately not implemented on this branch. The replacement is
+scoped in [TRAINING_SCOPE.md](TRAINING_SCOPE.md); no training command is currently
+advertised as supported.

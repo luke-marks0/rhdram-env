@@ -17,7 +17,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 
-PHASE_GATE_NUMBERS = tuple(list(range(0, 10)) + list(range(11, 20)))
+PHASE_GATE_NUMBERS = tuple(list(range(0, 10)) + list(range(11, 19)))
 # Standing invariant guards, each a repro for a defect that once shipped. Unlike the
 # phase gates these are not build-order history and never retire, so they carry names
 # rather than phase numbers.

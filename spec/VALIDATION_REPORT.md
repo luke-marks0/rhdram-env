@@ -4,7 +4,7 @@
 
 The release gate is `scripts/verify_release.py`. It now checks:
 
-- all admitted phase gates: P0-P9 and P11-P19;
+- all retained phase gates: P0-P9 and P11-P18;
 - the full `tests/` suite with zero required skips;
 - deterministic replay for seeds 20, 21, and 22 under `SOURCE_MANIFEST.yaml`;
 - no-mock symbol scanning over `cpp/`, `rowhammer_env/`, `profile_builder/`,

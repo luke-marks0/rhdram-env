@@ -18,12 +18,6 @@ disturbance engine have produced the task condition.
   calls — there is no separate `script_ms` budget.
 - `episode.finish`: terminate the episode and receive reward from trusted state.
 
-`rowhammer_env.llm.TOOL_SCHEMAS` exposes this surface as function/tool schemas
-for tool-calling chat backends. `OpenAICompatibleToolPolicy` can call any
-OpenAI-compatible chat-completions endpoint configured with
-`RHD_LLM_CHAT_COMPLETIONS_URL`, `RHD_LLM_MODEL`, and optionally
-`RHD_LLM_API_KEY`.
-
 ## Discovery families and the secret address mapping
 
 Discovery families (`bounded_sweep` and `hidden_adjacency`) hide which candidate
@@ -89,9 +83,3 @@ probing policy's measured probe+hammer cost plus headroom.
 **Termination** (SPEC §9): the success predicate becomes true, the policy calls
 `episode.finish`, a budget is exhausted, an unrecoverable simulator/sandbox error
 occurs, or the maximum simulated cycle count is reached.
-
-## CI Fixture Policy
-
-`CIHammerFixturePolicy` is a deterministic test fixture for CI. It is not
-advertised as an LLM policy; it exists to prove the HTTP adapter, rollouts, and
-metrics work without a network model dependency.

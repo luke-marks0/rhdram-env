@@ -20,7 +20,7 @@ def _load_verify_release():
 class Phase20ReleaseGateTests(unittest.TestCase):
     def test_release_gate_runs_full_admitted_phase_matrix(self) -> None:
         verify_release = _load_verify_release()
-        self.assertEqual(verify_release.PHASE_GATE_NUMBERS, tuple(list(range(0, 10)) + list(range(11, 20))))
+        self.assertEqual(verify_release.PHASE_GATE_NUMBERS, tuple(list(range(0, 10)) + list(range(11, 19))))
 
     def test_symbol_scan_exempts_only_verifier_denylist_definitions(self) -> None:
         verify_release = _load_verify_release()

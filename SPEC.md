@@ -68,9 +68,7 @@ Optional script path (policy submits Python):
   step(script.run) → RestrictedScriptBroker → unshare+bwrap child → rh_sdk broker
   → same env.step tool surface               rowhammer_env/script_sandbox.py, sdk/rh_sdk/
 
-Training harness (torch/trl only in scripts/):
-  grpo_env (prompt/parse/reward) · multiturn_rollout (loop + completion mask)
-  · curriculum · shaping · policies (reference/fixture)   rowhammer_env/llm/*
+Training harness: not implemented; replacement scope is in `TRAINING_SCOPE.md`.
 ```
 
 **Environment class hierarchy** (each layer adds one concern; `RowHammerTaskEnv`
@@ -99,7 +97,7 @@ A missing/empty `tool` fails closed with `BAD_SCHEMA` (never OpenEnv's transport
 `VALIDATION_ERROR`). Unknown tools return `UNSUPPORTED_TOOL`.
 Defined in: `rowhammer_env/phase5_env.py` (`ALLOWED_TOOLS`, `step`),
 `rowhammer_env/phase2_env.py` (`Phase2Action`, `RowHammerEnv.step`),
-`spec/schemas/action.schema.json`, `rowhammer_env/llm/tools.py` (`TOOL_SCHEMAS`).
+`spec/schemas/action.schema.json`.
 
 #### `@spec:rl-observation-reset` — initial observation
 `reset(seed, episode_id=None, task=None, budgets=None)` returns a `Phase2Observation`
@@ -656,110 +654,15 @@ Defined in: `rowhammer_env/server/app.py`, `rowhammer_env/client.py`.
 
 ### Training and evaluation harness
 
-All training glue is torch/trl-free and host-testable; the torch/trl binding lives
-in `scripts/train_grpo.py` (and `scripts/train_curriculum.py`).
+Not yet implemented. The previous harness was removed because it mixed multiple
+rollout, transport, inference, and legacy training paths without completing a
+validated GPU run. `TRAINING_SCOPE.md` defines the replacement. Its requirements
+are design targets, not current `@spec` contracts.
 
-#### `@spec:train-prompt` — disclosed observation → prompt
-`build_messages` turns a disclosed reset observation into GRPO chat messages
-(fixed `SYSTEM_PROMPT` + a task view of *only disclosed* fields). `reference_hints`
-are gated by `HINT_LEVELS` (`full`/`geometry`/`none`); the dataset-build and rollout
-prompts for one run must use the same level (the trainer matches prompts to tasks).
-Defined in: `rowhammer_env/llm/grpo_env.py` (`build_messages`, `SYSTEM_PROMPT`,
-`public_hints`, `set_hint_level`).
-
-#### `@spec:train-completion-parse` — completion → tool calls
-`parse_actions` tolerantly parses a completion (fenced/raw JSON, several shapes)
-into an ordered `ToolCall` list; `summarize_actions` reports the *expanded*
-activation count (the key diagnostic). An unparseable completion yields `[]` →
-reward 0.
-Defined in: `rowhammer_env/llm/grpo_env.py` (`parse_actions`, `_coerce_action`,
-`summarize_actions`, `completion_text`).
-
-#### `@spec:train-reward-eval` — trusted replay reward
-Parsed tool calls are replayed through the *same* verified rollout path
-(`ScriptedPolicy` → `run_episode`) and scored by the trusted episode reward
-(`1.0` only on a real flip). Batched, concurrency-bounded; a broken episode scores
-0, never crashes training. Nothing here can fabricate reward from model text.
-Defined in: `rowhammer_env/llm/grpo_env.py` (`ScriptedPolicy`, `evaluate_rewards`,
-`evaluate_item`), `rowhammer_env/llm/rollout.py`.
-
-#### `@spec:train-multiturn-rollout` — turn-by-turn training loop
-`run_training_episode[_local]` / `run_batched_training_episodes[_local]` drive a
-turn-by-turn chat loop (assistant completion → parsed tool call → `env.step` →
-rendered tool-result turn), trace-equivalent to the eval loop. Records the full
-chat transcript alongside the trajectory as a `MultiTurnRollout`.
-Defined in: `rowhammer_env/llm/multiturn_rollout.py`, `rowhammer_env/llm/rollout.py`.
-
-#### `@spec:train-completion-mask` — assistant-span token mask
-On the supported PoC HF path, `GeneratedTurn` retains the exact sampled token IDs
-and each turn's conditioning prefix. `to_grpo_example` extends those prefixes with
-zero masks on tool/template tokens and ones only on sampled tokens. A rewriting
-template fails closed. Context-limit driver finishes are never training targets.
-The following render-based builder remains for reference/SFT trajectories and
-legacy tokenizer tests:
-`build_masked_completion` tokenizes a full transcript and marks only assistant-turn
-tokens trainable (each turn anchored independently, robust to the Qwen3
-`enable_thinking` `<think></think>` quirk); `to_grpo_example` emits
-`(prompt_ids, completion_ids, completion_mask, reward)`. `enable_thinking` must
-match how the dataset prompt was baked.
-Defined in: `rowhammer_env/llm/multiturn_rollout.py` (`build_masked_completion`,
-`to_grpo_example`, `_as_token_ids`).
-
-#### `@spec:train-curriculum` — ordered, gated curriculum
-`load_curriculum` parses the `curriculum:` config block into ordered
-`CurriculumStage`s and enforces non-decreasing difficulty
-(`tier0 → tier2a → tier2b`, `easy → medium → hard`). Each stage carries a
-`reference_min_success` gate (the P26 reference policy must solve that fraction
-before the stage earns training time). This module only defines/orders stages; it
-computes no reward.
-Defined in: `rowhammer_env/llm/curriculum.py`, `configs/training/grpo_curriculum.yaml`.
-
-#### `@spec:train-reward-shaping` — bounded, outcome-neutral, training-only
-An optional auxiliary shaping term rewards each *decisive* bank-conflict probe
-(a pairwise, repeated alternation whose real `timing_digest` lands cleanly in one
-regime), computed only from disclosed timing, bounded in `[0,1]`, outcome-neutral
-(same-bank and different-bank score equally). `validate_shaping_weight` fails closed
-unless the weight is `>= 0` and **strictly below** `success_weight`, so shaping can
-never rival one real flip. Training-only; eval/benchmark scoring uses the trusted
-reward alone.
-Defined in: `rowhammer_env/llm/shaping.py`.
-
-The scoped configuration selects `unique_candidate_probe` shaping: each distinct
-disclosed candidate earns credit at most once, from a short, actually alternating
-victim/candidate read probe with a decisive real digest. Repeated probes, grouped
-reads, long hammers, and rejected actions earn no additional credit. The term is
-normalized by candidate count. It is zero during trainer validation as well as
-standalone benchmark evaluation. This bounded auxiliary objective is not a claim
-of potential-based shaping or of guaranteed useful gradients.
-
-#### `@spec:train-reference-policy` — deterministic DRAMA reference solver
-`ReferenceProbePolicy` is a hand-written reference (labelled a fixture, never the
-LLM policy) that solves the discovery families using only disclosed tools/signals:
-classify each candidate by `timing_digest.acts_delta`, drop different-bank ones, then
-double-side the same-bank survivors. `use_timing=False` is the differential control
-(hammers everything → trips `BUDGET_EXCEEDED`), which is what makes the timing signal
-load-bearing. Other policies (`CIHammerFixturePolicy`, `TrainableHammerPolicy`,
-`OpenAICompatibleToolPolicy`, `ClaimSuccessFixturePolicy`) are fixtures/adapters.
-Defined in: `rowhammer_env/llm/policies.py`.
-
-#### `@spec:eval-metrics` — episode result + aggregation
-`EpisodeResult.from_rollout` normalizes one rollout (family, difficulty, split,
-success = reward == 1.0, steps, final cycle, budget); `summarize_episodes` aggregates
-success rate / reward / budget efficiency, bucketed by family/difficulty/split.
-Defined in: `rowhammer_env/observability/metrics.py`.
-
-#### `@spec:poc-experiment` — scoped experiment contract
-`rowhammer_env/poc.py` narrows the served environment when `RH_POC=1`: only DDR4,
-the admitted profile at 50 C, baseline refresh, easy/medium discovery, and
-`dram.info` / `dram.issue` / `episode.finish` are available. Other policy tools are
-rejected before dispatch. The general environment remains available for regression
-utilities. The canonical recipe is `configs/training/poc.yaml`; training seeds,
-development-validation seeds, and final benchmark seeds are disjoint.
-`scripts/verify_poc.py` fails on any skipped required test. `eval_poc.py` writes
-disclosed trajectories, resource/error metrics, source snapshots, model identity,
-and per-task Wilson intervals. Timing-hidden evaluation strips every dynamic timing
-view only at the policy boundary; trusted simulator state and scoring are unchanged.
-GPU optimizer/reload/resume qualification is a separate `smoke_train_poc.py` gate.
+The retained `rowhammer_env/poc.py` is environment code: it narrows the served
+runtime to DDR4, the admitted profile at 50 C, baseline refresh, easy/medium
+discovery, and `dram.info` / `dram.issue` / `episode.finish`. It contains no
+trainer, rollout, policy, metrics, or experiment-config implementation.
 
 ### Cross-cutting invariants
 
@@ -829,9 +732,9 @@ Deliberately **not** tagged as contracts — in flux, aspirational, or advisory:
 - **Difficulty / budget numbers.** `BAND_ACTS`, `BAND_WINDOW`, `BAND_CANDIDATES`,
   discovery hammer/probe pair counts, and `tRH` defaults are calibration values,
   expected to be retuned. The *existence* of graded bands is spec; the numbers are not.
-- **Reward shaping in use.** `@spec:train-reward-shaping` fixes the envelope (bounded,
-  outcome-neutral, sub-success, training-only). Whether/at what weight shaping is
-  actually enabled in a given run is an experiment config, not spec.
+- **Training rewrite.** Training and evaluation are intentionally absent. The
+  compact design in `TRAINING_SCOPE.md` remains unimplemented and is not a current
+  architecture contract.
 - **Additional mitigations.** `mitigations.py` names an `ADMISSION_ORDER`
   (`para`, `graphene`, `twice`, `blockhammer`, `prac`, `hydra`, `rrs`, `aqua`, `rfm`)
   and aliases, but only `none`/`oracle` are admitted. The rest are roadmap, currently
@@ -846,10 +749,6 @@ Deliberately **not** tagged as contracts — in flux, aspirational, or advisory:
   `spec/PRE_RELEASE_RESTRUCTURE.md` describe a de-phase-naming restructure that is
   **spec'd but not executed** — the `phaseN_env.py` / `verify_phaseN.py` names are
   still the reality. Treat the phase-rename as future work, not current architecture.
-- **Training scale-out.** The batched multi-turn rollout paths (vLLM/HF batch
-  generation) exist and are host-tested, but full GRPO training runs are
-  instance-side and not covered by the host CI gates.
-
 ---
 
 ## Drift
@@ -892,10 +791,6 @@ Flagged, not resolved — a human decides which side is authoritative.
 `@spec:mitigation-capabilities`, `@spec:mitigation-oracle`,
 `@spec:security-simulation-only`, `@spec:sandbox-script`, `@spec:sandbox-attestation`,
 `@spec:server-transport`, `@spec:server-session-model`,
-`@spec:train-prompt`, `@spec:train-completion-parse`, `@spec:train-reward-eval`,
-`@spec:train-multiturn-rollout`, `@spec:train-completion-mask`,
-`@spec:train-curriculum`, `@spec:train-reward-shaping`, `@spec:train-reference-policy`,
-`@spec:eval-metrics`, `@spec:poc-experiment`,
 `@spec:invariant-no-mock`, `@spec:invariant-trusted-reward`,
 `@spec:invariant-no-leakage`, `@spec:invariant-budget-honesty`,
 `@spec:invariant-determinism`.
